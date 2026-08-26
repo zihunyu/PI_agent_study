@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import time
 import unittest
 from pathlib import Path
 
@@ -267,20 +266,21 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         agent = Agent(model=self.model, stream_fn=provider.stream)
         listener_finished = False
+        agent_was_busy_inside_listener = False
 
         async def listener(event, _token):
-            nonlocal listener_finished
+            nonlocal listener_finished, agent_was_busy_inside_listener
             if event["type"] == "agent_end":
+                agent_was_busy_inside_listener = agent.state.is_streaming
                 await asyncio.sleep(0.02)
                 listener_finished = True
 
         agent.subscribe(listener)
-        started = time.perf_counter()
         await agent.prompt("测试结算")
-        elapsed = time.perf_counter() - started
 
+        # 直接验证语义，不使用容易受 Windows timer 精度影响的耗时阈值。
+        self.assertTrue(agent_was_busy_inside_listener)
         self.assertTrue(listener_finished)
-        self.assertGreaterEqual(elapsed, 0.018)
         await agent.wait_for_idle()
 
 

@@ -1,122 +1,149 @@
-"""最小可运行示例：模型调用两个工具，再根据结果生成最终回答。"""
+"""真实模型基础示例：接收任意用户消息并保留编号事件说明。
+
+命令行直接传入消息：
+
+    python examples/basic_usage.py "请同时计算 2+3 和 4×5"
+
+不传消息时，程序会在终端询问。运行前需准备本地 `agent.toml` 和
+`providers.toml`；真实配置均已被 Git 忽略。
+"""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # 允许在没有 pip install -e . 的情况下直接运行仓库示例。
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 from pi_agent_loop import (  # noqa: E402
     Agent,
-    Model,
-    ScriptedProvider,
+    ProviderConfigError,
     ToolRegistry,
-    assistant_message,
     create_add_tool,
     create_multiply_tool,
+    create_provider,
     load_agent_limits,
+    load_provider_settings,
 )
 
 # ============================================================================
 # Tool Timeout 教学配置区
 # ============================================================================
 # 正常成功：两个值都保持 0。
-# 触发加法超时：把 ADD_TOOL_DELAY_SECONDS 改成 3，因为 add 限制是 2 秒。
-# 触发乘法超时：把 MULTIPLY_TOOL_DELAY_SECONDS 改成 6，因为 multiply 限制是 5 秒。
-# 两个同时超时：分别改成 3 和 6。两个工具并行时，总等待约 5 秒。
+# 触发加法超时：改成 3，因为 add 的独立 timeout 是 2 秒。
+# 触发乘法超时：改成 6，因为 multiply 的独立 timeout 是 5 秒。
 ADD_TOOL_DELAY_SECONDS = 0.0
 MULTIPLY_TOOL_DELAY_SECONDS = 0.0
 
 
-async def main() -> None:
-    # 从独立 TOML 文件读取 Turn、Tool Call 和最大并行数配置。
-    config_path = Path(__file__).resolve().parents[1] / "config" / "agent.toml"
-    limits = load_agent_limits(config_path)
+def parse_user_message() -> str:
+    """读取命令行后面的任意消息；没有参数时再使用交互输入。"""
 
-    model = Model(
-        id="demo-model",
-        provider="scripted",
-        api="demo",
-        name="演示模型",
+    parser = argparse.ArgumentParser(
+        description="通过真实 OpenAI-compatible 模型运行 Agent Loop",
+    )
+    parser.add_argument(
+        "message",
+        nargs="*",
+        help="要交给 Agent 的用户消息；含空格时建议使用引号",
+    )
+    arguments = parser.parse_args()
+    if arguments.message:
+        return " ".join(arguments.message).strip()
+    return input("请输入用户消息：").strip()
+
+
+def content_text(message: dict) -> str:
+    """从消息 content 中取出全部文本。"""
+
+    return "".join(
+        str(block.get("text", ""))
+        for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
     )
 
-    # 第一次模型响应同时要求调用 add 和 multiply。
-    first_response = assistant_message(
-        model=model,
-        stop_reason="toolUse",
-        content=[
-            {
-                "type": "toolCall",
-                "id": "call-add",
-                "name": "add",
-                "arguments": {"a": 2, "b": 3},
-            },
-            {
-                "type": "toolCall",
-                "id": "call-multiply",
-                "name": "multiply",
-                "arguments": {"a": 4, "b": 5},
-            },
-        ],
-    )
 
-    # 第二次响应根据 Context 中的两条 toolResult 生成最终文本。
-    def final_response(context, _options):
-        tool_results = {
-            message["toolName"]: message
-            for message in context["messages"]
-            if message.get("role") == "toolResult"
-        }
-        add_result = tool_results["add"]
-        multiply_result = tool_results["multiply"]
+def result_text(result: dict) -> str:
+    """从工具结果中取第一段文本。"""
 
-        # 正常时保持原来的最终回答；触发 timeout 时，把两个工具各自的成功或
-        # 失败情况说清楚，方便观察“一个超时不会误伤另一个”。
-        if not add_result["isError"] and not multiply_result["isError"]:
-            text = (
-                f"加法结果是 {add_result['content'][0]['text']}，"
-                f"乘法结果是 {multiply_result['content'][0]['text']}。"
+    for block in result.get("content", []):
+        if isinstance(block, dict) and block.get("type") == "text":
+            return str(block.get("text", ""))
+    return "（没有文本结果）"
+
+
+def model_call_explanations(messages: list[dict]) -> list[str]:
+    """根据真实 assistant 历史解释每次模型调用，而不是写死调用两次。"""
+
+    assistant_messages = [
+        message for message in messages if message.get("role") == "assistant"
+    ]
+    explanations: list[str] = []
+    for index, message in enumerate(assistant_messages, start=1):
+        tool_names = [
+            str(block.get("name", "未知工具"))
+            for block in message.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "toolCall"
+        ]
+        if tool_names:
+            explanations.append(
+                f"  第 {index} 次：模型决定调用工具：{'、'.join(tool_names)}。"
+            )
+        elif message.get("stopReason") in {"error", "aborted"}:
+            explanations.append(
+                f"  第 {index} 次：模型请求失败："
+                f"{message.get('errorMessage', '未知错误')}。"
+            )
+        elif index == 1:
+            explanations.append(
+                "  第 1 次：模型判断不需要工具，直接生成回答。"
             )
         else:
-            descriptions = []
-            for name, label in [("add", "加法"), ("multiply", "乘法")]:
-                result = tool_results[name]
-                value = result["content"][0]["text"]
-                descriptions.append(
-                    f"{label}{'失败' if result['isError'] else '成功'}：{value}"
-                )
-            text = "；".join(descriptions) + "。"
+            explanations.append(
+                f"  第 {index} 次：模型读取此前消息和工具结果，生成回答。"
+            )
+    return explanations
 
-        return assistant_message(
-            model=model,
-            content=[{"type": "text", "text": text}],
-            stop_reason="stop",
+
+async def main() -> None:
+    user_message = parse_user_message()
+    if not user_message:
+        print("用户消息为空，程序结束。")
+        return
+
+    try:
+        limits = load_agent_limits(ROOT / "config" / "agent.toml")
+        provider_settings = load_provider_settings(
+            ROOT / "config" / "providers.toml"
         )
+    except (FileNotFoundError, ProviderConfigError, ValueError) as error:
+        print(f"配置错误：{error}")
+        print("请按照 config/README.md 复制并填写本地配置。")
+        return
 
-    provider = ScriptedProvider(
-        [first_response, final_response],
-        chunk_size=4,
-    )
+    model, provider = create_provider(provider_settings)
+    profile = provider_settings.active
 
-    # 第一步：创建工具注册表。
     registry = ToolRegistry()
-
-    # 第二步：创建我们自己编写的加法、乘法工具，并注册到注册表。
     registry.register(create_add_tool(delay_seconds=ADD_TOOL_DELAY_SECONDS))
     registry.register(
         create_multiply_tool(delay_seconds=MULTIPLY_TOOL_DELAY_SECONDS)
     )
 
-    # 第三步：把注册表中的工具列表交给 Agent。
-    # 从这一刻开始，Provider 能在模型请求中看到工具定义；模型返回同名
-    # toolCall 时，Agent Loop 就能找到并执行对应的 Python 函数。
     agent = Agent(
         model=model,
         stream_fn=provider.stream,
-        system_prompt="你是一个只使用给定工具完成计算的助手。",
+        system_prompt=(
+            "你是一个中文助手。先理解用户的真实请求。只有在请求适合当前工具时"
+            "才调用工具；工具执行后必须读取 Tool Result 再回答。没有合适工具时，"
+            "使用模型自身能力回答，不得编造已经执行了外部操作。"
+        ),
         tools=registry.all(),
         tool_execution="parallel",
         max_tool_calls=limits.max_tool_calls,
@@ -124,31 +151,12 @@ async def main() -> None:
         max_turns=limits.max_turns,
     )
 
-    # 下面把内部英文事件翻译成中文故事线。message_update 是逐字流事件，
-    # 数量可能很多，为了让第一次阅读更清楚，本示例不逐条打印它。
+    # 保留原来的 01、02、03……中文事件显示模式。message_update 是逐字流事件，
+    # 数量可能非常多，所以继续只展示关键生命周期事件。
     event_number = 0
     turn_number = 0
 
-    def content_text(message: dict) -> str:
-        """从消息 content 中取出所有文本，便于显示。"""
-
-        return "".join(
-            block.get("text", "")
-            for block in message.get("content", [])
-            if block.get("type") == "text"
-        )
-
-    def result_text(result: dict) -> str:
-        """从工具结果中取第一段文本。"""
-
-        for block in result.get("content", []):
-            if block.get("type") == "text":
-                return str(block.get("text", ""))
-        return "（没有文本结果）"
-
-    async def print_event(event, _cancellation):
-        """把每个关键事件翻译为一条通俗中文说明。"""
-
+    async def print_event(event, _cancellation) -> None:
         nonlocal event_number, turn_number
         event_type = event["type"]
         if event_type == "message_update":
@@ -158,20 +166,20 @@ async def main() -> None:
         explanation = ""
 
         if event_type == "agent_start":
-            explanation = "Agent 开始处理用户任务。"
+            explanation = "Agent 开始处理本次用户任务。"
         elif event_type == "turn_start":
             turn_number += 1
-            explanation = f"开始第 {turn_number} 轮：准备请求一次模型。"
+            explanation = f"开始第 {turn_number} 轮：准备请求真实模型。"
         elif event_type == "message_start":
             message = event["message"]
             role = message.get("role")
             if role == "user":
-                explanation = f"开始接收用户消息：{content_text(message)}"
+                explanation = f"收到本次用户输入：{content_text(message)}"
             elif role == "assistant":
-                explanation = "模型开始生成一条回复。"
+                explanation = "真实模型开始生成一条回复。"
             elif role == "toolResult":
                 explanation = (
-                    f"准备把 {message.get('toolName')} 的结果写回对话。"
+                    f"准备把 {message.get('toolName')} 的结果写回模型上下文。"
                 )
         elif event_type == "message_end":
             message = event["message"]
@@ -180,21 +188,22 @@ async def main() -> None:
                 explanation = "用户消息已经加入本次模型上下文。"
             elif role == "assistant":
                 tool_names = [
-                    block.get("name", "未知工具")
+                    str(block.get("name", "未知工具"))
                     for block in message.get("content", [])
-                    if block.get("type") == "toolCall"
+                    if isinstance(block, dict) and block.get("type") == "toolCall"
                 ]
                 if tool_names:
+                    explanation = "模型要求调用工具：" + "、".join(tool_names) + "。"
+                elif message.get("stopReason") in {"error", "aborted"}:
                     explanation = (
-                        "模型第一轮没有直接给答案，而是要求调用工具："
-                        + "、".join(tool_names)
-                        + "。"
+                        "模型请求失败："
+                        f"{message.get('errorMessage', '未知错误')}"
                     )
                 else:
                     explanation = f"模型回复完成：{content_text(message)}"
             elif role == "toolResult":
                 explanation = (
-                    f"{message.get('toolName')} 的结果已经写回对话："
+                    f"{message.get('toolName')} 的结果已经写回模型上下文："
                     f"{result_text(message)}"
                 )
         elif event_type == "tool_execution_start":
@@ -224,33 +233,44 @@ async def main() -> None:
         print(f"[{event_number:02d}] {explanation}")
 
     print("=" * 68)
-    print("这个示例不会连接真实大模型，而是使用预先写好的假模型响应。")
-    print("任务：请同时计算 2+3 和 4×5。")
+    print("真实 OpenAI-compatible Agent 示例")
+    print(f"Provider：{model.provider}")
+    print(f"模型：{model.id}")
+    print(f"用户消息：{user_message}")
     print("已注册工具：add（独立超时 2 秒）、multiply（独立超时 5 秒）。")
-    print(
-        "模拟执行延时："
-        f"add={ADD_TOOL_DELAY_SECONDS:g} 秒，"
-        f"multiply={MULTIPLY_TOOL_DELAY_SECONDS:g} 秒。"
-    )
     print(
         "运行预算："
         f"max_turns={limits.max_turns}，"
         f"max_tool_calls={limits.max_tool_calls}，"
         f"max_parallel_tools={limits.max_parallel_tools}。"
     )
-    print("重点：模型先请求两个工具，工具完成后，模型再生成最终回答。")
+    parsed_url = urlsplit(profile.base_url)
+    if parsed_url.scheme == "http" and parsed_url.hostname not in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }:
+        print("安全警告：当前使用远程明文 HTTP，Bearer 和消息没有 TLS 保护。")
     print("=" * 68)
 
     agent.subscribe(print_event)
-    await agent.prompt("请同时计算 2+3 和 4×5")
+    await agent.prompt(user_message)
 
     final = agent.state.messages[-1]
+    final_text = content_text(final)
+    if not final_text:
+        final_text = str(final.get("errorMessage", "（模型没有返回文本）"))
+
     print("\n" + "=" * 68)
-    print("最终回答：", final["content"][0]["text"])
+    print("最终回答：", final_text)
     print("模型调用次数：", provider.call_count)
-    print("为什么调用 2 次：")
-    print("  第 1 次：模型决定调用 add 和 multiply 两个工具。")
-    print("  第 2 次：模型读取两个工具结果，整理成最终中文回答。")
+    print(f"为什么调用 {provider.call_count} 次：")
+    explanations = model_call_explanations(agent.state.messages)
+    if explanations:
+        for explanation in explanations:
+            print(explanation)
+    else:
+        print("  本次没有形成 assistant 消息。")
     print("=" * 68)
 
 

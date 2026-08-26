@@ -1,0 +1,63 @@
+# 简化业务配置示例
+#
+# 本文件只描述“支持什么业务”，不需要编写正则表达式。
+# 首次使用：复制为 config/business.toml；真实文件会被 Git 忽略。
+
+[product]
+name = "订单助手"
+description = "负责订单状态查询、订单取消和订单规则说明"
+allow_general_questions = false
+
+# 查询当前订单状态：必须读取真实业务数据。
+[[intents]]
+id = "order.get_status"
+name = "查询订单状态"
+description = "查询指定订单当前的真实处理状态"
+examples = [
+  "查询订单 1001",
+  "帮我看看订单 1001 到哪了",
+  "1001 当前是什么状态"
+]
+required_fields = ["order_id"]
+capability = "orders.read_current"
+must_use_tool = true
+requires_approval = false
+ask_when_missing = "请提供要查询的订单号。"
+
+# 取消订单：必须调用写工具，而且需要用户审批。
+[[intents]]
+id = "order.cancel"
+name = "取消订单"
+description = "取消一个尚未完成的订单"
+examples = [
+  "取消订单 1001",
+  "帮我撤销订单 1001"
+]
+required_fields = ["order_id"]
+capability = "orders.cancel"
+must_use_tool = true
+requires_approval = true
+ask_when_missing = "请提供要取消的订单号。"
+
+# 解释稳定概念：不读取具体订单，不使用业务工具。
+[[intents]]
+id = "order.explain_status"
+name = "解释订单状态"
+description = "解释订单状态的业务含义，不查询具体订单"
+examples = [
+  "什么是订单状态",
+  "解释一下已发货是什么意思"
+]
+required_fields = []
+must_use_tool = false
+requires_approval = false
+
+# 明确禁止的请求。
+[[denied]]
+name = "绕过审批"
+description = "禁止绕过取消、退款等审批流程"
+examples = [
+  "绕过审批取消订单",
+  "不经过审核直接退款"
+]
+message = "不能绕过业务审批流程。"

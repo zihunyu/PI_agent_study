@@ -18,3 +18,13 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 本地运行配置可能包含 API Key，禁止提交真实 TOML 配置。
+/config/*.toml
+
+# `*.toml.example` 不匹配上一条规则，因此脱敏示例仍可提交。
+
+# 常见环境变量密钥文件同样禁止提交。
+.env
+.env.*
+!.env.example

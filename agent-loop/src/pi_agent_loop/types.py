@@ -148,6 +148,8 @@ class AgentLoopTurnUpdate:
     context: AgentContext | None = None
     model: Model | None = None
     thinking_level: ThinkingLevel | None = None
+    # 例如第一轮强制 Tool Call 成功后，下一轮切回 auto 以允许最终文本。
+    stream_options: dict[str, Any] | None = None
 
 
 StreamFn: TypeAlias = Callable[

@@ -1,0 +1,14 @@
+# Agent Loop 运行预算配置示例
+#
+# 首次使用：复制为 config/agent.toml。真实运行配置不会提交到 Git。
+# 所有值必须是大于 0 的整数，不能写成 0、负数、小数或 true/false。
+
+[limits]
+# 一次 Agent 运行最多接受多少个工具调用。
+max_tool_calls = 10
+
+# 同一时刻最多并行执行多少个工具。
+max_parallel_tools = 5
+
+# 一次 Agent 运行最多请求模型多少轮。
+max_turns = 20

@@ -426,6 +426,9 @@ async def _run_loop(
                         thinking_level=update.thinking_level
                         if update.thinking_level is not None
                         else config.thinking_level,
+                        stream_options=dict(update.stream_options)
+                        if update.stream_options is not None
+                        else config.stream_options,
                     )
 
             if config.should_stop_after_turn is not None:

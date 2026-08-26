@@ -1,6 +1,6 @@
 # Python Agent 内置工具系统架构设计
 
-> 状态：总体架构设计已完成；当前已完成计算工具、ToolRegistry、父子取消、独立 Timeout，以及 TOML 可配置的 Turn/Tool Call/最大并行工具预算。  
+> 状态：总体架构设计已完成；当前已完成工具执行基础、运行预算、简化 business.toml、HybridModelRouter、CapabilityRegistry、Approval Gate 和 RequiredToolCallGuard。
 > 目标项目：`agent-loop/`  
 > 目标：为现有 Python Agent Loop 增加安全、可测试、可扩展的内置工具系统。  
 > 当前教学工具：`add`、`multiply`。  

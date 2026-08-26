@@ -1,0 +1,28 @@
+# 第三方大模型 Provider 配置示例
+#
+# 首次使用：复制为 config/providers.toml，再填写真实 Base URL、API Key 和模型 ID。
+# providers.toml 会被 Git 忽略；本示例文件只能保存无效占位值。
+
+[active]
+profile = "third_party"
+
+[profiles.third_party]
+protocol = "openai_chat_completions"
+
+# 可以包含 /v1，但不要包含 /chat/completions。
+base_url = "https://api.example.com/v1"
+endpoint = "/chat/completions"
+
+# 第一版只支持 Authorization: Bearer <api_key>。
+auth_type = "bearer"
+api_key = "REPLACE_WITH_YOUR_API_KEY"
+
+# 填写第三方平台文档规定的真实模型 ID。
+model = "REPLACE_WITH_PROVIDER_MODEL_ID"
+
+stream = true
+connect_timeout_seconds = 10
+request_timeout_seconds = 60
+
+# 远程 API 默认必须使用 HTTPS。本地 localhost/127.0.0.1 测试可使用 HTTP。
+allow_insecure_http = false

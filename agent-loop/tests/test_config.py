@@ -14,7 +14,11 @@ from pi_agent_loop import AgentLimits, load_agent_limits  # noqa: E402
 
 class AgentConfigTests(unittest.TestCase):
     def test_项目配置读取为_10_5_20(self) -> None:
-        config_path = Path(__file__).resolve().parents[1] / "config" / "agent.toml"
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "agent.toml.example"
+        )
 
         limits = load_agent_limits(config_path)
 
