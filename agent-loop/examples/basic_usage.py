@@ -11,54 +11,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pi_agent_loop import (  # noqa: E402
     Agent,
-    AgentTool,
-    AgentToolResult,
     Model,
     ScriptedProvider,
+    ToolRegistry,
     assistant_message,
+    create_add_tool,
+    create_multiply_tool,
 )
-
-
-def validate_numbers(arguments: object) -> dict:
-    """示例参数校验：两个字段都必须是数字。"""
-
-    if not isinstance(arguments, dict):
-        raise ValueError("参数必须是对象")
-    a = arguments.get("a")
-    b = arguments.get("b")
-    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
-        raise ValueError("a 和 b 必须是数字")
-    return {"a": a, "b": b}
-
-
-async def add_execute(tool_call_id, arguments, cancellation, on_update):
-    """加法工具；演示工具如何发送一次中间进度。"""
-
-    cancellation.throw_if_cancelled()
-    on_update(
-        AgentToolResult(
-            content=[{"type": "text", "text": "正在计算加法……"}],
-            details={"phase": "calculating"},
-        )
-    )
-    await asyncio.sleep(0.02)
-    value = arguments["a"] + arguments["b"]
-    return AgentToolResult(
-        content=[{"type": "text", "text": str(value)}],
-        details={"value": value, "toolCallId": tool_call_id},
-    )
-
-
-async def multiply_execute(tool_call_id, arguments, cancellation, on_update):
-    """乘法工具。"""
-
-    cancellation.throw_if_cancelled()
-    await asyncio.sleep(0.01)
-    value = arguments["a"] * arguments["b"]
-    return AgentToolResult(
-        content=[{"type": "text", "text": str(value)}],
-        details={"value": value, "toolCallId": tool_call_id},
-    )
 
 
 async def main() -> None:
@@ -112,36 +71,21 @@ async def main() -> None:
         chunk_size=4,
     )
 
-    add_tool = AgentTool(
-        name="add",
-        label="加法",
-        description="计算两个数字之和",
-        parameters={
-            "type": "object",
-            "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
-            "required": ["a", "b"],
-        },
-        validate_args=validate_numbers,
-        execute=add_execute,
-    )
-    multiply_tool = AgentTool(
-        name="multiply",
-        label="乘法",
-        description="计算两个数字之积",
-        parameters={
-            "type": "object",
-            "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
-            "required": ["a", "b"],
-        },
-        validate_args=validate_numbers,
-        execute=multiply_execute,
-    )
+    # 第一步：创建工具注册表。
+    registry = ToolRegistry()
 
+    # 第二步：创建我们自己编写的加法、乘法工具，并注册到注册表。
+    registry.register(create_add_tool())
+    registry.register(create_multiply_tool())
+
+    # 第三步：把注册表中的工具列表交给 Agent。
+    # 从这一刻开始，Provider 能在模型请求中看到工具定义；模型返回同名
+    # toolCall 时，Agent Loop 就能找到并执行对应的 Python 函数。
     agent = Agent(
         model=model,
         stream_fn=provider.stream,
         system_prompt="你是一个只使用给定工具完成计算的助手。",
-        tools=[add_tool, multiply_tool],
+        tools=registry.all(),
         tool_execution="parallel",
     )
 

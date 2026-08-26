@@ -11,6 +11,13 @@ from .loop import (
 )
 from .messages import assistant_message, empty_usage, now_ms, user_message
 from .testing import ScriptedProvider
+from .tools import (
+    ToolRegistry,
+    create_add_tool,
+    create_calculator_registry,
+    create_calculator_tools,
+    create_multiply_tool,
+)
 from .types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -45,10 +52,15 @@ __all__ = [
     "Model",
     "OperationCancelledError",
     "ScriptedProvider",
+    "ToolRegistry",
     "TurnCompletedContext",
     "agent_loop",
     "agent_loop_continue",
     "assistant_message",
+    "create_add_tool",
+    "create_calculator_registry",
+    "create_calculator_tools",
+    "create_multiply_tool",
     "empty_usage",
     "now_ms",
     "run_agent_loop",

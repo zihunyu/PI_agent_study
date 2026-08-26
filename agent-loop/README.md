@@ -123,7 +123,8 @@ agent-loop/
 │  ├─ minimal_text.py                最简单的纯文本示例
 │  └─ basic_usage.py                 带逐步中文说明的并行工具示例
 ├─ tests/
-│  └─ test_agent_loop.py             核心语义测试
+│  ├─ test_agent_loop.py             Agent Loop 核心语义测试
+│  └─ test_calculator_tools.py       加法、乘法与注册表测试
 └─ src/pi_agent_loop/
    ├─ __init__.py                    公开导出
    ├─ cancellation.py                合作式取消令牌
@@ -132,7 +133,13 @@ agent-loop/
    ├─ types.py                       Model、Tool、Config 等类型
    ├─ loop.py                        低层 Agent Loop
    ├─ agent.py                       有状态 Agent 封装
-   └─ testing.py                     ScriptedProvider
+   ├─ testing.py                     ScriptedProvider
+   └─ tools/
+      ├─ __init__.py                 计算工具公开导出
+      ├─ validators.py               a、b 参数校验
+      ├─ add.py                      加法工具
+      ├─ multiply.py                 乘法工具
+      └─ registry.py                 工具注册表
 ```
 
 ---
@@ -240,20 +247,25 @@ python -m unittest discover -s tests -v
 
 ```text
 ... ok
-Ran 6 tests
+Ran 11 tests
 OK
 ```
 
-表示六个自动测试全部通过，并不是 Agent 又执行了六个用户任务。
+表示十一个自动测试全部通过，并不是 Agent 又执行了十一个用户任务。
 
-六个测试分别检查：
+十一个测试分别检查：
 
 1. 最终回答能否进入 Agent 状态；
 2. 工具结果能否交回模型并触发第二次模型请求；
 3. 并行工具的完成顺序与结果顺序是否正确；
 4. 被长度上限截断的工具参数是否会被安全拒绝；
 5. follow-up 是否等原任务结束后才处理；
-6. `agent_end` 的异步监听器结束前，Agent 是否仍保持忙碌。
+6. `agent_end` 的异步监听器结束前，Agent 是否仍保持忙碌；
+7. 加法工具是否正确返回 `2+3=5`；
+8. 乘法工具是否正确返回 `4×5=20`；
+9. 参数校验是否拒绝缺少字段和布尔值；
+10. 注册表是否拒绝重名工具；
+11. 注册后的真实工具函数是否能被 Agent Loop 调用。
 
 ### 4.5 可选安装
 
@@ -815,7 +827,10 @@ TypeScript 通过联合类型提供编译期检查。Python 版本为零依赖�
 
 ## 16. 测试说明
 
-测试文件：`tests/test_agent_loop.py`。
+测试文件：
+
+- `tests/test_agent_loop.py`；
+- `tests/test_calculator_tools.py`。
 
 覆盖：
 
@@ -824,7 +839,11 @@ TypeScript 通过联合类型提供编译期检查。Python 版本为零依赖�
 3. 并行工具完成顺序与结果顺序；
 4. length 截断工具不执行；
 5. follow-up 的处理时机；
-6. `agent_end` listener settlement。
+6. `agent_end` listener settlement；
+7. 加法和乘法结果；
+8. 参数校验；
+9. 工具重名保护；
+10. Registry → Agent → Agent Loop → ToolResult 完整链路。
 
 运行：
 
@@ -942,3 +961,384 @@ Session/Host
 > **低层循环只负责模型、消息、工具和队列；重试、压缩、持久化和 UI 由外层负责。**
 
 如果只是学习 Agent 原理，可以直接阅读 `loop.py` 和 `agent.py`；如果准备做生产系统，请先运行测试，再按第 17 节补齐可靠性和安全能力。
+
+---
+
+## 20. 加法工具、乘法工具和注册流程教学
+
+本阶段只实现两个工具：
+
+```text
+add          加法工具
+multiply     乘法工具
+```
+
+目标不是建设完整文件工具系统，而是先学懂一条最小工具链：
+
+```text
+编写工具
+  -> 注册工具
+  -> 把工具交给 Agent
+  -> 假模型返回 toolCall
+  -> Agent Loop 找到同名工具
+  -> 执行 Python 函数
+  -> ToolResult 写回模型上下文
+  -> 模型生成最终回答
+```
+
+### 20.1 工具文件在哪里
+
+```text
+src/pi_agent_loop/tools/
+├─ validators.py       加法、乘法共用参数校验
+├─ add.py              加法工具
+├─ multiply.py         乘法工具
+├─ registry.py         工具注册表
+└─ __init__.py         对外导出
+```
+
+### 20.2 加法工具由哪些部分组成
+
+打开：
+
+`src/pi_agent_loop/tools/add.py`
+
+工具工厂：
+
+```python
+create_add_tool()
+```
+
+它返回 `AgentTool`，其中包含：
+
+```text
+name                 模型调用时使用的名字 add
+label                给人看的中文名称“加法”
+description          告诉模型这个工具做什么
+parameters           给模型看的参数 JSON Schema
+validate_args        Python 运行时参数校验
+execute              真正执行 a + b
+execution_mode       允许与其他工具并行
+```
+
+真正计算发生在：
+
+```python
+value = a + b
+```
+
+最终返回：
+
+```python
+AgentToolResult(
+    content=[{"type": "text", "text": str(value)}],
+    details={
+        "operation": "add",
+        "a": a,
+        "b": b,
+        "value": value,
+    },
+)
+```
+
+`content` 会交给模型，`details` 主要给测试、日志和以后 UI 使用。
+
+### 20.3 乘法工具
+
+打开：
+
+`src/pi_agent_loop/tools/multiply.py`
+
+工具工厂：
+
+```python
+create_multiply_tool()
+```
+
+核心计算：
+
+```python
+value = a * b
+```
+
+它与加法工具使用相同参数：
+
+```python
+{"a": 4, "b": 5}
+```
+
+返回文本：
+
+```text
+20
+```
+
+### 20.4 参数校验为什么独立
+
+两个工具都需要 `a` 和 `b`，所以共享：
+
+`src/pi_agent_loop/tools/validators.py`
+
+校验规则：
+
+- 参数必须是字典；
+- 必须同时包含 `a` 和 `b`；
+- 两者必须是 `int` 或 `float`；
+- 拒绝布尔值；
+- 拒绝 NaN；
+- 拒绝正负无穷。
+
+工具给模型看的 JSON Schema 和 Python 真正运行的校验是两件事：
+
+```text
+parameters       告诉模型应该怎样填写参数
+validate_args    防止错误参数真正进入 Python 计算
+```
+
+不能只相信模型会按照 Schema 正确输出。
+
+### 20.5 什么叫“注册工具”
+
+工具写好后只是一个 Python 对象，Agent 还不知道它存在。
+
+注册就是把它加入 `ToolRegistry`：
+
+```python
+registry = ToolRegistry()
+registry.register(create_add_tool())
+registry.register(create_multiply_tool())
+```
+
+此时：
+
+```python
+registry.names()
+```
+
+返回：
+
+```python
+["add", "multiply"]
+```
+
+### 20.6 为什么需要 ToolRegistry
+
+也可以直接写：
+
+```python
+tools = [create_add_tool(), create_multiply_tool()]
+```
+
+但 Registry 可以：
+
+- 集中管理工具；
+- 检查工具名称不能为空；
+- 防止同名工具被静默覆盖；
+- 按名称查找工具；
+- 保持注册顺序；
+- 以后方便增加工具 Profile。
+
+重复注册：
+
+```python
+registry.register(create_add_tool())
+registry.register(create_add_tool())
+```
+
+会明确报错：
+
+```text
+工具已经注册：add
+```
+
+### 20.7 注册表怎样交给 Agent
+
+注册完成后，把 Registry 导出的列表交给 Agent：
+
+```python
+agent = Agent(
+    model=model,
+    stream_fn=provider.stream,
+    tools=registry.all(),
+)
+```
+
+这一步完成两个连接：
+
+1. Provider 请求时可以看到 `add`、`multiply` 的名称、描述和参数 Schema；
+2. 模型返回 `toolCall(name="add")` 时，Agent Loop 能找到真正的 Python 加法函数。
+
+### 20.8 完整注册代码
+
+`examples/basic_usage.py` 中现在使用：
+
+```python
+registry = ToolRegistry()
+registry.register(create_add_tool())
+registry.register(create_multiply_tool())
+
+agent = Agent(
+    model=model,
+    stream_fn=provider.stream,
+    system_prompt="你是一个只使用给定工具完成计算的助手。",
+    tools=registry.all(),
+    tool_execution="parallel",
+)
+```
+
+也可以使用快捷工厂：
+
+```python
+from pi_agent_loop import create_calculator_registry
+
+registry = create_calculator_registry()
+agent = Agent(
+    model=model,
+    stream_fn=provider.stream,
+    tools=registry.all(),
+)
+```
+
+### 20.9 注册以后是怎样调用到工具的
+
+假模型第一次返回：
+
+```python
+{
+    "type": "toolCall",
+    "id": "call-add",
+    "name": "add",
+    "arguments": {"a": 2, "b": 3},
+}
+```
+
+Agent Loop 执行：
+
+```text
+读取 name=add
+  -> 在 Agent tools 中找到 add
+  -> 调用 add.validate_args({a:2,b:3})
+  -> 调用 add.execute(...)
+  -> 得到文本结果 5
+  -> 创建 ToolResultMessage
+```
+
+乘法同理：
+
+```text
+name=multiply
+  -> 调用乘法工具
+  -> 4×5
+  -> 得到 20
+```
+
+### 20.10 为什么模型调用两次
+
+第 1 次：
+
+```text
+用户：请同时计算 2+3 和 4×5
+模型：我要调用 add 和 multiply
+```
+
+工具执行：
+
+```text
+add(2,3)          -> 5
+multiply(4,5)     -> 20
+```
+
+第 2 次：
+
+```text
+模型读取结果 5 和 20
+  -> 生成“加法结果是 5，乘法结果是 20。”
+```
+
+因此模型调用次数是 2，但 Python 工具各执行一次。
+
+### 20.11 为什么前五个事件保持不变
+
+```text
+[01] Agent 开始处理用户任务。
+[02] 开始第 1 轮：准备请求一次模型。
+[03] 开始接收用户消息：请同时计算 2+3 和 4×5
+[04] 用户消息已经加入本次模型上下文。
+[05] 模型开始生成一条回复。
+```
+
+这五步属于 Agent Loop 的通用流程，与工具写在示例内部还是独立 tools 目录无关。
+
+从第六步开始，模型返回 `add` 和 `multiply`，Agent Loop 才进入我们编写的工具。
+
+### 20.12 当前仍是假模型
+
+`ScriptedProvider` 已经预先写好：
+
+```text
+第一次返回 add/multiply toolCall
+第二次返回最终中文回答
+```
+
+所以当前重点是学习“工具编写和注册”，不是学习真实模型怎样理解用户问题。
+
+以后接入 DeepSeekProvider 后，将由真实模型根据：
+
+- 用户问题；
+- 工具 description；
+- 工具 parameters；
+
+自行决定是否调用 `add` 或 `multiply`。
+
+### 20.13 运行示例
+
+```bash
+python examples/basic_usage.py
+```
+
+前五步保持原样，后面会明确显示：
+
+```text
+模型要求调用工具：add、multiply
+开始执行工具 add
+开始执行工具 multiply
+加法工具正在计算
+乘法工具正在计算
+工具 add 返回 5
+工具 multiply 返回 20
+```
+
+### 20.14 运行测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+现在共有 11 项测试：
+
+- 原 Agent Loop 6 项；
+- 加法、乘法和 Registry 5 项。
+
+只有看到：
+
+```text
+Ran 11 tests
+OK
+```
+
+才表示本阶段全部通过。
+
+### 20.15 本阶段完成标准
+
+- [x] 创建 `tools` 目录；
+- [x] 加法工具独立文件；
+- [x] 乘法工具独立文件；
+- [x] 公共参数校验；
+- [x] ToolRegistry；
+- [x] 防止工具重名；
+- [x] 示例通过 Registry 注册工具；
+- [x] Agent Loop 调用真实 Python 工具函数；
+- [x] 工具单元测试；
+- [x] Agent 集成测试。
+
+下一阶段可以继续学习真实 Provider，或者根据要求继续增加新的内置工具。
