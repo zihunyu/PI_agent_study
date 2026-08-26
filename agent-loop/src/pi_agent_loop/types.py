@@ -74,6 +74,12 @@ class AgentTool:
     validate_args: Callable[[Any], Any] = lambda value: value
     prepare_arguments: Callable[[Any], Any] | None = None
     execution_mode: ToolExecutionMode | None = None
+    # 单工具超时优先于 Agent 的默认超时。None 表示使用 Agent 默认值。
+    timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise ValueError("工具 timeout_seconds 必须大于 0")
 
 
 @dataclass(slots=True)
@@ -159,6 +165,28 @@ class AgentLoopConfig:
     stream_options: dict[str, Any] = field(default_factory=dict)
     thinking_level: ThinkingLevel = "off"
     tool_execution: ToolExecutionMode = "parallel"
+    # 当工具没有自己的 timeout_seconds 时使用这个默认值。
+    default_tool_timeout_seconds: float | None = None
+    # 三项预算均按“一次 run_agent_loop 调用”计算；None 表示不限制。
+    max_tool_calls: int | None = None
+    max_parallel_tools: int | None = None
+    max_turns: int | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_tool_calls", self.max_tool_calls),
+            ("max_parallel_tools", self.max_parallel_tools),
+            ("max_turns", self.max_turns),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} 必须是大于 0 的整数或 None")
+        if (
+            self.default_tool_timeout_seconds is not None
+            and self.default_tool_timeout_seconds <= 0
+        ):
+            raise ValueError("default_tool_timeout_seconds 必须大于 0 或为 None")
 
     transform_context: Callable[
         [list[AgentMessage], CancellationToken], MaybeAwaitable

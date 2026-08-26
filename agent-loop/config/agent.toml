@@ -1,0 +1,20 @@
+# Agent Loop 运行预算配置
+#
+# 修改本文件后重新运行 examples/basic_usage.py 即可生效。
+# 所有值必须是大于 0 的整数，不能写成 0、负数、小数或 true/false。
+
+[limits]
+# max_tool_calls：限制一次 Agent 运行最多接受多少个工具调用。
+# 这里统计模型请求的全部 toolCall，包括并行工具、未知工具、参数错误工具。
+# 如果当前一整批工具会导致总数超过限制，则整批工具都不执行，防止只做一半。
+max_tool_calls = 10
+
+# max_parallel_tools：限制同一时刻最多并行执行多少个工具。
+# 例如模型一次请求 8 个工具，此值为 5 时，会先运行最多 5 个；
+# 其中有工具完成后，排队工具再进入执行。它不改变 max_tool_calls 总预算。
+max_parallel_tools = 5
+
+# max_turns：限制一次 Agent 运行最多请求模型多少轮。
+# 一轮通常是“一条 assistant 回复 + 该回复要求的全部工具结果”。
+# 达到限制后，不再发起下一次模型请求，而是正常发出预算耗尽和 agent_end 事件。
+max_turns = 20

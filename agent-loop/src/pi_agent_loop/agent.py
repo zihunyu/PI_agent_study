@@ -124,8 +124,27 @@ class Agent:
         steering_mode: QueueMode = "one-at-a-time",
         follow_up_mode: QueueMode = "one-at-a-time",
         tool_execution: ToolExecutionMode = "parallel",
+        default_tool_timeout_seconds: float | None = None,
+        max_tool_calls: int | None = None,
+        max_parallel_tools: int | None = None,
+        max_turns: int | None = None,
         stream_options: dict[str, Any] | None = None,
     ) -> None:
+        if (
+            default_tool_timeout_seconds is not None
+            and default_tool_timeout_seconds <= 0
+        ):
+            raise ValueError("default_tool_timeout_seconds 必须大于 0")
+        for name, value in (
+            ("max_tool_calls", max_tool_calls),
+            ("max_parallel_tools", max_parallel_tools),
+            ("max_turns", max_turns),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} 必须是大于 0 的整数或 None")
+
         self.state = AgentState(
             system_prompt=system_prompt,
             model=model,
@@ -142,6 +161,10 @@ class Agent:
         self.should_stop_after_turn = should_stop_after_turn
         self.prepare_next_turn = prepare_next_turn
         self.tool_execution = tool_execution
+        self.default_tool_timeout_seconds = default_tool_timeout_seconds
+        self.max_tool_calls = max_tool_calls
+        self.max_parallel_tools = max_parallel_tools
+        self.max_turns = max_turns
         self.stream_options = dict(stream_options or {})
 
         self._steering_queue = _PendingMessageQueue(steering_mode)
@@ -371,6 +394,10 @@ class Agent:
             get_steering_messages=get_steering,
             get_follow_up_messages=get_follow_up,
             tool_execution=self.tool_execution,
+            default_tool_timeout_seconds=self.default_tool_timeout_seconds,
+            max_tool_calls=self.max_tool_calls,
+            max_parallel_tools=self.max_parallel_tools,
+            max_turns=self.max_turns,
             stream_options=dict(self.stream_options),
         )
 
@@ -441,6 +468,8 @@ class Agent:
             message = event.get("message", {})
             if message.get("role") == "assistant" and message.get("errorMessage"):
                 self.state.error_message = str(message["errorMessage"])
+        elif event_type == "budget_exceeded":
+            self.state.error_message = str(event.get("message", "运行预算不足"))
         elif event_type == "agent_end":
             self.state.streaming_message = None
 

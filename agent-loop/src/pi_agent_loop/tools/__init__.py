@@ -11,17 +11,33 @@ from .registry import ToolRegistry
 from .validators import validate_two_numbers
 
 
-def create_calculator_tools():
-    """创建加法、乘法两项计算工具。"""
+def create_calculator_tools(
+    *,
+    add_delay_seconds: float = 0.0,
+    multiply_delay_seconds: float = 0.0,
+):
+    """创建加法、乘法工具，可选教学模拟延时。"""
 
-    return [create_add_tool(), create_multiply_tool()]
+    return [
+        create_add_tool(delay_seconds=add_delay_seconds),
+        create_multiply_tool(delay_seconds=multiply_delay_seconds),
+    ]
 
 
-def create_calculator_registry() -> ToolRegistry:
+def create_calculator_registry(
+    *,
+    add_delay_seconds: float = 0.0,
+    multiply_delay_seconds: float = 0.0,
+) -> ToolRegistry:
     """创建并注册加法、乘法工具的注册表。"""
 
     registry = ToolRegistry()
-    registry.register_many(create_calculator_tools())
+    registry.register_many(
+        create_calculator_tools(
+            add_delay_seconds=add_delay_seconds,
+            multiply_delay_seconds=multiply_delay_seconds,
+        )
+    )
     return registry
 
 

@@ -71,7 +71,12 @@ def assistant_message(
     return message
 
 
-def error_tool_result(message: str, *, terminate: bool = False) -> "AgentToolResult":
+def error_tool_result(
+    message: str,
+    *,
+    terminate: bool = False,
+    details: dict | None = None,
+) -> "AgentToolResult":
     """把工具准备或执行异常规范成模型可读取的文本结果。"""
 
     # 延迟导入用于避免 messages.py 与 types.py 的循环导入。
@@ -79,7 +84,7 @@ def error_tool_result(message: str, *, terminate: bool = False) -> "AgentToolRes
 
     return AgentToolResult(
         content=[{"type": "text", "text": message}],
-        details={},
+        details=details or {},
         terminate=True if terminate else None,
     )
 

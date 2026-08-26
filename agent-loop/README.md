@@ -119,15 +119,22 @@ agent-loop/
 ├─ README.md                         中文说明
 ├─ LICENSE                           Pi 原项目 MIT 许可证
 ├─ pyproject.toml                    Python 包配置
+├─ config/
+│  └─ agent.toml                    Turn、Tool Call 和并行数配置
 ├─ examples/
 │  ├─ minimal_text.py                最简单的纯文本示例
 │  └─ basic_usage.py                 带逐步中文说明的并行工具示例
 ├─ tests/
 │  ├─ test_agent_loop.py             Agent Loop 核心语义测试
-│  └─ test_calculator_tools.py       加法、乘法与注册表测试
+│  ├─ test_calculator_tools.py       加法、乘法与注册表测试
+│  ├─ test_tool_timeout.py           独立超时与取消隔离测试
+│  ├─ test_cancellation.py           父子取消令牌传播测试
+│  ├─ test_config.py                 TOML 配置校验测试
+│  └─ test_budgets.py                Turn/Tool/并行预算测试
 └─ src/pi_agent_loop/
    ├─ __init__.py                    公开导出
    ├─ cancellation.py                合作式取消令牌
+   ├─ config.py                      TOML 配置加载
    ├─ event_stream.py                异步事件流和最终结果
    ├─ messages.py                    消息构造与复制
    ├─ types.py                       Model、Tool、Config 等类型
@@ -247,13 +254,13 @@ python -m unittest discover -s tests -v
 
 ```text
 ... ok
-Ran 11 tests
+Ran 30 tests
 OK
 ```
 
-表示十一个自动测试全部通过，并不是 Agent 又执行了十一个用户任务。
+表示三十个自动测试全部通过，并不是 Agent 又执行了三十个用户任务。
 
-十一个测试分别检查：
+三十个测试分别检查：
 
 1. 最终回答能否进入 Agent 状态；
 2. 工具结果能否交回模型并触发第二次模型请求；
@@ -265,7 +272,26 @@ OK
 8. 乘法工具是否正确返回 `4×5=20`；
 9. 参数校验是否拒绝缺少字段和布尔值；
 10. 注册表是否拒绝重名工具；
-11. 注册后的真实工具函数是否能被 Agent Loop 调用。
+11. 注册后的真实工具函数是否能被 Agent Loop 调用；
+12. 快速工具能否在自己的 timeout 内完成；
+13. 慢工具是否返回 `tool_timeout`；
+14. 一个并行工具超时是否不影响其他工具；
+15. Agent 默认 timeout 是否作用于未单独配置的工具；
+16. 用户取消是否取消全部工具并忽略迟到 update；
+17. 父令牌取消是否传播给全部子令牌；
+18. 子令牌取消是否不会误伤父令牌和兄弟令牌；
+19. `detach()` 后父令牌是否不再保存已结束工具；
+20. TOML 配置是否读取为 10、5、20；
+21. 配置缺少字段时是否明确报错；
+22. 配置中的 0、负数、小数和布尔值是否被拒绝；
+23. 配置拼写错误是否通过未知字段检测；
+24. 两轮、两个工具是否能在预算内完成；
+25. `max_turns=1` 是否阻止第二次模型请求；
+26. Tool Call 总预算不足时是否整批拒绝；
+27. Tool Call 预算是否跨 Turn 累计；
+28. `max_parallel_tools` 是否限制实际并发数；
+29. 未知工具是否也消耗 Tool Call 预算；
+30. 新 prompt 是否重新获得独立预算。
 
 ### 4.5 可选安装
 
@@ -830,7 +856,11 @@ TypeScript 通过联合类型提供编译期检查。Python 版本为零依赖�
 测试文件：
 
 - `tests/test_agent_loop.py`；
-- `tests/test_calculator_tools.py`。
+- `tests/test_calculator_tools.py`；
+- `tests/test_tool_timeout.py`；
+- `tests/test_cancellation.py`；
+- `tests/test_config.py`；
+- `tests/test_budgets.py`。
 
 覆盖：
 
@@ -843,7 +873,24 @@ TypeScript 通过联合类型提供编译期检查。Python 版本为零依赖�
 7. 加法和乘法结果；
 8. 参数校验；
 9. 工具重名保护；
-10. Registry → Agent → Agent Loop → ToolResult 完整链路。
+10. Registry → Agent → Agent Loop → ToolResult 完整链路；
+11. 单工具独立 timeout；
+12. 并行工具 timeout 隔离；
+13. Agent 默认 timeout；
+14. 父子 CancellationToken；
+15. 取消后的迟到 update 隔离；
+16. 父取消向下传播；
+17. 子取消不向上或横向传播；
+18. 子令牌 detach 清理；
+19. TOML 配置读取和严格校验；
+20. 最大 Turn 预算；
+21. 最大 Tool Call 总预算；
+22. Tool Call 跨 Turn 累计；
+23. 超预算整批拒绝；
+24. 最大并行工具数；
+25. 并行任务异常清理；
+26. 未知工具消耗预算；
+27. 每次 prompt 独立预算。
 
 运行：
 
@@ -859,25 +906,31 @@ python -m unittest discover -s tests -v
 
 如果要把本项目用于生产，至少还应增加：
 
-### 17.1 运行预算
+### 17.1 其余运行预算
 
-- 最大 Turn 数；
-- 最大工具调用数；
-- 最大总时间；
+当前已完成最大 Turn 数和最大 Tool Call 数，还缺少：
+
+- 整个 Run 的最大总时间；
 - 最大 token；
 - 最大费用。
 
-### 17.2 并发限制
+### 17.2 更高级的并发调度
 
-目前一批并行工具会全部启动。应增加 semaphore，例如：
+当前已使用 Semaphore 实现 `max_parallel_tools`，后续生产系统还可增加：
 
-```python
-semaphore = asyncio.Semaphore(4)
-```
+- 工具优先级；
+- 公平排队；
+- 不同工具类型分别限流；
+- 只读工具与有副作用工具的执行屏障。
 
-### 17.3 工具 timeout
+### 17.3 子进程级强制 Timeout
 
-CancellationToken 只能合作取消。每个工具还应有明确 timeout。
+当前已实现异步工具 timeout 和子 CancellationToken，但完全阻塞事件循环的
+同步代码仍无法被 asyncio timer 打断。Shell、外部程序等需要：
+
+- 子进程；
+- 进程组；
+- timeout 后终止整个进程树。
 
 ### 17.4 持久 Inbox
 
@@ -1314,21 +1367,152 @@ python examples/basic_usage.py
 python -m unittest discover -s tests -v
 ```
 
-现在共有 11 项测试：
+现在共有 19 项测试：
 
 - 原 Agent Loop 6 项；
-- 加法、乘法和 Registry 5 项。
+- 加法、乘法和 Registry 5 项；
+- Tool Timeout 和取消隔离 5 项；
+- 父子 CancellationToken 传播与 detach 3 项。
 
 只有看到：
 
 ```text
-Ran 11 tests
+Ran 19 tests
 OK
 ```
 
 才表示本阶段全部通过。
 
-### 20.15 本阶段完成标准
+### 20.15 加法 2 秒、乘法 5 秒的独立 Timeout
+
+当前工具配置：
+
+```text
+add.timeout_seconds = 2
+multiply.timeout_seconds = 5
+```
+
+Timeout 是“最多允许执行多久”，不是故意等待多久。正常加法和乘法会立即完成，所以普通示例不会等待 2 秒或 5 秒。
+
+#### 在 `basic_usage.py` 哪里设置模拟延时
+
+打开：
+
+`examples/basic_usage.py`
+
+在文件顶部找到：
+
+```python
+ADD_TOOL_DELAY_SECONDS = 0.0
+MULTIPLY_TOOL_DELAY_SECONDS = 0.0
+```
+
+正常成功：
+
+```python
+ADD_TOOL_DELAY_SECONDS = 0.0
+MULTIPLY_TOOL_DELAY_SECONDS = 0.0
+```
+
+只触发加法超时：
+
+```python
+ADD_TOOL_DELAY_SECONDS = 3.0       # 大于加法限制 2 秒
+MULTIPLY_TOOL_DELAY_SECONDS = 0.0
+```
+
+只触发乘法超时：
+
+```python
+ADD_TOOL_DELAY_SECONDS = 0.0
+MULTIPLY_TOOL_DELAY_SECONDS = 6.0  # 大于乘法限制 5 秒
+```
+
+两个工具都触发超时：
+
+```python
+ADD_TOOL_DELAY_SECONDS = 3.0
+MULTIPLY_TOOL_DELAY_SECONDS = 6.0
+```
+
+两个工具是并行执行的，因此同时超时时总等待大约 5 秒，而不是 3+6=9 秒。
+
+然后运行：
+
+```bat
+python examples\basic_usage.py
+```
+
+事件中会看到：
+
+```text
+工具 add 执行失败，结果为 工具 add 执行超时（限制 2 秒）
+```
+
+或者：
+
+```text
+工具 multiply 执行失败，结果为 工具 multiply 执行超时（限制 5 秒）
+```
+
+工具自己的 timeout 配置位置：
+
+- `src/pi_agent_loop/tools/add.py`；
+- `src/pi_agent_loop/tools/multiply.py`。
+
+每个工具执行时会从 Agent 总 CancellationToken 创建自己的子令牌：
+
+```text
+Agent 总令牌
+  ├─ add 子令牌，2 秒
+  └─ multiply 子令牌，5 秒
+```
+
+行为：
+
+- 用户取消 Agent：两个工具全部取消；
+- add 超过 2 秒：只取消 add；
+- multiply 超过 5 秒：只取消 multiply；
+- 一个工具超时不会误伤另一个工具；
+- 超时后的迟到 update 会被忽略；
+- timeout timer 和子令牌在工具结束后清理。
+
+工具没有单独 timeout 时，也可以使用 Agent 默认值：
+
+```python
+agent = Agent(
+    ...,
+    default_tool_timeout_seconds=30,
+)
+```
+
+优先级：
+
+```text
+AgentTool.timeout_seconds
+  -> Agent.default_tool_timeout_seconds
+  -> None，表示不限制
+```
+
+超时后的 ToolResultMessage：
+
+```python
+{
+    "isError": True,
+    "content": [
+        {"type": "text", "text": "工具 add 执行超时（限制 2 秒）"}
+    ],
+    "details": {
+        "code": "tool_timeout",
+        "toolName": "add",
+        "timeoutSeconds": 2,
+    },
+}
+```
+
+注意：asyncio timeout 只能打断会让出事件循环的异步工具。完全阻塞 Python 事件循环的同步死循环仍需要放入子进程，才能强制终止。
+
+### 20.16 本阶段完成标准
 
 - [x] 创建 `tools` 目录；
 - [x] 加法工具独立文件；
@@ -1339,6 +1523,203 @@ OK
 - [x] 示例通过 Registry 注册工具；
 - [x] Agent Loop 调用真实 Python 工具函数；
 - [x] 工具单元测试；
-- [x] Agent 集成测试。
+- [x] Agent 集成测试；
+- [x] 每个工具独立 timeout；
+- [x] 加法 timeout 为 2 秒；
+- [x] 乘法 timeout 为 5 秒；
+- [x] 父子 CancellationToken；
+- [x] 并行 timeout 隔离；
+- [x] timeout 和取消测试。
 
-下一阶段可以继续学习真实 Provider，或者根据要求继续增加新的内置工具。
+最大 Turn/Tool Call 预算和最大并行工具数已经完成，详细配置见下一节。
+
+---
+
+## 21. TOML 运行预算配置
+
+### 21.1 配置文件位置
+
+`config/agent.toml`
+
+当前内容：
+
+```toml
+[limits]
+max_tool_calls = 10
+max_parallel_tools = 5
+max_turns = 20
+```
+
+配置文件内已经为三个字段加入中文注释。修改后重新运行程序即可生效。
+
+### 21.2 三个字段的含义
+
+```text
+max_tool_calls       限制整个运行最多接受多少个工具调用
+max_parallel_tools   同一时刻最多并行执行多少个工具
+max_turns            限制最多请求模型多少轮
+```
+
+它们必须是大于 0 的整数。以下值都会被拒绝：
+
+```text
+0
+-1
+1.5
+true
+```
+
+未知字段也会被拒绝，防止把 `max_tool_calls` 错写成 `max_tool_call` 后误以为已经生效。
+
+### 21.3 示例怎样读取配置
+
+`examples/basic_usage.py`：
+
+```python
+config_path = Path(__file__).resolve().parents[1] / "config" / "agent.toml"
+limits = load_agent_limits(config_path)
+```
+
+然后交给 Agent：
+
+```python
+agent = Agent(
+    ...,
+    max_tool_calls=limits.max_tool_calls,
+    max_parallel_tools=limits.max_parallel_tools,
+    max_turns=limits.max_turns,
+)
+```
+
+运行示例时会打印：
+
+```text
+运行预算：max_turns=20，max_tool_calls=10，max_parallel_tools=5。
+```
+
+### 21.4 Turn 预算
+
+每次真正准备请求一次 assistant 时消耗 1 Turn。
+
+当前示例：
+
+```text
+第 1 Turn：模型请求 add、multiply
+第 2 Turn：模型读取工具结果并生成最终回答
+```
+
+使用 2 个 Turn，小于配置的 20。
+
+达到 `max_turns` 后：
+
+- 不再多请求一次 Provider；
+- 发出 `budget_exceeded`；
+- 设置 Agent error_message；
+- 正常发出 `agent_end`。
+
+### 21.5 Tool Call 总预算
+
+模型一条 assistant message 中的全部 toolCall 会先按整批检查：
+
+```text
+已使用数量 + 本批请求数量 <= max_tool_calls
+```
+
+成立：整批进入预检和执行。
+
+不成立：整批都不执行。
+
+例如：
+
+```text
+max_tool_calls=6
+模型一次请求10个工具
+```
+
+结果：
+
+```text
+10个全部拒绝
+不会先执行6个
+每个工具获得 tool_call_budget_exceeded 结果
+当前 Agent 运行结束
+```
+
+未知工具、参数错误和 before hook 阻止的工具，只要整批预算允许，也会消耗 Tool Call 预算，防止错误调用无限重试。
+
+### 21.6 最大并行工具数
+
+`max_parallel_tools` 通过 `asyncio.Semaphore` 限制真正进入 execute 的工具数量。
+
+例如：
+
+```text
+max_tool_calls=20
+max_parallel_tools=5
+模型一次请求8个工具
+```
+
+结果：
+
+```text
+总预算允许8个
+同一时刻最多执行5个
+有工具完成后，剩余3个陆续进入执行
+```
+
+这8个工具仍属于同一个 Turn。
+
+### 21.7 预算事件
+
+超出预算时发出：
+
+```python
+{
+    "type": "budget_exceeded",
+    "budget": "tool_calls" 或 "turns",
+    "limit": 10,
+    "used": 8,
+    "requested": 3,
+    "remaining": 2,
+    "message": "...",
+}
+```
+
+UI、日志和测试可以根据结构化字段展示原因。
+
+### 21.8 每次 prompt 的预算独立
+
+预算按一次 `run_agent_loop` 计算。
+
+```text
+agent.prompt("任务一")  获得一份新预算
+agent.prompt("任务二")  再获得一份新预算
+```
+
+任务一使用过的 Turn 和 Tool Call 不会扣减任务二的预算。
+
+### 21.9 测试
+
+新增：
+
+- `tests/test_config.py`：4 项配置测试；
+- `tests/test_budgets.py`：7 项预算与并行测试。
+
+全部测试：
+
+```text
+Ran 30 tests
+OK
+```
+
+测试覆盖：
+
+- 当前配置读取为 10、5、20；
+- 缺字段和错误类型；
+- 预算内正常运行；
+- Turn 达限不多请求模型；
+- Tool Call 超限整批拒绝；
+- 跨 Turn 累计；
+- 并行数量不超过限制；
+- 未知工具消耗预算；
+- 新 prompt 重置预算。

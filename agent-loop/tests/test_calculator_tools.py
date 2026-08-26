@@ -25,6 +25,7 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_加法工具返回正确结果(self) -> None:
         tool = create_add_tool()
         updates = []
+        self.assertEqual(tool.timeout_seconds, 2)
 
         result = await tool.execute(
             "add-id",
@@ -41,6 +42,7 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_乘法工具返回正确结果(self) -> None:
         tool = create_multiply_tool()
         updates = []
+        self.assertEqual(tool.timeout_seconds, 5)
 
         result = await tool.execute(
             "multiply-id",

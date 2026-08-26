@@ -2,6 +2,7 @@
 
 from .agent import Agent
 from .cancellation import CancellationToken, OperationCancelledError
+from .config import AgentLimits, load_agent_limits
 from .event_stream import AgentEventStream, AssistantMessageEventStream, EventStream
 from .loop import (
     agent_loop,
@@ -38,6 +39,7 @@ __all__ = [
     "AgentContext",
     "AgentEventStream",
     "AgentLoopConfig",
+    "AgentLimits",
     "AgentLoopTurnUpdate",
     "AgentState",
     "AgentTool",
@@ -62,6 +64,7 @@ __all__ = [
     "create_calculator_tools",
     "create_multiply_tool",
     "empty_usage",
+    "load_agent_limits",
     "now_ms",
     "run_agent_loop",
     "run_agent_loop_continue",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 from ..types import AgentTool, AgentToolResult
 from .validators import validate_two_numbers
@@ -13,6 +14,8 @@ async def _execute_multiply(
     arguments,
     cancellation,
     on_update,
+    *,
+    delay_seconds: float = 0.0,
 ) -> AgentToolResult:
     """执行乘法并返回模型可读取的文本结果。"""
 
@@ -23,7 +26,8 @@ async def _execute_multiply(
             details={"phase": "calculating", "operation": "multiply"},
         )
     )
-    await asyncio.sleep(0)
+    # 默认 0 表示立即计算；例如设成 6，会超过乘法工具 5 秒限制。
+    await asyncio.sleep(delay_seconds)
     cancellation.throw_if_cancelled()
 
     a = arguments["a"]
@@ -41,8 +45,24 @@ async def _execute_multiply(
     )
 
 
-def create_multiply_tool() -> AgentTool:
-    """创建一份可注册到 Agent 的乘法工具定义。"""
+def create_multiply_tool(*, delay_seconds: float = 0.0) -> AgentTool:
+    """创建乘法工具。
+
+    ``delay_seconds`` 是教学用模拟延时。传入大于 5 的值可以触发乘法工具
+    的 5 秒 Timeout。
+    """
+
+    if not math.isfinite(delay_seconds) or delay_seconds < 0:
+        raise ValueError("乘法工具 delay_seconds 必须是大于等于 0 的有限数字")
+
+    async def execute(tool_call_id, arguments, cancellation, on_update):
+        return await _execute_multiply(
+            tool_call_id,
+            arguments,
+            cancellation,
+            on_update,
+            delay_seconds=delay_seconds,
+        )
 
     return AgentTool(
         name="multiply",
@@ -58,6 +78,8 @@ def create_multiply_tool() -> AgentTool:
             "additionalProperties": False,
         },
         validate_args=validate_two_numbers,
-        execute=_execute_multiply,
+        execute=execute,
         execution_mode="parallel",
+        # 乘法工具最多执行 5 秒；超时只取消当前乘法，不影响并行工具。
+        timeout_seconds=5,
     )

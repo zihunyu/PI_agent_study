@@ -59,6 +59,14 @@ _ASSISTANT_UPDATE_TYPES = {
 }
 
 
+@dataclass(slots=True)
+class _RunBudgetState:
+    """一次低层 Agent 运行的预算使用量；每次 prompt/continue 都重新创建。"""
+
+    turns_used: int = 0
+    tool_calls_used: int = 0
+
+
 async def _maybe_await(value: Any) -> Any:
     """统一处理同步回调和异步回调的返回值。"""
 
@@ -268,6 +276,7 @@ async def _run_loop(
     current_context = initial_context
     config = initial_config
     first_turn = True
+    budget = _RunBudgetState()
     pending_messages = await _get_messages(config.get_steering_messages)
 
     while True:
@@ -275,9 +284,29 @@ async def _run_loop(
 
         while has_more_tool_calls or pending_messages:
             if not first_turn:
+                # 在发出 turn_start 和请求 Provider 前检查，确保不会多请求一轮。
+                if (
+                    config.max_turns is not None
+                    and budget.turns_used >= config.max_turns
+                ):
+                    await _emit_budget_exceeded(
+                        emit,
+                        budget="turns",
+                        limit=config.max_turns,
+                        used=budget.turns_used,
+                        requested=1,
+                    )
+                    await _emit(
+                        emit,
+                        {"type": "agent_end", "messages": list(new_messages)},
+                    )
+                    return
                 await _emit(emit, {"type": "turn_start"})
             else:
                 first_turn = False
+
+            # 每次真正准备请求 assistant 时消耗一个 Turn。
+            budget.turns_used += 1
 
             # Steering/follow-up 在新 assistant 请求前作为正常消息注入。
             if pending_messages:
@@ -315,18 +344,45 @@ async def _run_loop(
             tool_calls = _assistant_tool_calls(message)
             tool_results: list[AgentMessage] = []
             has_more_tool_calls = False
+            hard_budget_stop = False
 
             if tool_calls:
-                if message.get("stopReason") == "length":
-                    batch = await _fail_truncated_tool_calls(tool_calls, emit)
-                else:
-                    batch = await _execute_tool_calls(
-                        current_context,
-                        message,
-                        config,
-                        cancellation,
+                requested_calls = len(tool_calls)
+                if (
+                    config.max_tool_calls is not None
+                    and budget.tool_calls_used + requested_calls
+                    > config.max_tool_calls
+                ):
+                    # 总预算不足时整批拒绝，绝不执行“前几个成功、后几个失败”的
+                    # 半批副作用。被拒绝调用不计入 used，但运行会在本 Turn 后结束。
+                    await _emit_budget_exceeded(
                         emit,
+                        budget="tool_calls",
+                        limit=config.max_tool_calls,
+                        used=budget.tool_calls_used,
+                        requested=requested_calls,
                     )
+                    batch = await _fail_tool_call_budget(
+                        tool_calls,
+                        emit,
+                        limit=config.max_tool_calls,
+                        used=budget.tool_calls_used,
+                    )
+                    hard_budget_stop = True
+                else:
+                    # 一整批先计入预算，再做未知工具、参数和 before hook 检查，
+                    # 因此无效/被阻止调用也不能绕过工具总预算。
+                    budget.tool_calls_used += requested_calls
+                    if message.get("stopReason") == "length":
+                        batch = await _fail_truncated_tool_calls(tool_calls, emit)
+                    else:
+                        batch = await _execute_tool_calls(
+                            current_context,
+                            message,
+                            config,
+                            cancellation,
+                            emit,
+                        )
                 tool_results.extend(batch.messages)
                 has_more_tool_calls = not batch.terminate
                 for result_message in tool_results:
@@ -341,6 +397,15 @@ async def _run_loop(
                     "toolResults": tool_results,
                 },
             )
+
+            # Tool Call 硬预算超限时，错误结果已完整记录；现在直接结束，
+            # 不再调用 prepareNextTurn，也不让队列消息绕过本次预算。
+            if hard_budget_stop:
+                await _emit(
+                    emit,
+                    {"type": "agent_end", "messages": list(new_messages)},
+                )
+                return
 
             turn_context = TurnCompletedContext(
                 message=message,
@@ -373,6 +438,26 @@ async def _run_loop(
                         {"type": "agent_end", "messages": list(new_messages)},
                     )
                     return
+
+            # 当前 Turn 已经用尽预算时，不再领取 steering/follow-up，避免消息
+            # 从内存队列取出后尚未处理就丢失。若工具要求继续，额外发预算事件。
+            if (
+                config.max_turns is not None
+                and budget.turns_used >= config.max_turns
+            ):
+                if has_more_tool_calls:
+                    await _emit_budget_exceeded(
+                        emit,
+                        budget="turns",
+                        limit=config.max_turns,
+                        used=budget.turns_used,
+                        requested=1,
+                    )
+                await _emit(
+                    emit,
+                    {"type": "agent_end", "messages": list(new_messages)},
+                )
+                return
 
             pending_messages = await _get_messages(config.get_steering_messages)
 
@@ -527,6 +612,74 @@ class _ImmediateToolCall:
     is_error: bool
 
 
+async def _emit_budget_exceeded(
+    emit: EventSink,
+    *,
+    budget: str,
+    limit: int,
+    used: int,
+    requested: int,
+) -> None:
+    """发出结构化预算耗尽事件，供 UI、日志和测试读取。"""
+
+    label = "Turn" if budget == "turns" else "Tool Call"
+    remaining = max(0, limit - used)
+    await _emit(
+        emit,
+        {
+            "type": "budget_exceeded",
+            "budget": budget,
+            "limit": limit,
+            "used": used,
+            "requested": requested,
+            "remaining": remaining,
+            "message": (
+                f"{label} 预算不足：限制 {limit}，已使用 {used}，"
+                f"本次请求 {requested}，剩余 {remaining}"
+            ),
+        },
+    )
+
+
+async def _fail_tool_call_budget(
+    tool_calls: list[dict],
+    emit: EventSink,
+    *,
+    limit: int,
+    used: int,
+) -> _ExecutedToolBatch:
+    """总工具预算不足时整批拒绝，避免执行部分副作用。"""
+
+    requested = len(tool_calls)
+    remaining = max(0, limit - used)
+    messages: list[AgentMessage] = []
+    for tool_call in tool_calls:
+        await _emit_tool_start(tool_call, emit)
+        tool_name = str(tool_call.get("name", ""))
+        finalized = _FinalizedToolCall(
+            tool_call=tool_call,
+            result=error_tool_result(
+                f"工具 {tool_name} 未执行：Tool Call 预算不足。"
+                f"限制 {limit}，已使用 {used}，本批请求 {requested}，"
+                f"剩余 {remaining}。",
+                terminate=True,
+                details={
+                    "code": "tool_call_budget_exceeded",
+                    "limit": limit,
+                    "used": used,
+                    "requested": requested,
+                    "remaining": remaining,
+                },
+            ),
+            is_error=True,
+        )
+        await _emit_tool_end(finalized, emit)
+        message = _create_tool_result_message(finalized)
+        await _emit_tool_result_message(message, emit)
+        messages.append(message)
+    return _ExecutedToolBatch(messages=messages, terminate=True)
+
+
 async def _fail_truncated_tool_calls(
     tool_calls: list[dict],
     emit: EventSink,
@@ -615,6 +768,7 @@ async def _execute_tools_sequential(
                 preparation,
                 cancellation,
                 emit,
+                config.default_tool_timeout_seconds,
             )
             finalized = await _finalize_executed_tool(
                 context,
@@ -650,6 +804,11 @@ async def _execute_tools_parallel(
 ) -> _ExecutedToolBatch:
     """顺序预检、并发执行、按 source order 生成 ToolResultMessage。"""
 
+    # Semaphore 只限制真正进入工具 execute 的数量。所有工具仍按模型顺序
+    # 完成预检；等待槽位的工具不会占用并发执行名额。
+    parallel_limit = config.max_parallel_tools or max(1, len(tool_calls))
+    semaphore = asyncio.Semaphore(parallel_limit)
+
     # entries 保持 assistant 原始调用顺序。立即失败存 finalized；通过预检则存
     # 一个异步工厂，等预检阶段完成后再统一 create_task。
     entries: list[
@@ -679,23 +838,25 @@ async def _execute_tools_parallel(
             async def run_one(
                 prepared: _PreparedToolCall = preparation,
             ) -> _FinalizedToolCall:
-                result, is_error = await _execute_prepared_tool(
-                    prepared,
-                    cancellation,
-                    emit,
-                )
-                finalized_result = await _finalize_executed_tool(
-                    context,
-                    assistant_message,
-                    prepared,
-                    result,
-                    is_error,
-                    config,
-                    cancellation,
-                )
-                # end 在每个任务中发，因此谁先完成谁先发。
-                await _emit_tool_end(finalized_result, emit)
-                return finalized_result
+                async with semaphore:
+                    result, is_error = await _execute_prepared_tool(
+                        prepared,
+                        cancellation,
+                        emit,
+                        config.default_tool_timeout_seconds,
+                    )
+                    finalized_result = await _finalize_executed_tool(
+                        context,
+                        assistant_message,
+                        prepared,
+                        result,
+                        is_error,
+                        config,
+                        cancellation,
+                    )
+                    # end 在每个任务中发，因此谁先完成谁先发。
+                    await _emit_tool_end(finalized_result, emit)
+                    return finalized_result
 
             entries.append(run_one)
 
@@ -709,9 +870,29 @@ async def _execute_tools_parallel(
         else:
             tasks.append(asyncio.create_task(entry()))
 
+    # 一次 gather 等待所有已启动任务，并保持结果数组与 source order 一致。
+    # 任一任务出现调度/listener 异常时，明确取消并等待剩余任务，避免后台泄漏。
+    running_tasks = [task for task in tasks if task is not None]
+    try:
+        running_results = (
+            await asyncio.gather(*running_tasks) if running_tasks else []
+        )
+    except BaseException:
+        for task in running_tasks:
+            if not task.done():
+                task.cancel()
+        if running_tasks:
+            await asyncio.gather(*running_tasks, return_exceptions=True)
+        raise
+
     finalized_calls: list[_FinalizedToolCall] = []
+    running_index = 0
     for entry, task in zip(entries, tasks, strict=True):
-        finalized_calls.append(entry if task is None else await task)
+        if task is None:
+            finalized_calls.append(cast(_FinalizedToolCall, entry))
+        else:
+            finalized_calls.append(running_results[running_index])
+            running_index += 1
 
     messages: list[AgentMessage] = []
     for finalized in finalized_calls:
@@ -789,11 +970,32 @@ async def _execute_prepared_tool(
     prepared: _PreparedToolCall,
     cancellation: CancellationToken,
     emit: EventSink,
+    default_timeout_seconds: float | None,
 ) -> tuple[AgentToolResult, bool]:
-    """执行一个已验证工具，并保证该工具的 update 在 end 前结算。"""
+    """执行一个已验证工具，并实现单工具独立超时。
+
+    每个工具获得 Agent 总取消令牌的子令牌：
+
+    - 用户取消 Agent 时，父令牌会取消所有子令牌；
+    - 当前工具超时时，只取消自己的子令牌；
+    - 其他并行工具继续运行。
+
+    超时只对能让出 asyncio 事件循环的异步工具有效。完全阻塞事件循环的同步
+    死循环无法被 asyncio 定时器打断，生产系统应把这种工作放入子进程。
+    """
 
     update_tasks: list[asyncio.Task[None]] = []
     accepting_updates = True
+    tool_name = str(prepared.tool_call.get("name", ""))
+    timeout_seconds = (
+        prepared.tool.timeout_seconds
+        if prepared.tool.timeout_seconds is not None
+        else default_timeout_seconds
+    )
+
+    # 子令牌只控制当前工具。它会继承父令牌的用户取消，但自己的 timeout
+    # 不会反向传播给 Agent 或其他并行工具。
+    tool_cancellation = cancellation.create_child()
 
     def on_update(partial_result: AgentToolResult) -> None:
         nonlocal accepting_updates
@@ -806,7 +1008,7 @@ async def _execute_prepared_tool(
                     {
                         "type": "tool_execution_update",
                         "toolCallId": str(prepared.tool_call.get("id", "")),
-                        "toolName": str(prepared.tool_call.get("name", "")),
+                        "toolName": tool_name,
                         "args": copy.deepcopy(prepared.tool_call.get("arguments", {})),
                         "partialResult": _tool_result_payload(partial_result),
                     },
@@ -814,24 +1016,115 @@ async def _execute_prepared_tool(
             )
         )
 
-    try:
-        result = await prepared.tool.execute(
+    execute_task = asyncio.create_task(
+        prepared.tool.execute(
             str(prepared.tool_call.get("id", "")),
             prepared.args,
-            cancellation,
+            tool_cancellation,
             on_update,
         )
-        accepting_updates = False
-        if update_tasks:
-            await asyncio.gather(*update_tasks)
-        return result, False
-    except Exception as error:
-        accepting_updates = False
-        if update_tasks:
-            await asyncio.gather(*update_tasks)
-        return error_tool_result(str(error)), True
+    )
+    cancellation_wait_task = asyncio.create_task(tool_cancellation.wait())
+    timeout_task = (
+        asyncio.create_task(asyncio.sleep(timeout_seconds))
+        if timeout_seconds is not None
+        else None
+    )
+
+    async def stop_execute_task() -> None:
+        """取消并等待工具协程收尾，避免遗留无人管理的 asyncio Task。"""
+
+        if not execute_task.done():
+            execute_task.cancel()
+        try:
+            await execute_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # 超时/用户取消是当前工具的最终分类。工具在取消收尾中抛出的
+            # 次要异常不应覆盖这个更早、更明确的原因。
+            pass
+
+    result: AgentToolResult
+    is_error: bool
+
+    try:
+        waiters: set[asyncio.Task[Any]] = {execute_task, cancellation_wait_task}
+        if timeout_task is not None:
+            waiters.add(timeout_task)
+        done, _pending = await asyncio.wait(
+            waiters,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # 工具与 timeout 同时完成时优先接受已经完成的工具结果。
+        if execute_task in done:
+            try:
+                result = await execute_task
+                is_error = False
+            except asyncio.CancelledError:
+                result = error_tool_result(
+                    f"工具 {tool_name} 已取消：{tool_cancellation.reason}",
+                    details={"code": "tool_cancelled"},
+                )
+                is_error = True
+            except Exception as error:
+                result = error_tool_result(
+                    str(error),
+                    details={"code": "tool_execution_error"},
+                )
+                is_error = True
+        elif timeout_task is not None and timeout_task in done:
+            accepting_updates = False
+            timeout_text = f"{timeout_seconds:g}"
+            tool_cancellation.cancel(
+                f"工具 {tool_name} 执行超过 {timeout_text} 秒"
+            )
+            await stop_execute_task()
+            result = error_tool_result(
+                f"工具 {tool_name} 执行超时（限制 {timeout_text} 秒）",
+                details={
+                    "code": "tool_timeout",
+                    "toolName": tool_name,
+                    "timeoutSeconds": timeout_seconds,
+                },
+            )
+            is_error = True
+        else:
+            # cancellation_wait_task 完成，说明用户取消 Agent，或上层主动取消
+            # 当前工具子令牌。
+            accepting_updates = False
+            await stop_execute_task()
+            result = error_tool_result(
+                f"工具 {tool_name} 已取消：{tool_cancellation.reason}",
+                details={
+                    "code": "tool_cancelled",
+                    "toolName": tool_name,
+                    "reason": tool_cancellation.reason,
+                },
+            )
+            is_error = True
     finally:
         accepting_updates = False
+
+        # 清理 timeout/cancellation 等待任务，确保工具结束后没有 timer 残留。
+        waiter_tasks = [cancellation_wait_task]
+        if timeout_task is not None:
+            waiter_tasks.append(timeout_task)
+        for waiter in waiter_tasks:
+            if not waiter.done():
+                waiter.cancel()
+        if waiter_tasks:
+            await asyncio.gather(*waiter_tasks, return_exceptions=True)
+
+        # 当前工具在超时或取消前已经发出的 update 必须先结算，再允许发送
+        # tool_execution_end。超时之后到来的 update 会因 accepting_updates=False
+        # 被忽略。
+        if update_tasks:
+            await asyncio.gather(*update_tasks)
+        tool_cancellation.detach()
+
+    return result, is_error
 
 
 async def _finalize_executed_tool(

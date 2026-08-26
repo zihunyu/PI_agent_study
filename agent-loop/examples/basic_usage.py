@@ -17,10 +17,25 @@ from pi_agent_loop import (  # noqa: E402
     assistant_message,
     create_add_tool,
     create_multiply_tool,
+    load_agent_limits,
 )
+
+# ============================================================================
+# Tool Timeout 教学配置区
+# ============================================================================
+# 正常成功：两个值都保持 0。
+# 触发加法超时：把 ADD_TOOL_DELAY_SECONDS 改成 3，因为 add 限制是 2 秒。
+# 触发乘法超时：把 MULTIPLY_TOOL_DELAY_SECONDS 改成 6，因为 multiply 限制是 5 秒。
+# 两个同时超时：分别改成 3 和 6。两个工具并行时，总等待约 5 秒。
+ADD_TOOL_DELAY_SECONDS = 0.0
+MULTIPLY_TOOL_DELAY_SECONDS = 0.0
 
 
 async def main() -> None:
+    # 从独立 TOML 文件读取 Turn、Tool Call 和最大并行数配置。
+    config_path = Path(__file__).resolve().parents[1] / "config" / "agent.toml"
+    limits = load_agent_limits(config_path)
+
     model = Model(
         id="demo-model",
         provider="scripted",
@@ -50,19 +65,34 @@ async def main() -> None:
 
     # 第二次响应根据 Context 中的两条 toolResult 生成最终文本。
     def final_response(context, _options):
-        results = [
-            block["content"][0]["text"]
-            for block in context["messages"]
-            if block.get("role") == "toolResult"
-        ]
+        tool_results = {
+            message["toolName"]: message
+            for message in context["messages"]
+            if message.get("role") == "toolResult"
+        }
+        add_result = tool_results["add"]
+        multiply_result = tool_results["multiply"]
+
+        # 正常时保持原来的最终回答；触发 timeout 时，把两个工具各自的成功或
+        # 失败情况说清楚，方便观察“一个超时不会误伤另一个”。
+        if not add_result["isError"] and not multiply_result["isError"]:
+            text = (
+                f"加法结果是 {add_result['content'][0]['text']}，"
+                f"乘法结果是 {multiply_result['content'][0]['text']}。"
+            )
+        else:
+            descriptions = []
+            for name, label in [("add", "加法"), ("multiply", "乘法")]:
+                result = tool_results[name]
+                value = result["content"][0]["text"]
+                descriptions.append(
+                    f"{label}{'失败' if result['isError'] else '成功'}：{value}"
+                )
+            text = "；".join(descriptions) + "。"
+
         return assistant_message(
             model=model,
-            content=[
-                {
-                    "type": "text",
-                    "text": f"加法结果是 {results[0]}，乘法结果是 {results[1]}。",
-                }
-            ],
+            content=[{"type": "text", "text": text}],
             stop_reason="stop",
         )
 
@@ -75,8 +105,10 @@ async def main() -> None:
     registry = ToolRegistry()
 
     # 第二步：创建我们自己编写的加法、乘法工具，并注册到注册表。
-    registry.register(create_add_tool())
-    registry.register(create_multiply_tool())
+    registry.register(create_add_tool(delay_seconds=ADD_TOOL_DELAY_SECONDS))
+    registry.register(
+        create_multiply_tool(delay_seconds=MULTIPLY_TOOL_DELAY_SECONDS)
+    )
 
     # 第三步：把注册表中的工具列表交给 Agent。
     # 从这一刻开始，Provider 能在模型请求中看到工具定义；模型返回同名
@@ -87,6 +119,9 @@ async def main() -> None:
         system_prompt="你是一个只使用给定工具完成计算的助手。",
         tools=registry.all(),
         tool_execution="parallel",
+        max_tool_calls=limits.max_tool_calls,
+        max_parallel_tools=limits.max_parallel_tools,
+        max_turns=limits.max_turns,
     )
 
     # 下面把内部英文事件翻译成中文故事线。message_update 是逐字流事件，
@@ -177,6 +212,8 @@ async def main() -> None:
                 f"工具 {event['toolName']} 执行{status}，结果为 "
                 f"{result_text(event['result'])}。"
             )
+        elif event_type == "budget_exceeded":
+            explanation = f"运行预算不足：{event['message']}。"
         elif event_type == "turn_end":
             explanation = f"第 {turn_number} 轮结束。"
         elif event_type == "agent_end":
@@ -189,6 +226,18 @@ async def main() -> None:
     print("=" * 68)
     print("这个示例不会连接真实大模型，而是使用预先写好的假模型响应。")
     print("任务：请同时计算 2+3 和 4×5。")
+    print("已注册工具：add（独立超时 2 秒）、multiply（独立超时 5 秒）。")
+    print(
+        "模拟执行延时："
+        f"add={ADD_TOOL_DELAY_SECONDS:g} 秒，"
+        f"multiply={MULTIPLY_TOOL_DELAY_SECONDS:g} 秒。"
+    )
+    print(
+        "运行预算："
+        f"max_turns={limits.max_turns}，"
+        f"max_tool_calls={limits.max_tool_calls}，"
+        f"max_parallel_tools={limits.max_parallel_tools}。"
+    )
     print("重点：模型先请求两个工具，工具完成后，模型再生成最终回答。")
     print("=" * 68)
 
