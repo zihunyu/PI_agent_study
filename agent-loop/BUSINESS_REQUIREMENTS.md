@@ -190,13 +190,16 @@ AI 不得根据不完整描述自行编造真实 API、数据库字段、权限�
 
 真实写工具和可恢复 Operation 还必须填写：
 
-| Tool/Intent | replay_policy | Approval Role | Idempotency Key 来源 | Outcome Unknown 核对 API | 恢复时允许动作 |
-|---|---|---|---|---|---|
-| `orders.read_current` | `safe` | 无 | 无 | 无 | 可重放查询 |
-| `order.cancel` | `never` | `approver` | 调用方生成 | 待提供 | 只核对，不重放 |
+| Tool/Intent | execution_mode | Resource Key | replay_policy | Approval Role | Idempotency Key 来源 | Outcome Unknown 核对 API | 恢复时允许动作 |
+|---|---|---|---|---|---|---|---|
+| `orders.read_current` | `resource_locked` | `order:{order_id}` | `safe` | 无 | 无 | 无 | 可重放查询 |
+| `order.cancel` | `resource_locked` | `order:{order_id}` | `never` | `approver` | 调用方生成 | 待提供 | 只核对，不重放 |
 
 规则：
 
+- `parallel` 仅用于互不影响的操作；
+- `exclusive` 用于必须全局独占的操作；
+- `resource_locked` 必须填写稳定 Resource Key，相同 Key 串行；
 - `safe` 只能用于只读或严格幂等工具；
 - 写工具默认 `never`；
 - Approval 必须绑定精确操作 Hash，并且只能消费一次；

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..transcript import TranscriptIntegrityError, validate_closed_tool_call_transcript
 from .errors import ProviderProtocolError
 from .settings import ProviderProfile
 
@@ -126,6 +127,12 @@ def serialize_chat_request(
     raw_messages = context.get("messages", [])
     if not isinstance(raw_messages, list):
         raise ProviderProtocolError("模型 context.messages 必须是列表")
+    try:
+        validate_closed_tool_call_transcript(raw_messages)
+    except TranscriptIntegrityError as error:
+        raise ProviderProtocolError(
+            f"模型消息历史违反 Tool Call 协议：{error}"
+        ) from error
 
     messages: list[dict[str, Any]] = []
     system_prompt = context.get("systemPrompt", "")

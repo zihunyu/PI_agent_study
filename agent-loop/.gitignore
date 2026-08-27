@@ -32,5 +32,5 @@ Thumbs.db
 # Retry Journal、Checkpoint 等本地运行状态禁止提交。
 /state/
 
-# 本地订单业务演示，不纳入状态机源码提交。
+# 本地订单业务演示不提交到代码仓库。
 /test_demo/

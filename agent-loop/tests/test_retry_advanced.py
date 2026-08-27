@@ -127,12 +127,14 @@ class AdvancedRetryTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_circuit_breaker_open_和_half_open_恢复(self) -> None:
+        now = 0.0
         breaker = CircuitBreaker(
             CircuitBreakerPolicy(
                 enabled=True,
                 failure_threshold=2,
-                recovery_timeout_seconds=0.01,
-            )
+                recovery_timeout_seconds=10,
+            ),
+            clock=lambda: now,
         )
         await breaker.before_call()
         await breaker.record_failure()
@@ -142,7 +144,7 @@ class AdvancedRetryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CircuitOpenError):
             await breaker.before_call()
 
-        await asyncio.sleep(0.015)
+        now = 11.0
         await breaker.before_call()
         self.assertEqual(breaker.state, "half_open")
         await breaker.record_success()

@@ -241,6 +241,11 @@ async def main() -> None:
             explanation = (
                 f"开始执行工具 {event['toolName']}，参数为 {event['args']}。"
             )
+        elif event_type == "tool_execution_queued":
+            explanation = (
+                f"工具 {event['toolName']} 已进入调度队列，策略为 "
+                f"{event['executionMode']}。"
+            )
         elif event_type == "tool_execution_dispatch_start":
             explanation = (
                 f"工具 {event['toolName']} 第 {event['attempt']} 次实际进入执行函数。"

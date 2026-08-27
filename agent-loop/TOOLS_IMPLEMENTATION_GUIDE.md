@@ -270,6 +270,8 @@ cancellation.throw_if_cancelled()
 
 完全阻塞或不响应取消的代码需要子进程隔离。
 
+Agent Runtime 会在 Scheduler/Listener 异常时取消并等待嵌套 `execute_task`，但工具仍必须正确传播 `asyncio.CancelledError`，不能故意吞掉取消。
+
 ---
 
 ## 9. 进度更新
@@ -312,6 +314,39 @@ timeout_seconds=5
 - Timeout 后要取消底层请求并释放资源。
 
 工具自身 Timeout 优先于 Agent 默认 Timeout。
+
+### 10.1 执行策略
+
+每个工具必须评估：
+
+```text
+parallel
+纯计算或互不影响的只读操作
+
+exclusive
+需要形成全局屏障，执行时不能与同批其他工具重叠
+
+resource_locked
+只锁定具体业务资源；相同资源串行，不同资源可并行
+```
+
+`resource_locked` 必须提供：
+
+```python
+resolve_resource_keys=lambda args: f"order:{args['order_id']}"
+```
+
+规则：
+
+- Resource Key 使用已校验参数生成；
+- 使用稳定前缀，例如 `order:1001`、`file:/path`；
+- 不得包含 API Key、Token 或不必要隐私；
+- 多个 Key 会按稳定顺序加锁，避免死锁；
+- Retry Backoff 期间释放锁；
+- 写工具必须结合 Approval、Idempotency 和 expected_version；
+- `sequential` 仅保留为 `exclusive` 的向后兼容别名，新工具不要再使用。
+
+模型不能决定并发安全；`execution_mode` 和资源键由 Host/工具作者定义。
 
 ---
 
@@ -753,6 +788,8 @@ AI 每次新增工具必须按顺序执行：
 - [ ] CancellationToken；
 - [ ] 进度 Update；
 - [ ] 独立 Timeout；
+- [ ] 已选择 parallel/exclusive/resource_locked；
+- [ ] resource_locked 已定义稳定资源键；
 - [ ] 已评估幂等性和 Retry Policy；
 - [ ] 已声明 replay_policy；
 - [ ] 写工具已设计 Approval/Idempotency/outcome_unknown；
@@ -765,6 +802,8 @@ AI 每次新增工具必须按顺序执行：
 - [ ] 单元测试；
 - [ ] Agent 集成测试；
 - [ ] Timeout/取消测试；
+- [ ] Scheduler/Listener 异常下无后台 Task 残留；
+- [ ] Update Listener 失败后子令牌仍 Detach；
 - [ ] README 更新；
 - [ ] BUSINESS_REQUIREMENTS 更新（业务工具）；
 - [ ] 全部测试通过；

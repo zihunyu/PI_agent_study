@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from ..transcript import (
+    TranscriptIntegrityError,
+    validate_closed_tool_call_transcript,
+)
 from .operation_events import OperationEvent
 
 
@@ -135,6 +139,21 @@ def reduce_operation_event(
         )
         return replace(base, tools={**state.tools, tool_call_id: invocation})
     if event.type == "operation_finished":
+        pending_requests = [
+            request
+            for request in state.model_requests.values()
+            if request.phase == "started"
+        ]
+        if pending_requests:
+            raise OperationLogInvariantError(
+                "Operation Finished 时仍有未结束 Model Request"
+            )
+        try:
+            validate_closed_tool_call_transcript(list(state.messages))
+        except TranscriptIntegrityError as error:
+            raise OperationLogInvariantError(
+                f"Operation Finished 时 Tool Call 未闭合：{error}"
+            ) from error
         outcome = str(event.data.get("outcome", "failed"))
         if outcome not in {"completed", "failed", "cancelled"}:
             raise OperationLogInvariantError("Operation outcome 无效")

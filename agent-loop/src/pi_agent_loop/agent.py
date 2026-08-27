@@ -23,6 +23,7 @@ from typing import Any, Literal, cast
 from .cancellation import CancellationToken
 from .loop import run_agent_loop, run_agent_loop_continue
 from .messages import empty_usage, now_ms, user_message
+from .transcript import repair_unresolved_tool_calls
 from .types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -315,6 +316,8 @@ class Agent:
         *,
         skip_initial_steering_poll: bool = False,
     ) -> None:
+        self._repair_transcript_before_run()
+
         async def execute(token: CancellationToken) -> None:
             await run_agent_loop(
                 messages,
@@ -331,6 +334,8 @@ class Agent:
         await self._run_with_lifecycle(execute)
 
     async def _run_continuation(self) -> None:
+        self._repair_transcript_before_run()
+
         async def execute(token: CancellationToken) -> None:
             await run_agent_loop_continue(
                 self._context_snapshot(),
@@ -341,6 +346,16 @@ class Agent:
             )
 
         await self._run_with_lifecycle(execute)
+
+    def _repair_transcript_before_run(self) -> None:
+        """在加入新 User Message 前补齐旧历史中缺失的 ToolResult。"""
+
+        repaired, _inserted = repair_unresolved_tool_calls(
+            self.state.messages,
+            code="tool_result_missing_repaired",
+            text="此前工具调用没有结果，系统已补写错误结果以恢复协议完整性。",
+        )
+        self.state.messages = repaired
 
     def _context_snapshot(self) -> AgentContext:
         """复制顶层容器，隔离低层 Loop 对当前运行 Context 的修改。"""
@@ -430,7 +445,26 @@ class Agent:
             self._idle_event.set()
 
     async def _handle_run_failure(self, error: Exception, aborted: bool) -> None:
-        """把低层契约外异常规范成一组失败生命周期事件。"""
+        """补齐未闭合 Tool Call，再规范成失败生命周期事件。"""
+
+        try:
+            repaired, inserted = repair_unresolved_tool_calls(
+                self.state.messages,
+                code="tool_not_executed_due_run_error",
+                text="工具调用因 Agent 运行异常而未执行。",
+            )
+            self.state.messages = repaired
+            for message in inserted:
+                await self._notify_repair_event(
+                    {
+                        "type": "transcript_repaired",
+                        "message": message,
+                        "reason": "run_error",
+                    }
+                )
+        except Exception:
+            # 原始运行错误优先；无法安全修复的历史由下一次运行前校验正式拒绝。
+            pass
 
         failure: AgentMessage = {
             "role": "assistant",
@@ -449,6 +483,18 @@ class Agent:
             {"type": "turn_end", "message": failure, "toolResults": []}
         )
         await self._process_event({"type": "agent_end", "messages": [failure]})
+
+    async def _notify_repair_event(self, event: AgentEvent) -> None:
+        """通知所有 Listener，但修复通知失败不能覆盖原始运行错误。"""
+
+        token = self._active_token
+        if token is None:
+            return
+        for listener in list(self._listeners):
+            try:
+                await _maybe_await(listener(event, token))
+            except Exception:
+                continue
 
     async def _process_event(self, event: AgentEvent) -> None:
         """先更新 AgentState，再按订阅顺序等待 listener。"""

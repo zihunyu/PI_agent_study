@@ -77,7 +77,7 @@ def reduce_runtime_state(state: RunState, event: RuntimeEvent) -> RunState:
         tool = ToolCallState(
             tool_call_id=tool_call_id,
             tool_name=_required_text(event.data, "toolName"),
-            phase="executing",
+            phase="queued",
         )
         return replace(base, phase="executing_tools", tools={**state.tools, tool_call_id: tool})
     if event.type == "tool_dispatch_started":

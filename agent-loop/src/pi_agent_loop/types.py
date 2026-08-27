@@ -18,6 +18,12 @@ if False:  # 仅供静态类型工具理解，运行时不会导入，避免循�
     from .event_stream import AssistantMessageEventStream
 
 ToolExecutionMode: TypeAlias = Literal["sequential", "parallel"]
+ToolExecutionPolicyMode: TypeAlias = Literal[
+    "parallel",
+    "exclusive",
+    "resource_locked",
+    "sequential",  # 向后兼容别名，调度时等价于 exclusive。
+]
 ToolReplayPolicy: TypeAlias = Literal["never", "safe"]
 QueueMode: TypeAlias = Literal["all", "one-at-a-time"]
 ThinkingLevel: TypeAlias = Literal[
@@ -75,7 +81,9 @@ class AgentTool:
     parameters: dict[str, Any] = field(default_factory=dict)
     validate_args: Callable[[Any], Any] = lambda value: value
     prepare_arguments: Callable[[Any], Any] | None = None
-    execution_mode: ToolExecutionMode | None = None
+    execution_mode: ToolExecutionPolicyMode | None = None
+    # resource_locked 工具根据已校验参数返回一个或多个资源键。
+    resolve_resource_keys: Callable[[Any], str | list[str] | tuple[str, ...]] | None = None
     # 单工具超时优先于 Agent 的默认超时。None 表示使用 Agent 默认值。
     timeout_seconds: float | None = None
     # 只有显式幂等并声明可重试错误码的工具才能自动重试。
@@ -88,6 +96,18 @@ class AgentTool:
             raise ValueError("工具 timeout_seconds 必须大于 0")
         if self.replay_policy not in {"never", "safe"}:
             raise ValueError("工具 replay_policy 必须是 never 或 safe")
+        if self.execution_mode not in {
+            None,
+            "parallel",
+            "exclusive",
+            "resource_locked",
+            "sequential",
+        }:
+            raise ValueError("工具 execution_mode 无效")
+        if self.execution_mode == "resource_locked" and self.resolve_resource_keys is None:
+            raise ValueError("resource_locked 工具必须提供 resolve_resource_keys")
+        if self.execution_mode != "resource_locked" and self.resolve_resource_keys is not None:
+            raise ValueError("只有 resource_locked 工具可以提供 resolve_resource_keys")
 
 
 @dataclass(slots=True)

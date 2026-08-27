@@ -30,12 +30,14 @@ class RoutedAgent:
         *,
         runtime_tracker: Any | None = None,
         operation_recorder: Any | None = None,
+        suspend_on_approval: bool = False,
     ) -> None:
         self.agent = agent
         self.router = router
         self.capabilities = capabilities
         self.runtime_tracker = runtime_tracker
         self.operation_recorder = operation_recorder
+        self.suspend_on_approval = suspend_on_approval
         if runtime_tracker is not None:
             self.agent.subscribe(runtime_tracker.listener)
         if operation_recorder is not None:
@@ -99,13 +101,29 @@ class RoutedAgent:
             "in_scope_no_tool",
             "in_scope_tool_ready",
         }:
+            waiting_approval = (
+                decision.status == "in_scope_approval_required"
+                and self.suspend_on_approval
+            )
             if self.runtime_tracker is not None:
-                await self.runtime_tracker.record_external(
-                    "run_finished",
-                    {"outcome": "completed"},
-                )
+                if waiting_approval:
+                    await self.runtime_tracker.record_external(
+                        "approval_required",
+                        {"intent": decision.intent},
+                    )
+                else:
+                    await self.runtime_tracker.record_external(
+                        "run_finished",
+                        {"outcome": "completed"},
+                    )
             if self.operation_recorder is not None:
-                await self.operation_recorder.finish_operation("completed")
+                if waiting_approval:
+                    await self.operation_recorder.record_external(
+                        "approval_pending",
+                        {"intent": decision.intent},
+                    )
+                else:
+                    await self.operation_recorder.finish_operation("completed")
             return RoutedPromptResult(
                 decision=decision,
                 model_called=False,

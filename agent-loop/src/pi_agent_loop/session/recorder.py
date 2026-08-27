@@ -69,6 +69,14 @@ class DurableOperationRecorder:
             return
         if self.operation_id is None:
             return
+        if event_type == "transcript_repaired":
+            message = event.get("message")
+            if isinstance(message, dict):
+                await self._append(
+                    "message_appended",
+                    {"message": message, "syntheticRepair": True},
+                )
+            return
         if event_type == "message_start":
             message = event.get("message", {})
             if message.get("role") == "assistant":

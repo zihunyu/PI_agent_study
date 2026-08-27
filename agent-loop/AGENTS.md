@@ -40,4 +40,9 @@
 - 可恢复工具必须声明 `replay_policy`，写工具默认 `never`；
 - Approval 必须绑定可信身份和精确 Action Hash，禁止仅使用布尔 `approved=True`；
 - 写操作必须使用 Idempotency Key Hash、持久事件和 outcome_unknown 核对；
-- Recovery Callback 是 Host 信任边界，不能绕过 Tool Guard、权限或审批。
+- Recovery Callback 是 Host 信任边界，不能绕过 Tool Guard、权限或审批；
+- 新工具必须在 parallel/exclusive/resource_locked 中选择执行策略；
+- resource_locked 必须使用已校验参数生成稳定 Resource Key，禁止在 Key 中包含密钥；
+- 写工具不得因为全局 parallel 而省略执行策略、Approval、Idempotency 和 expected_version；
+- 任何并行调度改动都必须验证外层取消会清理嵌套 Execute/Update/Timer/Waiter Task；
+- `CancellationToken.detach()` 必须位于不可跳过的 finally，清理错误不得覆盖主要错误。

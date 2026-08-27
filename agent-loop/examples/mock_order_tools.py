@@ -57,6 +57,7 @@ def create_mock_order_status_tool() -> AgentTool:
         },
         validate_args=_validate,
         execute=_execute,
+        execution_mode="parallel",
         timeout_seconds=5,
         replay_policy="safe",
     )

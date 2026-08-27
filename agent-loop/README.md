@@ -134,7 +134,9 @@ agent-loop/
 │  ├─ real_model_usage.py            真实 OpenAI-compatible 模型示例
 │  ├─ retry_usage.py                 全部 Retry 能力离线演示
 │  ├─ state_machine_usage.py         Runtime/业务状态机离线演示
+│  ├─ tool_scheduling_usage.py       三种工具执行策略离线演示
 │  ├─ durable_session_usage.py       Approval/写操作/恢复离线演示
+│  ├─ durable_host_usage.py          P1 Host/Approval Resume 离线演示
 │  ├─ mock_order_tools.py            模拟订单业务工具
 │  └─ business_routing_usage.py      强制业务工具路由示例
 ├─ tests/
@@ -149,6 +151,9 @@ agent-loop/
 │  ├─ test_retry.py                  模型和单工具重试测试
 │  ├─ test_retry_advanced.py         持久化/Circuit/Task/Compaction 测试
 │  ├─ test_runtime_state_machine.py  Runtime/Domain 状态机测试
+│  ├─ test_tool_scheduling.py        Parallel/Exclusive/Resource Lock 测试
+│  ├─ test_parallel_cleanup.py       Listener 异常与嵌套 Task 清理测试
+│  ├─ test_durable_agent_host.py     P1 Host/Runtime/Approval Resume 测试
 │  ├─ test_durable_session.py        Context/Approval/写操作/恢复测试
 │  ├─ test_provider_serialize.py     OpenAI 请求序列化测试
 │  ├─ test_provider_sse.py           SSE 分片测试
@@ -205,6 +210,12 @@ agent-loop/
    │  └─ state_machine.py            幂等写操作状态机
    ├─ domains/
    │  └─ state_machine.py            项目业务实体状态机
+   ├─ harness/
+   │  ├─ durable_agent_host.py       P1 统一编排入口
+   │  ├─ model_runtime_adapter.py    可恢复模型 Runtime
+   │  ├─ tool_runtime_adapter.py     可恢复工具 Runtime
+   │  ├─ approval_gateway.py         Approval Resume 协调
+   │  └─ startup_recovery.py         启动恢复扫描
    ├─ providers/                     第三方大模型 Provider
    │  ├─ settings.py                 Provider TOML 配置
    │  ├─ factory.py                  Model/Provider 工厂
@@ -349,13 +360,13 @@ python -m unittest discover -s tests -v
 
 ```text
 ... ok
-Ran 119 tests
+Ran 138 tests
 OK
 ```
 
-表示一百一十九个自动测试全部通过，并不是 Agent 又执行了一百一十九个用户任务。
+表示一百三十八个自动测试全部通过，并不是 Agent 又执行了一百三十八个用户任务。
 
-一百一十九个测试分别检查：
+一百三十八个测试分别检查：
 
 1. 最终回答能否进入 Agent 状态；
 2. 工具结果能否交回模型并触发第二次模型请求；
@@ -475,7 +486,26 @@ OK
 116. 写操作是否执行审批、幂等和重复请求去重；
 117. outcome_unknown 写操作是否通过核对完成；
 118. JSONL 重启后是否恢复完整消息 Context；
-119. 状态机指南是否包含业务实现和恢复安全契约。
+119. 状态机指南是否包含业务实现和恢复安全契约；
+120. Exclusive 是否在前后 Parallel Pool 之间形成屏障；
+121. Resource Lock 是否实现同资源串行、不同资源并行；
+122. Resource Lock 是否在 Retry Backoff 期间释放；
+123. 全局 Sequential 是否覆盖工具 Parallel；
+124. 旧 Sequential 值是否兼容为 Exclusive；
+125. Resource-locked 工具是否强制提供资源解析器；
+126. Tool End Listener 异常是否取消兄弟嵌套 Execute Task；
+127. Update Listener 异常后是否仍 Detach 子令牌；
+128. 清理阶段次要异常是否不覆盖主要 Listener 异常；
+129. 用户取消后是否没有 Tool Timer/Waiter/Update Task 残留；
+130. RecoverableModelRuntime 是否复用正式 StreamFn；
+131. RecoverableToolRuntime 是否复用参数/Timeout/Retry 管线；
+132. RecoverableToolRuntime 是否拒绝未授权 Never Tool；
+133. Startup Recovery 是否扫描并完成未结束 Operation；
+134. Approval Resume 是否批准后恢复 Payload；
+135. 进程中断后是否继续已消费 Approval 的 Resume；
+136. DurableAgentHost 是否自动装配普通 Agent；
+137. Approval 缺少可信申请人时是否安全结束 Operation；
+138. Host Approval 是否执行幂等写并继续模型。
 
 ### 4.5 可选安装
 
@@ -763,18 +793,57 @@ agent = Agent(
 )
 ```
 
-### 9.3 单工具要求串行
+### 9.3 Parallel 工具
 
 ```python
 tool = AgentTool(
     ...,
-    execution_mode="sequential",
+    execution_mode="parallel",
 )
 ```
 
-只要一批调用中有一个工具要求串行，整批都会串行。这与 Pi 原实现保持一致。
+同一段中的 Parallel 工具进入有界并行池。
 
-### 9.4 为什么工具结果不按完成顺序交给模型
+### 9.4 Exclusive Barrier
+
+```python
+tool = AgentTool(
+    ...,
+    execution_mode="exclusive",
+)
+```
+
+Exclusive 会等待前面的并行池排空，单独执行完成后，后面的并行工具才开始。
+
+```text
+parallel A + parallel B
+→ exclusive C
+→ parallel D + parallel E
+```
+
+### 9.5 Resource Lock
+
+```python
+tool = AgentTool(
+    ...,
+    execution_mode="resource_locked",
+    resolve_resource_keys=lambda args: f"order:{args['order_id']}",
+)
+```
+
+相同 Resource Key 串行，不同 Key 可以并行。资源锁只在实际 Attempt 期间持有，Retry Backoff 会释放锁。
+
+### 9.6 Sequential 兼容
+
+旧值：
+
+```python
+execution_mode="sequential"
+```
+
+仍可使用，但内部等价于 `exclusive`。新工具应使用新的三种策略。
+
+### 9.7 为什么工具结果不按完成顺序交给模型
 
 假设模型按以下顺序调用：
 
@@ -1579,12 +1648,12 @@ python examples/basic_usage.py
 python -m unittest discover -s tests -v
 ```
 
-当前共有 119 项离线测试，覆盖 Agent Loop、完整 Context Session、恢复、可信身份、Approval、幂等写操作、Runtime/Domain 状态机和 AI 开发契约。
+当前共有 138 项离线测试，覆盖 Agent Loop、P0 清理、P1 DurableAgentHost、恢复 Runtime、Approval Resume、Durable Session、写操作和状态机。
 
 只有看到：
 
 ```text
-Ran 119 tests
+Ran 138 tests
 OK
 ```
 
@@ -1928,12 +1997,15 @@ agent.prompt("任务二")  再获得一份新预算
 - `tests/test_retry.py`：7 项模型和单工具重试测试；
 - `tests/test_retry_advanced.py`：9 项持久化、Circuit、Task、Outcome 和 Compaction 测试；
 - `tests/test_runtime_state_machine.py`：10 项 Runtime/Domain 状态机测试；
-- `tests/test_durable_session.py`：10 项 Context、Recovery、Identity、Approval 和 Write 测试。
+- `tests/test_durable_session.py`：10 项 Context、Recovery、Identity、Approval 和 Write 测试；
+- `tests/test_tool_scheduling.py`：6 项 Parallel/Exclusive/Resource Lock 测试；
+- `tests/test_parallel_cleanup.py`：4 项 Listener 异常和嵌套 Task 清理测试；
+- `tests/test_durable_agent_host.py`：9 项 P1 Host、Recovery Runtime 和 Approval Resume 测试。
 
 全部测试：
 
 ```text
-Ran 119 tests
+Ran 138 tests
 OK
 ```
 
@@ -2470,10 +2542,10 @@ tests/test_simple_business_config.py
 tests/test_hybrid_router.py
 ```
 
-覆盖简化配置、Hybrid 路由、Retry、Runtime/Domain 状态机、Durable Session、Approval、写操作和 AI 开发指南契约。
+覆盖 Hybrid 路由、Retry、状态机、Durable Session、P0 清理、P1 Host/Approval Resume、调度和 AI 开发指南契约。
 
 ```text
-Ran 119 tests
+Ran 138 tests
 OK
 ```
 
@@ -3086,7 +3158,7 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 119 tests
+Ran 138 tests
 OK
 ```
 
@@ -3307,7 +3379,7 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 119 tests
+Ran 138 tests
 OK
 ```
 
@@ -3369,3 +3441,437 @@ STATE_MACHINE_IMPLEMENTATION_GUIDE.md
 `BUSINESS_REQUIREMENTS.md` 仍是唯一真实业务需求来源；状态机指南只定义实现方法，不复制具体业务状态，避免两份配置冲突。
 
 `AGENTS.md` 和契约测试会防止 AI 忘记阅读该指南。
+
+---
+
+## 30. Parallel、Exclusive 和 Resource-Locked 调度
+
+### 30.1 三种策略
+
+```text
+parallel
+互不影响的纯计算或只读操作进入有界并行池
+
+exclusive
+形成全局屏障，等待前一并行池排空后单独执行
+
+resource_locked
+只锁定具体资源；相同 Key 串行，不同 Key 并行
+```
+
+全局 `tool_execution="sequential"` 仍会覆盖所有工具并强制串行。
+
+### 30.2 Exclusive Barrier
+
+模型顺序：
+
+```text
+parallel A
+parallel B
+exclusive C
+parallel D
+parallel E
+```
+
+执行：
+
+```text
+A + B 并行
+→ C 独占
+→ D + E 并行
+```
+
+`sequential` 作为旧值继续兼容，但等价于 `exclusive`。
+
+### 30.3 Resource Lock
+
+```python
+AgentTool(
+    ...,
+    execution_mode="resource_locked",
+    resolve_resource_keys=lambda args: f"order:{args['order_id']}",
+)
+```
+
+```text
+order:1001 与 order:1001
+→ 串行
+
+order:1001 与 order:2002
+→ 可以并行
+```
+
+支持一个工具返回多个 Key；调度器排序和去重后加锁，避免不同加锁顺序造成死锁。
+
+### 30.4 与 Retry 的关系
+
+Resource Lock 和 Semaphore 只在真实 Attempt 执行期间持有：
+
+```text
+Attempt 失败
+→ 释放 Resource Lock 和并发槽
+→ Retry Backoff
+→ 下一 Attempt 重新获取
+```
+
+所以等待 Backoff 不会阻塞同资源后续操作，也不会浪费并发槽。
+
+Exclusive 则在整个逻辑调用（包括 Retry）完成前保持屏障，防止后续分段越过独占操作。
+
+### 30.5 调度事件
+
+新增：
+
+```text
+tool_execution_queued
+```
+
+包含：
+
+```text
+Tool Call ID
+Tool Name
+executionMode
+Resource Key Count
+```
+
+真实 Key 不进入普通调度事件。
+
+现有：
+
+```text
+tool_execution_dispatch_start
+```
+
+表示某个 Attempt 真正进入工具函数。Runtime 和 DurableOperationRecorder 可以区分 Queued、Intent、Dispatch 和 Result。
+
+### 30.6 运行演示
+
+```bat
+python examples\tool_scheduling_usage.py
+```
+
+预期时间线：
+
+```text
+read-a/read-b 同时开始
+→ 两者结束
+→ exclusive 单独执行
+→ exclusive 结束
+→ order:1001 和 order:2002 并行
+→ 第二个 order:1001 等第一个结束后执行
+```
+
+### 30.7 写工具建议
+
+全局独占写操作：
+
+```python
+execution_mode="exclusive"
+replay_policy="never"
+```
+
+按实体锁定的写操作：
+
+```python
+execution_mode="resource_locked"
+resolve_resource_keys=lambda args: f"order:{args['order_id']}"
+replay_policy="never"
+```
+
+同时仍需 Approval、Idempotency Key、expected_version 和 outcome_unknown 核对。
+
+### 30.8 测试
+
+```bat
+python -m unittest tests.test_tool_scheduling -v
+python -m unittest discover -s tests -v
+```
+
+当前：
+
+```text
+Ran 138 tests
+OK
+```
+
+覆盖 Exclusive Barrier、资源冲突、不同资源并行、Retry 释放锁、全局串行覆盖、Sequential 兼容和无资源解析器拒绝。
+
+---
+
+## 31. P0 并行异常清理
+
+### 31.1 问题
+
+一个并行 `run_one` 因 Listener 或 Scheduler 异常被取消时，内部独立创建的 `execute_task` 不会由 asyncio 自动级联取消。如果不显式清理，Agent 结束后工具可能继续运行。
+
+Update Listener 异常也可能在旧实现中阻止 `CancellationToken.detach()`。
+
+### 31.2 当前清理顺序
+
+`_execute_prepared_tool()` 最外层现在执行：
+
+```text
+禁止后续 Update
+→ 取消工具子 CancellationToken
+→ 取消并等待嵌套 execute_task
+→ 取消并等待 timeout/cancellation waiter
+→ 等待全部 update task，收集 Listener 错误
+→ finally 中强制 detach 子令牌
+→ 保留最早的主要异常
+```
+
+### 31.3 主要异常优先
+
+例如：
+
+```text
+主要错误：tool_execution_end Listener 失败
+清理错误：慢工具取消收尾又抛异常
+```
+
+最终 Agent Error 保留主要 Listener 错误，次要清理错误不会覆盖根因。
+
+如果没有更早错误，Update Listener 错误仍会在所有清理完成后按严格 Listener 语义向上传播。
+
+### 31.4 Task 命名和诊断
+
+内部 Task 现在使用可识别名称：
+
+```text
+pi-tool-run:...
+pi-tool-execute:...
+pi-tool-update:...
+pi-tool-timeout:...
+pi-tool-cancel-wait:...
+```
+
+测试和诊断可以通过 `asyncio.all_tasks()` 检查 Agent 结束后是否仍有 Tool Task。
+
+`CancellationToken.child_count` 可以检查是否仍挂接子令牌。
+
+### 31.5 测试
+
+```bat
+python -m unittest tests.test_parallel_cleanup -v
+python -m unittest discover -s tests -v
+```
+
+覆盖：
+
+- Tool End Listener 异常取消兄弟 Execute Task；
+- Update Listener 异常后仍 Detach；
+-次要清理异常不覆盖主要异常；
+-用户取消后没有 Timer/Waiter/Update Task 残留。
+
+```text
+Ran 138 tests
+OK
+```
+
+### 31.6 边界
+
+asyncio 只能可靠清理会响应 Cancellation 的协程。完全阻塞事件循环、故意吞掉 CancelledError 或卡死的第三方同步代码，仍必须放入子进程并使用进程级终止。
+
+---
+
+## 32. P1 DurableAgentHost 与 Approval Resume
+
+### 32.1 统一 Host
+
+```python
+host = await DurableAgentHost.create(
+    session_id="my-session",
+    state_dir="state/my-session",
+    model=model,
+    stream_fn=provider.stream,
+    system_prompt="...",
+    tools=tools,
+    router=router,
+    capabilities=capabilities,
+)
+```
+
+Host 自动装配：
+
+```text
+Agent
+RuntimeStateTracker
+DurableOperationRecorder
+Retry Journal
+Context Compaction
+RecoverableModelRuntime
+RecoverableToolRuntime
+StartupRecoveryCoordinator
+ApprovalService
+ApprovalResumeCoordinator
+WriteOperationService
+```
+
+`auto_recover=True` 时创建 Host 会扫描未完成 Operation。
+
+### 32.2 RecoverableModelRuntime
+
+恢复模型请求仍通过正式 StreamFn，因此继续使用 Provider Retry、Circuit Breaker、Compaction、鉴权和 Retry Event Store。
+
+```python
+message = await host.model_runtime.request(messages)
+```
+
+### 32.3 RecoverableToolRuntime
+
+```python
+result = await host.tool_runtime.execute(recovery_action)
+```
+
+恢复工具继续经过：
+
+```text
+Agent Tool 参数校验
+Before/After Hook
+Timeout
+Tool Retry
+Cancellation
+Parallel/Exclusive/Resource Policy
+Tool Result 标准化
+```
+
+`replay_safe_tool` 必须匹配 `replay_policy="safe"`。
+
+`replay_policy="never"` 默认拒绝，只有注入 `authorize_never_replay` 后才允许进入执行管线；真实写操作优先使用 WriteOperationService。
+
+### 32.4 Startup Recovery
+
+```python
+report = await host.recover_on_startup()
+```
+
+报告：
+
+```text
+completed
+manual_intervention
+failed
+```
+
+扫描每个非终态 Operation，使用 Model/Tool/Reconcile Runtime Callback 恢复。
+
+### 32.5 Approval Resume
+
+Host 使用 Router 得到 `in_scope_approval_required` 时：
+
+```text
+保持 Runtime Run 在 waiting_approval
+保持 Durable Operation 活动
+持久化 User Message
+持久化 Host 确认的 Assistant Tool Call
+创建绑定 Action Hash 的 Approval
+返回 approval_id
+```
+
+使用：
+
+```python
+pending = await host.prompt(
+    "取消订单 1001",
+    requester=verified_operator,
+)
+```
+
+批准并继续：
+
+```python
+final = await host.approve_and_resume(
+    pending.approval_id,
+    approver=verified_approver,
+    consumer=verified_operator,
+    idempotency_key="cancel-order-1001",
+    write_handler=cancel_order_handler,
+)
+```
+
+流程：
+
+```text
+验证 Approver Role
+→ 禁止默认自审
+→ 消费 Approval 一次
+→ WriteOperation Prepare
+→ Idempotency 去重
+→ Tool Intent/Dispatch 持久化
+→ 执行写 Handler
+→ Tool Result 写入完整 Context
+→ 正式 Model Runtime 生成最终回答
+→ Operation/Run Completed
+```
+
+缺少 VerifiedIdentity 时，Host 会安全结束当前 Operation 为 Failed，不留下 waiting 状态。
+
+### 32.6 Approval Resume 崩溃恢复
+
+如果 Approval 已消费、Resume 已开始但进程崩溃：
+
+```python
+await host.approval_resume.recover_incomplete(resume_callback)
+```
+
+会读取持久 Resume Payload，继续未完成恢复，并写入 Completed/Failed。
+
+Write Handler 仍必须使用 Idempotency Key，防止崩溃恢复重复写入。
+
+### 32.7 Recovery 信任边界
+
+`RecoveryCallbacks`、`write_handler` 和 `reconcile_tool` 属于 Host 信任边界。
+
+生产实现必须：
+
+- 使用正式 Provider/Tool Adapter；
+-不能绕过 Guard/Permission/Approval；
+-不能把 Never Tool 当 Safe Tool；
+-使用 Idempotency 和 expected_version；
+-持久化结果后再对外确认成功。
+
+### 32.8 运行演示
+
+```bat
+python examples\durable_host_usage.py
+```
+
+输出：
+
+```text
+普通 Host 自动装配并完成回答
+→ Runtime completed
+→ Durable Operation ID
+
+写操作 waiting_approval
+→ 可信 Approver 批准
+→ 写 Handler 只执行一次
+→ 模型继续回答
+→ Runtime completed
+```
+
+### 32.9 测试
+
+```bat
+python -m unittest tests.test_durable_agent_host -v
+python -m unittest discover -s tests -v
+```
+
+当前：
+
+```text
+Ran 138 tests
+OK
+```
+
+覆盖正式 Model Runtime、Tool Runtime、Never Tool 拒绝、Startup Recovery、Approval Resume、崩溃恢复、Host 自动装配、缺失身份安全失败和幂等写后继续模型。
+
+### 32.10 当前边界
+
+- StaticIdentityVerifier 仍只用于开发测试；
+- Approval UI/API 和通知尚未实现；
+- JSONL 仍是单进程 Store；
+- 多 Worker 事务一致性属于 P2；
+- 真实业务 Tool/Identity/Reconciliation 需要后续 Adapter；
+- 多 Intent Plan/Task 属于 P3。

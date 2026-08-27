@@ -45,6 +45,12 @@ class CancellationToken:
 
         return self._reason
 
+    @property
+    def child_count(self) -> int:
+        """当前仍挂接的子令牌数量，供清理诊断和测试使用。"""
+
+        return len(self._children)
+
     def cancel(self, reason: str = "操作已取消") -> None:
         """发出取消请求；重复调用是安全的，第一次原因会被保留。"""
 

@@ -31,6 +31,11 @@ from .event_stream import (
 from .messages import clone_message, error_tool_result, now_ms
 from .retry.errors import OutcomeUnknownToolError, RetryableToolError
 from .retry.tool import execute_tool_with_retry
+from .transcript import (
+    repair_unresolved_tool_calls,
+    sanitize_terminal_assistant_tool_calls,
+    validate_closed_tool_call_transcript,
+)
 from .types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -505,7 +510,13 @@ async def _stream_assistant_response(
 ) -> AgentMessage:
     """请求并消费一次 assistant 流。"""
 
-    messages = list(context.messages)
+    repaired_messages, _inserted = repair_unresolved_tool_calls(
+        list(context.messages),
+        code="tool_result_missing_repaired",
+        text="此前工具调用没有结果，系统已补写错误结果以恢复协议完整性。",
+    )
+    context.messages = repaired_messages
+    messages = list(repaired_messages)
     if config.transform_context is not None:
         transformed = await _maybe_await(
             config.transform_context(messages, cancellation)
@@ -513,6 +524,7 @@ async def _stream_assistant_response(
         messages = list(transformed)
 
     llm_messages = list(await _maybe_await(config.convert_to_llm(messages)))
+    validate_closed_tool_call_transcript(llm_messages)
     llm_context = {
         "systemPrompt": context.system_prompt,
         "messages": llm_messages,
@@ -574,7 +586,9 @@ async def _stream_assistant_response(
                 },
             )
         elif event_type in {"done", "error"}:
-            final_message = await response.result()
+            final_message = sanitize_terminal_assistant_tool_calls(
+                await response.result()
+            )
             if added_partial:
                 context.messages[-1] = final_message
             else:
@@ -593,7 +607,9 @@ async def _stream_assistant_response(
             return final_message
 
     # 防御性 fallback：规范 Provider 应先发 done/error，再结束迭代。
-    final_message = await response.result()
+    final_message = sanitize_terminal_assistant_tool_calls(
+        await response.result()
+    )
     if added_partial:
         context.messages[-1] = final_message
     else:
@@ -630,6 +646,13 @@ class _FinalizedToolCall:
 class _ImmediateToolCall:
     result: AgentToolResult
     is_error: bool
+
+
+@dataclass(slots=True)
+class _ScheduledToolCall:
+    preparation: _PreparedToolCall
+    mode: str
+    resource_keys: tuple[str, ...] = ()
 
 
 async def _emit_budget_exceeded(
@@ -724,6 +747,35 @@ async def _fail_truncated_tool_calls(
     return _ExecutedToolBatch(messages=messages, terminate=False)
 
 
+async def _append_skipped_tool_results(
+    tool_calls: list[dict],
+    emit: EventSink,
+    *,
+    code: str,
+    reason: str,
+) -> tuple[list[_FinalizedToolCall], list[AgentMessage]]:
+    """为未 Dispatch 的调用补齐 Synthetic ToolResult，保持协议闭合。"""
+
+    finalized_calls: list[_FinalizedToolCall] = []
+    messages: list[AgentMessage] = []
+    for tool_call in tool_calls:
+        await _emit_tool_start(tool_call, emit)
+        finalized = _FinalizedToolCall(
+            tool_call=tool_call,
+            result=error_tool_result(
+                reason,
+                details={"code": code, "synthetic": True},
+            ),
+            is_error=True,
+        )
+        await _emit_tool_end(finalized, emit)
+        message = _create_tool_result_message(finalized)
+        await _emit_tool_result_message(message, emit)
+        finalized_calls.append(finalized)
+        messages.append(message)
+    return finalized_calls, messages
+
+
 async def _execute_tool_calls(
     context: AgentContext,
     assistant_message: AgentMessage,
@@ -732,13 +784,7 @@ async def _execute_tool_calls(
     emit: EventSink,
 ) -> _ExecutedToolBatch:
     tool_calls = _assistant_tool_calls(assistant_message)
-    tools_by_name = {tool.name: tool for tool in context.tools}
-    contains_sequential_tool = any(
-        tools_by_name.get(str(call.get("name"))) is not None
-        and tools_by_name[str(call.get("name"))].execution_mode == "sequential"
-        for call in tool_calls
-    )
-    if config.tool_execution == "sequential" or contains_sequential_tool:
+    if config.tool_execution == "sequential":
         return await _execute_tools_sequential(
             context,
             assistant_message,
@@ -747,7 +793,7 @@ async def _execute_tool_calls(
             cancellation,
             emit,
         )
-    return await _execute_tools_parallel(
+    return await _execute_tools_scheduled(
         context,
         assistant_message,
         tool_calls,
@@ -768,7 +814,7 @@ async def _execute_tools_sequential(
     finalized_calls: list[_FinalizedToolCall] = []
     messages: list[AgentMessage] = []
 
-    for tool_call in tool_calls:
+    for tool_index, tool_call in enumerate(tool_calls):
         await _emit_tool_start(tool_call, emit)
         preparation = await _prepare_tool_call(
             context,
@@ -807,6 +853,14 @@ async def _execute_tools_sequential(
         finalized_calls.append(finalized)
         messages.append(result_message)
         if cancellation.cancelled:
+            skipped_finalized, skipped_messages = await _append_skipped_tool_results(
+                tool_calls[tool_index + 1 :],
+                emit,
+                code="tool_aborted_before_dispatch",
+                reason="工具调用在执行前因 Agent 取消而跳过。",
+            )
+            finalized_calls.extend(skipped_finalized)
+            messages.extend(skipped_messages)
             break
 
     return _ExecutedToolBatch(
@@ -815,7 +869,7 @@ async def _execute_tools_sequential(
     )
 
 
-async def _execute_tools_parallel(
+async def _execute_tools_scheduled(
     context: AgentContext,
     assistant_message: AgentMessage,
     tool_calls: list[dict],
@@ -823,19 +877,15 @@ async def _execute_tools_parallel(
     cancellation: CancellationToken,
     emit: EventSink,
 ) -> _ExecutedToolBatch:
-    """顺序预检、并发执行、按 source order 生成 ToolResultMessage。"""
+    """Parallel Pool + Exclusive Barrier + Resource Lock 调度器。"""
 
-    # Semaphore 只限制真正进入工具 execute 的数量。所有工具仍按模型顺序
-    # 完成预检；等待槽位的工具不会占用并发执行名额。
     parallel_limit = config.max_parallel_tools or max(1, len(tool_calls))
     semaphore = asyncio.Semaphore(parallel_limit)
+    resource_locks: dict[str, asyncio.Lock] = {}
+    slots: list[_FinalizedToolCall | None] = []
+    scheduled: list[tuple[int, _ScheduledToolCall]] = []
 
-    # entries 保持 assistant 原始调用顺序。立即失败存 finalized；通过预检则存
-    # 一个异步工厂，等预检阶段完成后再统一 create_task。
-    entries: list[
-        _FinalizedToolCall | Callable[[], Awaitable[_FinalizedToolCall]]
-    ] = []
-
+    # 所有 Preflight 保持模型顺序；只有通过校验的调用进入调度阶段。
     for tool_call in tool_calls:
         await _emit_tool_start(tool_call, emit)
         preparation = await _prepare_tool_call(
@@ -851,81 +901,176 @@ async def _execute_tools_parallel(
                 result=preparation.result,
                 is_error=preparation.is_error,
             )
-            # Pi 语义：立即失败在预检阶段就发 execution_end。
             await _emit_tool_end(finalized, emit)
-            entries.append(finalized)
+            slots.append(finalized)
         else:
-
-            async def run_one(
-                prepared: _PreparedToolCall = preparation,
-            ) -> _FinalizedToolCall:
-                result, is_error = await _execute_prepared_tool(
-                    prepared,
-                    cancellation,
+            try:
+                item = _schedule_tool_call(preparation)
+            except Exception as error:
+                finalized = _FinalizedToolCall(
+                    tool_call=tool_call,
+                    result=error_tool_result(
+                        str(error),
+                        details={"code": "invalid_execution_policy"},
+                    ),
+                    is_error=True,
+                )
+                await _emit_tool_end(finalized, emit)
+                slots.append(finalized)
+            else:
+                index = len(slots)
+                slots.append(None)
+                scheduled.append((index, item))
+                await _emit(
                     emit,
-                    config.default_tool_timeout_seconds,
-                    execution_semaphore=semaphore,
-                    retry_event_sink=config.retry_event_sink,
+                    {
+                        "type": "tool_execution_queued",
+                        "toolCallId": str(tool_call.get("id", "")),
+                        "toolName": item.preparation.tool.name,
+                        "executionMode": item.mode,
+                        "resourceKeyCount": len(item.resource_keys),
+                    },
                 )
-                finalized_result = await _finalize_executed_tool(
-                    context,
-                    assistant_message,
-                    prepared,
-                    result,
-                    is_error,
-                    config,
-                    cancellation,
-                )
-                # end 在每个任务中发，因此谁先完成谁先发。
-                await _emit_tool_end(finalized_result, emit)
-                return finalized_result
 
-            entries.append(run_one)
-
-        if cancellation.cancelled:
-            break
-
-    tasks: list[asyncio.Task[_FinalizedToolCall] | None] = []
-    for entry in entries:
-        if isinstance(entry, _FinalizedToolCall):
-            tasks.append(None)
+    # Exclusive 形成屏障；屏障前后的 Parallel/Resource-Locked 分段执行。
+    pending_group: list[tuple[int, _ScheduledToolCall]] = []
+    for indexed in scheduled:
+        if indexed[1].mode == "exclusive":
+            await _run_scheduled_group(
+                pending_group,
+                slots,
+                context,
+                assistant_message,
+                config,
+                cancellation,
+                emit,
+                semaphore,
+                resource_locks,
+            )
+            pending_group = []
+            await _run_scheduled_group(
+                [indexed],
+                slots,
+                context,
+                assistant_message,
+                config,
+                cancellation,
+                emit,
+                None,
+                resource_locks,
+            )
         else:
-            tasks.append(asyncio.create_task(entry()))
+            pending_group.append(indexed)
+    await _run_scheduled_group(
+        pending_group,
+        slots,
+        context,
+        assistant_message,
+        config,
+        cancellation,
+        emit,
+        semaphore,
+        resource_locks,
+    )
 
-    # 一次 gather 等待所有已启动任务，并保持结果数组与 source order 一致。
-    # 任一任务出现调度/listener 异常时，明确取消并等待剩余任务，避免后台泄漏。
-    running_tasks = [task for task in tasks if task is not None]
-    try:
-        running_results = (
-            await asyncio.gather(*running_tasks) if running_tasks else []
-        )
-    except BaseException:
-        for task in running_tasks:
-            if not task.done():
-                task.cancel()
-        if running_tasks:
-            await asyncio.gather(*running_tasks, return_exceptions=True)
-        raise
-
-    finalized_calls: list[_FinalizedToolCall] = []
-    running_index = 0
-    for entry, task in zip(entries, tasks, strict=True):
-        if task is None:
-            finalized_calls.append(cast(_FinalizedToolCall, entry))
-        else:
-            finalized_calls.append(running_results[running_index])
-            running_index += 1
-
+    finalized_calls = [
+        cast(_FinalizedToolCall, slot) for slot in slots if slot is not None
+    ]
     messages: list[AgentMessage] = []
     for finalized in finalized_calls:
         result_message = _create_tool_result_message(finalized)
         await _emit_tool_result_message(result_message, emit)
         messages.append(result_message)
-
     return _ExecutedToolBatch(
         messages=messages,
         terminate=_should_terminate_batch(finalized_calls),
     )
+
+
+def _schedule_tool_call(preparation: _PreparedToolCall) -> _ScheduledToolCall:
+    mode = preparation.tool.execution_mode or "parallel"
+    if mode == "sequential":
+        mode = "exclusive"
+    if mode not in {"parallel", "exclusive", "resource_locked"}:
+        raise ValueError(f"工具 {preparation.tool.name} 的 execution_mode 无效：{mode}")
+    if mode != "resource_locked":
+        return _ScheduledToolCall(preparation=preparation, mode=mode)
+
+    resolver = preparation.tool.resolve_resource_keys
+    if resolver is None:
+        raise ValueError(f"工具 {preparation.tool.name} 缺少 resolve_resource_keys")
+    raw = resolver(preparation.args)
+    values = [raw] if isinstance(raw, str) else list(raw)
+    if not values or any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ValueError(f"工具 {preparation.tool.name} 返回了无效 Resource Key")
+    keys = tuple(sorted(set(value.strip() for value in values)))
+    return _ScheduledToolCall(
+        preparation=preparation,
+        mode=mode,
+        resource_keys=keys,
+    )
+
+
+async def _run_scheduled_group(
+    group: list[tuple[int, _ScheduledToolCall]],
+    slots: list[_FinalizedToolCall | None],
+    context: AgentContext,
+    assistant_message: AgentMessage,
+    config: AgentLoopConfig,
+    cancellation: CancellationToken,
+    emit: EventSink,
+    semaphore: asyncio.Semaphore | None,
+    resource_locks: dict[str, asyncio.Lock],
+) -> None:
+    if not group:
+        return
+
+    async def run_one(index: int, item: _ScheduledToolCall) -> tuple[int, _FinalizedToolCall]:
+        locks = tuple(
+            resource_locks.setdefault(key, asyncio.Lock())
+            for key in item.resource_keys
+        )
+        result, is_error = await _execute_prepared_tool(
+            item.preparation,
+            cancellation,
+            emit,
+            config.default_tool_timeout_seconds,
+            execution_semaphore=semaphore,
+            execution_locks=locks,
+            retry_event_sink=config.retry_event_sink,
+        )
+        finalized = await _finalize_executed_tool(
+            context,
+            assistant_message,
+            item.preparation,
+            result,
+            is_error,
+            config,
+            cancellation,
+        )
+        await _emit_tool_end(finalized, emit)
+        return index, finalized
+
+    tasks = [
+        asyncio.create_task(
+            run_one(index, item),
+            name=(
+                f"pi-tool-run:{item.preparation.tool.name}:"
+                f"{item.preparation.tool_call.get('id', '')}"
+            ),
+        )
+        for index, item in group
+    ]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    for index, finalized in results:
+        slots[index] = finalized
 
 
 async def _prepare_tool_call(
@@ -963,7 +1108,13 @@ async def _prepare_tool_call(
             )
             if cancellation.cancelled:
                 return _ImmediateToolCall(
-                    result=error_tool_result("操作已取消"),
+                    result=error_tool_result(
+                        "工具调用在执行前因 Agent 取消而跳过。",
+                        details={
+                            "code": "tool_aborted_before_dispatch",
+                            "synthetic": True,
+                        },
+                    ),
                     is_error=True,
                 )
             if isinstance(before_result, BeforeToolCallResult) and before_result.block:
@@ -977,7 +1128,13 @@ async def _prepare_tool_call(
 
         if cancellation.cancelled:
             return _ImmediateToolCall(
-                result=error_tool_result("操作已取消"),
+                result=error_tool_result(
+                    "工具调用在执行前因 Agent 取消而跳过。",
+                    details={
+                        "code": "tool_aborted_before_dispatch",
+                        "synthetic": True,
+                    },
+                ),
                 is_error=True,
             )
         return _PreparedToolCall(tool_call=tool_call, tool=tool, args=validated_args)
@@ -995,6 +1152,7 @@ async def _execute_prepared_tool(
     default_timeout_seconds: float | None,
     *,
     execution_semaphore: asyncio.Semaphore | None = None,
+    execution_locks: tuple[asyncio.Lock, ...] = (),
     retry_event_sink: Callable[[AgentEvent], Any] | None = None,
 ) -> tuple[AgentToolResult, bool]:
     """执行一个已验证工具，并实现单工具独立超时。
@@ -1037,7 +1195,8 @@ async def _execute_prepared_tool(
                         "args": copy.deepcopy(prepared.tool_call.get("arguments", {})),
                         "partialResult": _tool_result_payload(partial_result),
                     },
-                )
+                ),
+                name=f"pi-tool-update:{tool_name}:{len(update_tasks) + 1}",
             )
         )
 
@@ -1065,13 +1224,22 @@ async def _execute_prepared_tool(
         )
 
     async def execute_once() -> AgentToolResult:
-        if execution_semaphore is None:
-            execution_started.set()
-            return await dispatch_tool_body()
-        # Retry Backoff 不占并发槽；每个新 Attempt 重新申请。
-        async with execution_semaphore:
-            execution_started.set()
-            return await dispatch_tool_body()
+        acquired: list[asyncio.Lock] = []
+        try:
+            # Resource Lock 在 Attempt 期间持有，Backoff 时释放。
+            for lock in execution_locks:
+                await lock.acquire()
+                acquired.append(lock)
+            if execution_semaphore is None:
+                execution_started.set()
+                return await dispatch_tool_body()
+            # 等待 Resource Lock 不占并发槽；真正执行时才申请 Semaphore。
+            async with execution_semaphore:
+                execution_started.set()
+                return await dispatch_tool_body()
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
 
     async def emit_retry_event(event: AgentEvent) -> None:
         # 持久化 Hook 先完成，再向 UI 发布，接近 DeepSeek Harness 的 Durable 语义。
@@ -1087,9 +1255,13 @@ async def _execute_prepared_tool(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             emit=emit_retry_event,
-        )
+        ),
+        name=f"pi-tool-execute:{tool_name}:{tool_call_id}",
     )
-    cancellation_wait_task = asyncio.create_task(tool_cancellation.wait())
+    cancellation_wait_task = asyncio.create_task(
+        tool_cancellation.wait(),
+        name=f"pi-tool-cancel-wait:{tool_name}:{tool_call_id}",
+    )
 
     async def wait_for_timeout() -> None:
         # 初次排队等待并发槽不消耗工具 Timeout；第一次真正执行后开始计时。
@@ -1097,7 +1269,10 @@ async def _execute_prepared_tool(
         await asyncio.sleep(cast(float, timeout_seconds))
 
     timeout_task = (
-        asyncio.create_task(wait_for_timeout())
+        asyncio.create_task(
+            wait_for_timeout(),
+            name=f"pi-tool-timeout:{tool_name}:{tool_call_id}",
+        )
         if timeout_seconds is not None
         else None
     )
@@ -1118,6 +1293,7 @@ async def _execute_prepared_tool(
 
     result: AgentToolResult
     is_error: bool
+    primary_error: BaseException | None = None
 
     try:
         waiters: set[asyncio.Task[Any]] = {execute_task, cancellation_wait_task}
@@ -1201,25 +1377,50 @@ async def _execute_prepared_tool(
                 },
             )
             is_error = True
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         accepting_updates = False
+        cleanup_errors: list[BaseException] = []
+        try:
+            # 外层 Scheduler/Listener 异常取消 run_one 时，嵌套 execute_task 不会
+            # 自动跟随；这里显式取消并等待，避免 Agent 结束后工具继续运行。
+            if not execute_task.done():
+                tool_cancellation.cancel(f"工具 {tool_name} 调度被取消")
+                execute_task.cancel()
+            await asyncio.gather(execute_task, return_exceptions=True)
 
-        # 清理 timeout/cancellation 等待任务，确保工具结束后没有 timer 残留。
-        waiter_tasks = [cancellation_wait_task]
-        if timeout_task is not None:
-            waiter_tasks.append(timeout_task)
-        for waiter in waiter_tasks:
-            if not waiter.done():
-                waiter.cancel()
-        if waiter_tasks:
-            await asyncio.gather(*waiter_tasks, return_exceptions=True)
+            # 清理 timeout/cancellation 等待任务，确保没有 Timer/Waiter 残留。
+            waiter_tasks = [cancellation_wait_task]
+            if timeout_task is not None:
+                waiter_tasks.append(timeout_task)
+            for waiter in waiter_tasks:
+                if not waiter.done():
+                    waiter.cancel()
+            if waiter_tasks:
+                await asyncio.gather(*waiter_tasks, return_exceptions=True)
 
-        # 当前工具在超时或取消前已经发出的 update 必须先结算，再允许发送
-        # tool_execution_end。超时之后到来的 update 会因 accepting_updates=False
-        # 被忽略。
-        if update_tasks:
-            await asyncio.gather(*update_tasks)
-        tool_cancellation.detach()
+            # Update Listener 失败仍属于严格 Listener 语义，但必须先完成全部清理。
+            if update_tasks:
+                update_outcomes = await asyncio.gather(
+                    *update_tasks,
+                    return_exceptions=True,
+                )
+                cleanup_errors.extend(
+                    outcome
+                    for outcome in update_outcomes
+                    if isinstance(outcome, BaseException)
+                    and not isinstance(outcome, asyncio.CancelledError)
+                )
+        finally:
+            # 无论 Execute、Update、Listener 或清理本身如何结束，都解除父子引用。
+            tool_cancellation.detach()
+
+        # 没有更早的主要错误时，Update Listener 错误才成为本次失败原因；
+        # 若已有 Scheduler/Listener 主错误，则绝不让次要清理错误覆盖它。
+        if primary_error is None and cleanup_errors:
+            raise cleanup_errors[0]
 
     return result, is_error
 

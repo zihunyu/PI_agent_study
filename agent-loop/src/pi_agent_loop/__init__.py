@@ -12,6 +12,16 @@ from .domains import (
     EntityState,
 )
 from .event_stream import AgentEventStream, AssistantMessageEventStream, EventStream
+from .harness import (
+    ApprovalResumeCoordinator,
+    DurableAgentHost,
+    DurableHostPromptResult,
+    PendingApprovalResume,
+    RecoverableModelRuntime,
+    RecoverableToolRuntime,
+    StartupRecoveryCoordinator,
+    StartupRecoveryReport,
+)
 from .loop import (
     agent_loop,
     agent_loop_continue,
@@ -106,6 +116,12 @@ from .session import (
     replay_runtime_events,
 )
 from .testing import ScriptedProvider
+from .transcript import (
+    TranscriptIntegrityError,
+    analyze_tool_call_transcript,
+    repair_unresolved_tool_calls,
+    validate_closed_tool_call_transcript,
+)
 from .tools import (
     ToolRegistry,
     create_add_tool,
@@ -142,6 +158,7 @@ __all__ = [
     "AgentToolResult",
     "ApprovalError",
     "ApprovalRecord",
+    "ApprovalResumeCoordinator",
     "ApprovalService",
     "AfterToolCallContext",
     "AfterToolCallResult",
@@ -160,6 +177,8 @@ __all__ = [
     "DomainStateMachine",
     "DomainTransition",
     "DomainTransitionError",
+    "DurableAgentHost",
+    "DurableHostPromptResult",
     "DurableOperationRecorder",
     "DurableSessionRecovery",
     "EntityState",
@@ -176,6 +195,7 @@ __all__ = [
     "ModelRetryPolicy",
     "OperationCancelledError",
     "OpenAICompatibleProvider",
+    "PendingApprovalResume",
     "OutcomeReconciliationRegistry",
     "OperationRecoveryPlan",
     "OperationState",
@@ -187,6 +207,8 @@ __all__ = [
     "RecoveryAction",
     "RecoveryCallbacks",
     "RecoveryExecutionResult",
+    "RecoverableModelRuntime",
+    "RecoverableToolRuntime",
     "RequestDecision",
     "RetryableTaskError",
     "RetryableToolError",
@@ -207,10 +229,13 @@ __all__ = [
     "SimpleDeniedRule",
     "SimpleIntent",
     "SimpleProduct",
+    "StartupRecoveryCoordinator",
+    "StartupRecoveryReport",
     "StaticIdentityVerifier",
     "TaskRetryExecutor",
     "TaskRetryPolicy",
     "ToolCallState",
+    "TranscriptIntegrityError",
     "ToolCapability",
     "ToolChoicePolicy",
     "ToolRetryPolicy",
@@ -222,6 +247,7 @@ __all__ = [
     "WriteOperationService",
     "agent_loop",
     "agent_loop_continue",
+    "analyze_tool_call_transcript",
     "assistant_message",
     "create_add_tool",
     "create_calculator_registry",
@@ -238,10 +264,12 @@ __all__ = [
     "now_ms",
     "project_runtime_state",
     "reduce_runtime_state",
+    "repair_unresolved_tool_calls",
     "replay_operation",
     "replay_runtime_events",
     "run_agent_loop",
     "retry_model_stream",
     "run_agent_loop_continue",
     "user_message",
+    "validate_closed_tool_call_transcript",
 ]

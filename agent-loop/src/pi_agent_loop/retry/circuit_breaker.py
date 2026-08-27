@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -38,8 +39,14 @@ class CircuitOpenError(Exception):
 
 
 class CircuitBreaker:
-    def __init__(self, policy: CircuitBreakerPolicy) -> None:
+    def __init__(
+        self,
+        policy: CircuitBreakerPolicy,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self.policy = policy
+        self._clock = clock or time.monotonic
         self._state: Literal["closed", "open", "half_open"] = "closed"
         self._failures = 0
         self._opened_at = 0.0
@@ -57,7 +64,7 @@ class CircuitBreaker:
             if self._state == "closed":
                 return
             if self._state == "open":
-                elapsed = time.monotonic() - self._opened_at
+                elapsed = self._clock() - self._opened_at
                 if elapsed < self.policy.recovery_timeout_seconds:
                     raise CircuitOpenError("Provider Circuit Breaker 处于 Open")
                 self._state = "half_open"
@@ -85,4 +92,4 @@ class CircuitBreaker:
                 or self._failures >= self.policy.failure_threshold
             ):
                 self._state = "open"
-                self._opened_at = time.monotonic()
+                self._opened_at = self._clock()
