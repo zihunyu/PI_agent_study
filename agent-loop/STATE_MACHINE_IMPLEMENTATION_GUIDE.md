@@ -392,7 +392,15 @@ approved
 -有过期时间；
 -只能消费一次；
 -参数或 Tool 改变后旧 Approval 失效；
--批准后通过 Durable Operation 恢复原请求。
+-批准后通过 Durable Operation 恢复原请求；
+- `approval_resume_registered` 必须先于 Grant/Consume 持久化；
+-恢复扫描必须覆盖 approved/consumed/started，不能只扫描 Started；
+-恢复推进必须幂等，Completed 后不能再次执行 Resume；
+-多 Worker 必须使用事务 Claim，避免同时恢复同一 Approval；
+- Operation Reducer 必须正式归约 Approval/Write Event；
+- Recovery Planner 必须先处理 waiting/approved/consumed/outcome_unknown，再处理普通 Tool Call；
+- Waiting Approval 时禁止 Tool Dispatch；
+- Never Tool 的布尔授权不能替代已消费 Approval 和匹配 Action Hash。
 
 ---
 
@@ -513,6 +521,21 @@ Operation Started/Finished
 
 Recovery Callback 必须通过正式 Provider/Tool Runtime，不能绕过 Guard、权限、Timeout 和 Approval。
 
+每次 `model_request_started` 还必须保存该次请求的独立策略快照：
+
+```text
+visible_tool_names
+tool_choice
+required_capabilities
+allowed_tool_names
+expected_tool_arguments
+continuation_policy
+```
+
+Recovery 必须按 Request/Turn 恢复该快照；缺少快照时进入 Manual Intervention，禁止使用“全部工具 + auto”兜底。Required/Named Tool 完成后的 Continuation Policy 必须在原请求前确定并持久化。
+
+Approval 写操作完成后的说明性模型请求默认不暴露工具并使用 `tool_choice=none`。模型若仍返回 Tool Call，不得写 Completed；应结束 Model Request、标记 Operation Failed，并保持 Transcript 闭合。
+
 ---
 
 ## 16. 并发和 expected_version
@@ -534,14 +557,20 @@ stale_version
 
 禁止直接覆盖其他 Worker 已经更新的状态。
 
-生产多 Worker 还需要：
+单机多进程默认使用 `SQLiteOperationEventStore`：
 
 ```text
-数据库事务
-唯一约束
-Lease/单写者
-事件去重
+BEGIN IMMEDIATE
+Operation expected_last_sequence CAS
+Approval/Write 唯一约束
+Idempotency Key Hash 唯一约束
+跨进程 Lease Claim
+Event Batch Transaction
 ```
+
+JSONL 只允许单实例兼容使用。跨机器部署仍需要 PostgreSQL 等网络数据库。
+
+Approval Consume、Write Approved、Tool Dispatch Started 和 Write Submitting 必须作为同一批事务事件提交。外部 HTTP/数据库副作用不能放在长 SQLite 事务中，应先提交 Claim，再调用外部系统，最后写 Succeeded/Failed/OutcomeUnknown。
 
 ---
 
@@ -605,6 +634,16 @@ Cookie
 ```
 
 生产存储必须加密、鉴权并设置保留周期。
+
+单机事务 Event Store 必须支持：
+
+```text
+append_batch(expected_last_sequence=...)
+try_acquire_claim(...)
+release_claim(...)
+```
+
+状态转换必须先纯函数预验证，再通过 CAS 提交；冲突后重新读取状态，不能继续使用旧快照。
 
 ---
 
@@ -915,6 +954,12 @@ Timeout 后直接重试写操作
 
 工具恢复
 → replay_policy safe/never
+
+模型请求恢复
+→ ModelRequestPolicy（含 Continuation Policy）
+
+单机事务持久化
+→ SQLiteOperationEventStore + SQLiteRuntimeEventStore
 ```
 
 真实业务只需要在这些骨架上提供状态表、Adapter、Tool 和 Policy，不应重新实现另一套 Agent Loop。

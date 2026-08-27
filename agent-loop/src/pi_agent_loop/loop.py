@@ -29,6 +29,7 @@ from .event_stream import (
     AssistantMessageEventStream,
 )
 from .messages import clone_message, error_tool_result, now_ms
+from .model_policy import capture_model_request_policy
 from .retry.errors import OutcomeUnknownToolError, RetryableToolError
 from .retry.tool import execute_tool_with_retry
 from .transcript import (
@@ -97,6 +98,21 @@ async def _emit(sink: EventSink, event: AgentEvent) -> None:
     """发出事件，并等待可能存在的异步 listener。"""
 
     await _maybe_await(sink(event))
+
+
+async def _emit_model_policy_selected(
+    emit: EventSink,
+    context: AgentContext,
+    config: AgentLoopConfig,
+) -> None:
+    policy = capture_model_request_policy(
+        [tool.name for tool in context.tools],
+        config.stream_options,
+    )
+    await _emit(
+        emit,
+        {"type": "model_policy_selected", "policy": policy.to_dict()},
+    )
 
 
 def _assistant_tool_calls(message: AgentMessage) -> list[dict]:
@@ -232,6 +248,7 @@ async def run_agent_loop(
 
     await _emit(emit, {"type": "agent_start"})
     await _emit(emit, {"type": "turn_start"})
+    await _emit_model_policy_selected(emit, current_context, config)
     for prompt in prompts:
         await _emit(emit, {"type": "message_start", "message": clone_message(prompt)})
         await _emit(emit, {"type": "message_end", "message": prompt})
@@ -266,6 +283,7 @@ async def run_agent_loop_continue(
 
     await _emit(emit, {"type": "agent_start"})
     await _emit(emit, {"type": "turn_start"})
+    await _emit_model_policy_selected(emit, current_context, config)
     await _run_loop(
         current_context,
         new_messages,
@@ -449,6 +467,9 @@ async def _run_loop(
                         else config.stream_options,
                     )
 
+            if has_more_tool_calls:
+                await _emit_model_policy_selected(emit, current_context, config)
+
             if config.should_stop_after_turn is not None:
                 should_stop = bool(
                     await _maybe_await(config.should_stop_after_turn(turn_context))
@@ -548,6 +569,16 @@ async def _stream_assistant_response(
         }
     )
 
+    await _emit(
+        emit,
+        {
+            "type": "model_request_start",
+            "requestPolicy": capture_model_request_policy(
+                [tool.name for tool in context.tools],
+                config.stream_options,
+            ).to_dict(),
+        },
+    )
     response = await _maybe_await(stream_fn(config.model, llm_context, options))
     if not hasattr(response, "__aiter__") or not hasattr(response, "result"):
         raise TypeError("stream_fn 必须返回 AssistantMessageEventStream")

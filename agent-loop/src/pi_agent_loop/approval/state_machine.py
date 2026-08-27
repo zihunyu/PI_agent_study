@@ -11,7 +11,13 @@ from uuid import uuid4
 
 from ..security import VerifiedIdentity
 from ..session.operation_events import OperationEvent
-from ..session.operation_store import OperationEventStore
+from ..session.operation_store import (
+    OperationEventStore,
+    OperationStoreConflictError,
+    operation_last_sequence,
+)
+
+_MAX_CONFLICT_RETRIES = 20
 
 
 class ApprovalError(RuntimeError):
@@ -49,25 +55,34 @@ class ApprovalService:
         required_role: str,
         ttl_seconds: float = 300,
     ) -> ApprovalRecord:
-        if ttl_seconds <= 0:
-            raise ValueError("Approval ttl_seconds 必须大于 0")
-        approval_id = str(uuid4())
-        expires_at = int(time.time() * 1000 + ttl_seconds * 1000)
-        await self.store.append(
-            "approval_requested",
-            session_id,
-            operation_id,
-            {
-                "approvalId": approval_id,
-                "actionHash": action_digest(action),
-                "actionSummary": action_summary,
-                "requesterId": requester.principal_id,
-                "requesterVerificationId": requester.verification_id,
-                "requiredRole": required_role,
-                "expiresAt": expires_at,
-            },
+        approval_id, data = build_approval_request_event(
+            requester=requester,
+            action=action,
+            action_summary=action_summary,
+            required_role=required_role,
+            ttl_seconds=ttl_seconds,
         )
-        return await self.get(approval_id)
+        for _ in range(_MAX_CONFLICT_RETRIES):
+            events = await self.store.load(
+                session_id=session_id,
+                operation_id=operation_id,
+            )
+            if not events:
+                raise ApprovalError(
+                    "operation_not_found",
+                    "Approval 必须属于已持久化的 Operation",
+                )
+            try:
+                await self.store.append_batch(
+                    session_id,
+                    operation_id,
+                    [("approval_requested", data)],
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+                return await self.get(approval_id)
+            except OperationStoreConflictError:
+                continue
+        raise ApprovalError("approval_conflict", "Approval Request 并发冲突")
 
     async def grant(
         self,
@@ -77,23 +92,28 @@ class ApprovalService:
         allow_self_approval: bool = False,
     ) -> ApprovalRecord:
         record = await self.get(approval_id)
-        if record.state != "waiting":
-            raise ApprovalError("approval_not_waiting", "Approval 已不在等待状态")
         if record.required_role not in approver.roles:
             raise ApprovalError("approval_role_missing", "审批人缺少所需角色")
-        if not allow_self_approval and record.requester_id == approver.principal_id:
-            raise ApprovalError("self_approval_forbidden", "申请人不能审批自己的操作")
-        await self.store.append(
+        if (
+            not allow_self_approval
+            and record.requester_id == approver.principal_id
+        ):
+            raise ApprovalError(
+                "self_approval_forbidden",
+                "申请人不能审批自己的操作",
+            )
+        return await self._append_transition(
+            record,
             "approval_granted",
-            record.session_id,
-            record.operation_id,
             {
                 "approvalId": approval_id,
                 "approverId": approver.principal_id,
                 "approverVerificationId": approver.verification_id,
             },
+            required_state="waiting",
+            invalid_code="approval_not_waiting",
+            invalid_message="Approval 已不在等待状态",
         )
-        return await self.get(approval_id)
 
     async def reject(
         self,
@@ -103,22 +123,21 @@ class ApprovalService:
         reason: str,
     ) -> ApprovalRecord:
         record = await self.get(approval_id)
-        if record.state != "waiting":
-            raise ApprovalError("approval_not_waiting", "Approval 已不在等待状态")
         if record.required_role not in approver.roles:
             raise ApprovalError("approval_role_missing", "审批人缺少所需角色")
-        await self.store.append(
+        return await self._append_transition(
+            record,
             "approval_rejected",
-            record.session_id,
-            record.operation_id,
             {
                 "approvalId": approval_id,
                 "approverId": approver.principal_id,
                 "approverVerificationId": approver.verification_id,
                 "reason": reason,
             },
+            required_state="waiting",
+            invalid_code="approval_not_waiting",
+            invalid_message="Approval 已不在等待状态",
         )
-        return await self.get(approval_id)
 
     async def consume(
         self,
@@ -128,50 +147,152 @@ class ApprovalService:
         consumer: VerifiedIdentity,
     ) -> ApprovalRecord:
         record = await self.get(approval_id)
-        if record.state != "approved":
-            raise ApprovalError("approval_not_approved", "Approval 尚未批准或已消费")
         if record.action_hash != action_digest(action):
-            raise ApprovalError("approval_action_mismatch", "Approval 与待执行操作不匹配")
-        await self.store.append(
+            raise ApprovalError(
+                "approval_action_mismatch",
+                "Approval 与待执行操作不匹配",
+            )
+        return await self._append_transition(
+            record,
             "approval_consumed",
-            record.session_id,
-            record.operation_id,
             {
                 "approvalId": approval_id,
                 "consumerId": consumer.principal_id,
                 "consumerVerificationId": consumer.verification_id,
             },
+            required_state="approved",
+            invalid_code="approval_not_approved",
+            invalid_message="Approval 尚未批准或已消费",
         )
-        return await self.get(approval_id)
 
     async def get(self, approval_id: str) -> ApprovalRecord:
         events = await self.store.load()
         record = _replay_approval(events, approval_id)
-        if record.state == "waiting" and record.expires_at <= int(time.time() * 1000):
-            await self.store.append(
-                "approval_expired",
-                record.session_id,
-                record.operation_id,
-                {"approvalId": approval_id},
-            )
-            events = await self.store.load()
-            record = _replay_approval(events, approval_id)
+        if (
+            record.state == "waiting"
+            and record.expires_at <= int(time.time() * 1000)
+        ):
+            return await self._expire(record)
         return record
+
+    async def _expire(self, record: ApprovalRecord) -> ApprovalRecord:
+        for _ in range(_MAX_CONFLICT_RETRIES):
+            events = await self.store.load(
+                session_id=record.session_id,
+                operation_id=record.operation_id,
+            )
+            current = _replay_approval(events, record.approval_id)
+            if current.state != "waiting":
+                return current
+            if current.expires_at > int(time.time() * 1000):
+                return current
+            try:
+                await self.store.append_batch(
+                    current.session_id,
+                    current.operation_id,
+                    [
+                        (
+                            "approval_expired",
+                            {"approvalId": current.approval_id},
+                        )
+                    ],
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+            except OperationStoreConflictError:
+                continue
+            return _replay_approval(
+                await self.store.load(
+                    session_id=current.session_id,
+                    operation_id=current.operation_id,
+                ),
+                current.approval_id,
+            )
+        raise ApprovalError("approval_conflict", "Approval Expire 并发冲突")
+
+    async def _append_transition(
+        self,
+        record: ApprovalRecord,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        required_state: str,
+        invalid_code: str,
+        invalid_message: str,
+    ) -> ApprovalRecord:
+        for _ in range(_MAX_CONFLICT_RETRIES):
+            events = await self.store.load(
+                session_id=record.session_id,
+                operation_id=record.operation_id,
+            )
+            current = _replay_approval(events, record.approval_id)
+            if current.state != required_state:
+                raise ApprovalError(invalid_code, invalid_message)
+            try:
+                await self.store.append_batch(
+                    current.session_id,
+                    current.operation_id,
+                    [(event_type, data)],
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+            except OperationStoreConflictError:
+                continue
+            return _replay_approval(
+                await self.store.load(
+                    session_id=current.session_id,
+                    operation_id=current.operation_id,
+                ),
+                current.approval_id,
+            )
+        raise ApprovalError("approval_conflict", "Approval 状态转换并发冲突")
+
+
+def build_approval_request_event(
+    *,
+    requester: VerifiedIdentity,
+    action: dict[str, Any],
+    action_summary: str,
+    required_role: str,
+    ttl_seconds: float = 300,
+) -> tuple[str, dict[str, Any]]:
+    if ttl_seconds <= 0:
+        raise ValueError("Approval ttl_seconds 必须大于 0")
+    approval_id = str(uuid4())
+    expires_at = int(time.time() * 1000 + ttl_seconds * 1000)
+    return approval_id, {
+        "approvalId": approval_id,
+        "actionHash": action_digest(action),
+        "actionSummary": action_summary,
+        "requesterId": requester.principal_id,
+        "requesterVerificationId": requester.verification_id,
+        "requiredRole": required_role,
+        "expiresAt": expires_at,
+    }
 
 
 def action_digest(action: dict[str, Any]) -> str:
-    canonical = json.dumps(action, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        action,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _replay_approval(events: list[OperationEvent], approval_id: str) -> ApprovalRecord:
+def _replay_approval(
+    events: list[OperationEvent],
+    approval_id: str,
+) -> ApprovalRecord:
     record: ApprovalRecord | None = None
     for event in events:
         if event.data.get("approvalId") != approval_id:
             continue
         if event.type == "approval_requested":
             if record is not None:
-                raise ApprovalError("duplicate_approval", "Approval Request 重复")
+                raise ApprovalError(
+                    "duplicate_approval",
+                    "Approval Request 重复",
+                )
             record = ApprovalRecord(
                 approval_id=approval_id,
                 session_id=event.session_id,
@@ -184,10 +305,16 @@ def _replay_approval(events: list[OperationEvent], approval_id: str) -> Approval
                 expires_at=int(event.data.get("expiresAt", 0)),
             )
         elif record is None:
-            raise ApprovalError("approval_event_without_request", "Approval 事件缺少 Request")
+            raise ApprovalError(
+                "approval_event_without_request",
+                "Approval 事件缺少 Request",
+            )
         elif event.type == "approval_granted":
             if record.state != "waiting":
-                raise ApprovalError("invalid_approval_transition", "Approval 不能重复批准")
+                raise ApprovalError(
+                    "invalid_approval_transition",
+                    "Approval 不能重复批准",
+                )
             record = replace(
                 record,
                 state="approved",
@@ -195,16 +322,28 @@ def _replay_approval(events: list[OperationEvent], approval_id: str) -> Approval
             )
         elif event.type == "approval_rejected":
             if record.state != "waiting":
-                raise ApprovalError("invalid_approval_transition", "Approval 不能重复拒绝")
+                raise ApprovalError(
+                    "invalid_approval_transition",
+                    "Approval 不能重复拒绝",
+                )
             record = replace(record, state="rejected")
         elif event.type == "approval_expired":
             if record.state != "waiting":
-                raise ApprovalError("invalid_approval_transition", "只有 Waiting Approval 可以过期")
+                raise ApprovalError(
+                    "invalid_approval_transition",
+                    "只有 Waiting Approval 可以过期",
+                )
             record = replace(record, state="expired")
         elif event.type == "approval_consumed":
             if record.state != "approved":
-                raise ApprovalError("invalid_approval_transition", "只有 Approved 可以消费")
+                raise ApprovalError(
+                    "invalid_approval_transition",
+                    "只有 Approved 可以消费",
+                )
             record = replace(record, state="consumed")
     if record is None:
-        raise ApprovalError("approval_not_found", f"Approval 不存在：{approval_id}")
+        raise ApprovalError(
+            "approval_not_found",
+            f"Approval 不存在：{approval_id}",
+        )
     return record

@@ -6,7 +6,12 @@ from typing import Any
 from uuid import uuid4
 
 from ..types import AgentTool
-from .operation_store import OperationEventStore
+from .operation_state import replay_operation_with_specs
+from .operation_store import (
+    OperationEventStore,
+    OperationStoreConflictError,
+    operation_last_sequence,
+)
 
 
 class DurableOperationRecorder:
@@ -57,9 +62,29 @@ class DurableOperationRecorder:
         await self._append(event_type, data or {})
 
     async def finish_operation(self, outcome: str) -> None:
-        await self._append("operation_finished", {"outcome": outcome})
-        self.operation_id = None
-        self._active_request_id = None
+        if self.operation_id is None:
+            raise RuntimeError("没有活动 Durable Operation")
+        operation_id = self.operation_id
+        specs = [("operation_finished", {"outcome": outcome})]
+        for _ in range(20):
+            events = await self.store.load(
+                session_id=self.session_id,
+                operation_id=operation_id,
+            )
+            replay_operation_with_specs(events, specs)
+            try:
+                await self.store.append_batch(
+                    self.session_id,
+                    operation_id,
+                    specs,
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+            except OperationStoreConflictError:
+                continue
+            self.operation_id = None
+            self._active_request_id = None
+            return
+        raise RuntimeError("Operation Finished 并发冲突")
 
     async def listener(self, event: dict[str, Any], cancellation: Any) -> None:
         event_type = event.get("type")
@@ -77,11 +102,37 @@ class DurableOperationRecorder:
                     {"message": message, "syntheticRepair": True},
                 )
             return
+        if event_type == "model_policy_selected":
+            policy = event.get("policy")
+            if not isinstance(policy, dict):
+                raise RuntimeError("Model Policy Selected 缺少策略快照")
+            await self._append(
+                "model_policy_selected",
+                {"policy": policy},
+            )
+            return
+        if event_type == "model_request_start":
+            if self._active_request_id is not None:
+                raise RuntimeError("上一个 Model Request 尚未结束")
+            policy = event.get("requestPolicy")
+            if not isinstance(policy, dict):
+                raise RuntimeError("Model Request Start 缺少策略快照")
+            self._active_request_id = str(uuid4())
+            await self._append(
+                "model_request_started",
+                {
+                    "requestId": self._active_request_id,
+                    "requestPolicy": policy,
+                },
+            )
+            return
         if event_type == "message_start":
             message = event.get("message", {})
-            if message.get("role") == "assistant":
-                if self._active_request_id is not None:
-                    raise RuntimeError("上一个 Model Request 尚未结束")
+            if (
+                message.get("role") == "assistant"
+                and self._active_request_id is None
+            ):
+                # 兼容不发 model_request_start 的自定义旧 Loop。
                 self._active_request_id = str(uuid4())
                 await self._append(
                     "model_request_started",

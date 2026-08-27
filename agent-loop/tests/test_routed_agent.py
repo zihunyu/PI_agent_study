@@ -13,12 +13,15 @@ from pi_agent_loop import (  # noqa: E402
     AgentTool,
     AgentToolResult,
     CapabilityRegistry,
+    DurableOperationRecorder,
+    InMemoryOperationEventStore,
     Model,
     RequestDecision,
     RoutedAgent,
     ScriptedProvider,
     ToolChoicePolicy,
     assistant_message,
+    replay_operation,
 )
 
 
@@ -177,6 +180,63 @@ class RoutedAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.error_code)
         self.assertEqual(result.response_text, "订单 1001 已发货")
         self.assertEqual(provider.call_count, 2)
+
+    async def test_required策略按每次模型请求持久化并切换continuation(self) -> None:
+        provider = ScriptedProvider(
+            [
+                assistant_message(
+                    model=self.model,
+                    stop_reason="toolUse",
+                    content=[
+                        {
+                            "type": "toolCall",
+                            "id": "order-policy-call",
+                            "name": "get_order_status",
+                            "arguments": {"order_id": "1001"},
+                        }
+                    ],
+                ),
+                assistant_message(
+                    model=self.model,
+                    content=[{"type": "text", "text": "订单 1001 已发货"}],
+                ),
+            ]
+        )
+        capabilities = self.make_capabilities()
+        store = InMemoryOperationEventStore()
+        recorder = DurableOperationRecorder(
+            store,
+            session_id="policy-session",
+            tools=capabilities.all_tools(),
+        )
+        routed = RoutedAgent(
+            Agent(model=self.model, stream_fn=provider.stream),
+            FixedRouter(self.tool_decision()),
+            capabilities,
+            operation_recorder=recorder,
+        )
+
+        await routed.prompt("查询订单 1001 当前状态")
+
+        operation = replay_operation(
+            await store.load(operation_id=recorder.last_operation_id)
+        )
+        requests = list(operation.model_requests.values())
+        self.assertEqual(len(requests), 2)
+        first = requests[0].policy
+        second = requests[1].policy
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(first.visible_tool_names, ("get_order_status",))
+        self.assertEqual(first.tool_choice, "required")
+        self.assertEqual(first.allowed_tool_names, ("get_order_status",))
+        self.assertEqual(
+            first.expected_tool_arguments,
+            {"order_id": "1001"},
+        )
+        self.assertEqual(second.visible_tool_names, ("get_order_status",))
+        self.assertEqual(second.tool_choice, "auto")
+        self.assertEqual(second.expected_tool_arguments, {})
 
     async def test_capability_missing_不调用模型(self) -> None:
         provider = ScriptedProvider([])

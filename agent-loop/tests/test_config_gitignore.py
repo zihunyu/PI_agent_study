@@ -24,6 +24,11 @@ class ConfigGitIgnoreTests(unittest.TestCase):
         self.assertTrue(self.check_ignored("config/providers.toml"))
         self.assertTrue(self.check_ignored("config/business.toml"))
 
+    def test_sqlite运行状态和wal必须被忽略(self) -> None:
+        self.assertTrue(self.check_ignored("local-state.sqlite3"))
+        self.assertTrue(self.check_ignored("local-state.sqlite3-wal"))
+        self.assertTrue(self.check_ignored("local-state.sqlite3-shm"))
+
     def test_example_配置允许提交(self) -> None:
         self.assertFalse(self.check_ignored("config/agent.toml.example"))
         self.assertFalse(self.check_ignored("config/providers.toml.example"))

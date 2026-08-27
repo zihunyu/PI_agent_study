@@ -3,10 +3,12 @@
 from .jsonl import JsonlRuntimeEventStore
 from .operation_events import OperationEvent
 from .operation_state import (
+    ApprovalSnapshot,
     ModelRequestState,
     OperationLogInvariantError,
     OperationState,
     ToolInvocationState,
+    WriteSnapshot,
     reduce_operation_event,
     replay_operation,
 )
@@ -14,7 +16,9 @@ from .operation_store import (
     InMemoryOperationEventStore,
     JsonlOperationEventStore,
     OperationEventStore,
+    OperationStoreConflictError,
 )
+from .sqlite import SQLiteOperationEventStore, SQLiteRuntimeEventStore
 from .recorder import DurableOperationRecorder
 from .recovery import RuntimeRecoveryManager
 from .resume import (
@@ -32,12 +36,14 @@ __all__ = [
     "DurableSessionRecovery",
     "InMemoryOperationEventStore",
     "InMemoryRuntimeEventStore",
+    "ApprovalSnapshot",
     "JsonlOperationEventStore",
     "JsonlRuntimeEventStore",
     "ModelRequestState",
     "OperationEvent",
     "OperationEventStore",
     "OperationLogInvariantError",
+    "OperationStoreConflictError",
     "OperationRecoveryPlan",
     "OperationState",
     "RecoveryAction",
@@ -45,7 +51,10 @@ __all__ = [
     "RecoveryExecutionResult",
     "RuntimeEventStore",
     "RuntimeRecoveryManager",
+    "SQLiteOperationEventStore",
+    "SQLiteRuntimeEventStore",
     "ToolInvocationState",
+    "WriteSnapshot",
     "reduce_operation_event",
     "replay_operation",
     "replay_runtime_events",

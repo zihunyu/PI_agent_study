@@ -21,6 +21,7 @@ from pi_agent_loop import (  # noqa: E402
     InMemoryOperationEventStore,
     JsonlOperationEventStore,
     Model,
+    ModelRequestPolicy,
     OperationState,
     OutcomeUnknownToolError,
     RecoveryCallbacks,
@@ -47,6 +48,10 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
             operation_id,
             {"configuration": {"model": self.model.id}, "tools": []},
         )
+
+    @staticmethod
+    def no_tool_policy() -> ModelRequestPolicy:
+        return ModelRequestPolicy.no_tools()
 
     async def test_recorder_持久化完整消息和工具执行事实(self) -> None:
         tool = create_divide_tool()
@@ -132,11 +137,21 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
             "operation-1",
             {"message": {"role": "user", "content": [{"type": "text", "text": "问题"}]}},
         )
+        policy = self.no_tool_policy()
+        await store.append(
+            "model_policy_selected",
+            "session-1",
+            "operation-1",
+            {"policy": policy.to_dict()},
+        )
         await store.append(
             "model_request_started",
             "session-1",
             "operation-1",
-            {"requestId": "request-1"},
+            {
+                "requestId": "request-1",
+                "requestPolicy": policy.to_dict(),
+            },
         )
 
         plan = await DurableSessionRecovery(store).plan(
@@ -146,6 +161,36 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plan.actions[0].kind, "retry_model_request")
         self.assertEqual(plan.actions[0].request_id, "request-1")
+        self.assertEqual(plan.actions[0].request_policy, policy)
+
+    async def test_recovery缺少模型策略时进入人工处理而不扩大工具(self) -> None:
+        store = InMemoryOperationEventStore()
+        await self.start_operation(store)
+        await store.append(
+            "message_appended",
+            "session-1",
+            "operation-1",
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "问题"}],
+                }
+            },
+        )
+        await store.append(
+            "model_request_started",
+            "session-1",
+            "operation-1",
+            {"requestId": "legacy-without-policy"},
+        )
+
+        plan = await DurableSessionRecovery(store).plan(
+            session_id="session-1",
+            operation_id="operation-1",
+        )
+
+        self.assertEqual(plan.actions[0].kind, "manual_intervention")
+        self.assertIn("缺少持久化请求策略", plan.actions[0].reason)
 
     async def test_recovery_plan_区分_safe_replay_和_reconcile(self) -> None:
         async def plan_for(replay_policy: str):
@@ -213,8 +258,24 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
                 "arguments": {"a": 10, "b": 2},
             }],
         )
+        policy = ModelRequestPolicy(
+            visible_tool_names=("divide",),
+            tool_choice="required",
+            allowed_tool_names=("divide",),
+            expected_tool_arguments={"a": 10, "b": 2},
+            continuation_policy=self.no_tool_policy(),
+        )
         await store.append(
-            "model_request_started", "session-1", "operation-1", {"requestId": "r1"}
+            "model_policy_selected",
+            "session-1",
+            "operation-1",
+            {"policy": policy.to_dict()},
+        )
+        await store.append(
+            "model_request_started",
+            "session-1",
+            "operation-1",
+            {"requestId": "r1", "requestPolicy": policy.to_dict()},
         )
         await store.append(
             "model_request_completed",
@@ -253,7 +314,8 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
                 "isError": False,
             }
 
-        async def request_model(_messages):
+        async def request_model(_messages, recovered_policy):
+            self.assertEqual(recovered_policy, self.no_tool_policy())
             return assistant_message(
                 model=self.model,
                 content=[{"type": "text", "text": "结果是 5"}],
@@ -421,6 +483,12 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
             path = Path(directory) / "operation.jsonl"
             store = JsonlOperationEventStore(path)
             await self.start_operation(store)
+            await store.append(
+                "model_policy_selected",
+                "session-1",
+                "operation-1",
+                {"policy": self.no_tool_policy().to_dict()},
+            )
             await store.append(
                 "message_appended",
                 "session-1",

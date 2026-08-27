@@ -45,4 +45,24 @@
 - resource_locked 必须使用已校验参数生成稳定 Resource Key，禁止在 Key 中包含密钥；
 - 写工具不得因为全局 parallel 而省略执行策略、Approval、Idempotency 和 expected_version；
 - 任何并行调度改动都必须验证外层取消会清理嵌套 Execute/Update/Timer/Waiter Task；
-- `CancellationToken.detach()` 必须位于不可跳过的 finally，清理错误不得覆盖主要错误。
+- `CancellationToken.detach()` 必须位于不可跳过的 finally，清理错误不得覆盖主要错误；
+- 每个已提交 Assistant Tool Call 在下一条 User/Assistant 前必须有且只有一个 ToolResult；
+- 取消、跳过和 Scheduler 异常必须生成 Synthetic Error ToolResult，不能留下未闭合历史；
+- Provider 序列化前必须执行 Transcript Closure 校验；
+- Approval Resume 必须以 `approval_resume_registered` 为恢复锚点，不得只扫描 Started；
+- waiting/approved/consumed/started/completed 必须按当前状态幂等推进；
+- Approved 恢复必须解析可信 Consumer，禁止伪造身份；
+- Completed Resume 不得再次执行回调，跨进程 Claim 必须依赖事务 Store；
+- Operation Reducer 必须消费 Approval/Write Event，不能用“忽略后在 Startup 特判”代替正式状态；
+- Recovery Planner 必须先检查 Approval/Write，再规划普通 Model/Tool 恢复；
+- Waiting Approval 禁止 Tool Dispatch，Never Tool 的布尔授权不能替代 Consumed Approval；
+- Approval Action Hash、Tool Name/Arguments、Write ID 和 Tool Call ID 必须一致。
+- 每次 Model Request 必须持久化独立策略快照：可见工具、tool_choice、Capability、允许工具和预期参数。
+- Recovery 缺少请求策略时必须进入 Manual Intervention，禁止回退到“全部工具 + auto”。
+- Required/Named Tool 完成后的 Continuation Policy 必须预先持久化，不能在恢复时猜测。
+- Approval 写操作完成后的模型请求默认 tools=[]、tool_choice=none；若模型仍返回 Tool Call，Operation 必须失败且日志保持闭合。
+- Operation Finished 必须先经过 Reducer/Transcript Closure 预验证，再使用 expected version 条件追加。
+- 单机多进程默认使用 SQLite Transaction Store；JSONL 只保留为单实例兼容实现。
+- Approval/Write 的读取、状态检查和 Event 追加必须使用 CAS/事务，禁止裸露的 read-check-append。
+- Approval Consume、Write Claim、Tool Dispatch Intent 必须在同一 Store Transaction 中提交。
+- 外部写操作不能包在长数据库事务中；必须先持久 Claim，再依赖 Idempotency Key 和 Reconciliation 完成。

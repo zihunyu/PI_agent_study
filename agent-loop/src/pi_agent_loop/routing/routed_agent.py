@@ -7,6 +7,7 @@ from collections.abc import Awaitable
 from typing import Any, Protocol, cast
 
 from ..agent import Agent
+from ..model_policy import ModelRequestPolicy
 from ..types import AgentLoopTurnUpdate, TurnCompletedContext
 from .capabilities import CapabilityRegistry
 from .guard import RequiredToolCallGuard, guard_stream_fn
@@ -152,6 +153,13 @@ class RoutedAgent:
         self.agent.stream_options["expected_tool_arguments"] = dict(
             decision.extracted_fields
         )
+        self.agent.stream_options["recovery_continuation_policy"] = (
+            ModelRequestPolicy(
+                visible_tool_names=tuple(decision.selected_tools),
+                tool_choice="auto" if decision.selected_tools else "none",
+                allowed_tool_names=tuple(decision.selected_tools),
+            ).to_dict()
+        )
 
         self._active_decision = decision
         try:
@@ -214,6 +222,7 @@ class RoutedAgent:
         next_options["tool_choice"] = "auto"
         next_options["required_capabilities"] = []
         next_options["expected_tool_arguments"] = {}
+        next_options.pop("recovery_continuation_policy", None)
 
         return AgentLoopTurnUpdate(
             context=original_update.context if original_update else None,

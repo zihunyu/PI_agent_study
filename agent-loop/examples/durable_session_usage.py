@@ -15,6 +15,7 @@ from pi_agent_loop import (  # noqa: E402
     IdentityClaim,
     JsonlOperationEventStore,
     Model,
+    ModelRequestPolicy,
     RecoveryCallbacks,
     StaticIdentityVerifier,
     WriteOperationService,
@@ -101,6 +102,19 @@ async def crash_recovery_demo(store: JsonlOperationEventStore) -> None:
         operation_id,
         {"configuration": {"model": model.id}, "tools": []},
     )
+    policy = ModelRequestPolicy(
+        visible_tool_names=("divide",),
+        tool_choice="required",
+        allowed_tool_names=("divide",),
+        expected_tool_arguments={"a": 10, "b": 2},
+        continuation_policy=ModelRequestPolicy.no_tools(),
+    )
+    await store.append(
+        "model_policy_selected",
+        session_id,
+        operation_id,
+        {"policy": policy.to_dict()},
+    )
     await store.append(
         "message_appended",
         session_id,
@@ -126,7 +140,10 @@ async def crash_recovery_demo(store: JsonlOperationEventStore) -> None:
         "model_request_started",
         session_id,
         operation_id,
-        {"requestId": "request-before-crash"},
+        {
+            "requestId": "request-before-crash",
+            "requestPolicy": policy.to_dict(),
+        },
     )
     await store.append(
         "model_request_completed",
@@ -162,8 +179,9 @@ async def crash_recovery_demo(store: JsonlOperationEventStore) -> None:
             "isError": False,
         }
 
-    async def request_model(messages):
+    async def request_model(messages, recovered_policy):
         print("恢复后的模型 Context 角色：", [item["role"] for item in messages])
+        print("恢复策略 Tool Choice：", recovered_policy.tool_choice)
         return assistant_message(
             model=model,
             content=[{"type": "text", "text": "恢复完成，结果是 5"}],

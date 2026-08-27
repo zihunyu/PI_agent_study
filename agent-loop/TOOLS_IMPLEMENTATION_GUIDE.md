@@ -378,6 +378,20 @@ return AgentToolResult(
 - 不把完整隐私数据塞入 content；
 - 明确数据来源和操作结果。
 
+### 11.1 Tool Call Closure
+
+只要 Assistant Tool Call 已写入历史，Runtime 必须为它生成一个 ToolResult。
+
+工具未执行也要使用 Synthetic Error Result：
+
+```text
+tool_aborted_before_dispatch
+tool_not_executed_due_run_error
+tool_result_missing_repaired
+```
+
+禁止在取消时简单跳过剩余 Tool Call。Provider 序列化前还会校验 Duplicate、Orphan、Name Mismatch 和 Missing Result。
+
 ---
 
 ## 12. 错误处理
@@ -804,6 +818,8 @@ AI 每次新增工具必须按顺序执行：
 - [ ] Timeout/取消测试；
 - [ ] Scheduler/Listener 异常下无后台 Task 残留；
 - [ ] Update Listener 失败后子令牌仍 Detach；
+- [ ] 取消/跳过后全部 Tool Call 都有 Synthetic ToolResult；
+- [ ] Transcript Closure 校验通过；
 - [ ] README 更新；
 - [ ] BUSINESS_REQUIREMENTS 更新（业务工具）；
 - [ ] 全部测试通过；

@@ -6,12 +6,13 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from ..agent import Agent
 from ..approval import ApprovalService
 from ..messages import assistant_message, user_message
+from ..model_policy import ModelRequestPolicy
 from ..retry.compaction import CompactionRetryPolicy, compact_on_context_overflow
 from ..retry.events import JsonlRetryEventStore
 from ..routing.capabilities import CapabilityRegistry
@@ -21,11 +22,21 @@ from ..session import (
     DurableOperationRecorder,
     JsonlOperationEventStore,
     JsonlRuntimeEventStore,
+    OperationEventStore,
     RecoveryCallbacks,
     RuntimeRecoveryManager,
+    SQLiteOperationEventStore,
+    SQLiteRuntimeEventStore,
 )
 from ..security import VerifiedIdentity
-from ..session.operation_state import replay_operation
+from ..session.operation_state import (
+    replay_operation,
+    replay_operation_with_specs,
+)
+from ..session.operation_store import (
+    OperationStoreConflictError,
+    operation_last_sequence,
+)
 from ..types import AgentTool, Model, StreamFn
 from ..writes import WriteOperationService
 from .approval_gateway import ApprovalResumeCoordinator
@@ -52,7 +63,7 @@ class DurableAgentHost:
         self.routed_agent: RoutedAgent | None
         self.runtime_tracker: RuntimeStateTracker
         self.operation_recorder: DurableOperationRecorder
-        self.operation_store: JsonlOperationEventStore
+        self.operation_store: OperationEventStore
         self.approvals: ApprovalService
         self.approval_resume: ApprovalResumeCoordinator
         self.writes: WriteOperationService
@@ -60,6 +71,8 @@ class DurableAgentHost:
         self.tool_runtime: RecoverableToolRuntime
         self.startup_recovery: StartupRecoveryCoordinator
         self.startup_recovery_report: StartupRecoveryReport | None
+        self.pending_approval_resumes: tuple[str, ...]
+        self.recovered_approval_resumes: tuple[str, ...]
 
     @classmethod
     async def create(
@@ -83,6 +96,9 @@ class DurableAgentHost:
         default_tool_timeout_seconds: float | None = None,
         compaction_policy: CompactionRetryPolicy | None = None,
         auto_recover: bool = True,
+        approval_resume_handler: Callable[[dict[str, Any]], Any] | None = None,
+        approval_consumer_resolver: Callable[[Any], Any] | None = None,
+        store_backend: Literal["sqlite", "jsonl"] = "sqlite",
     ) -> "DurableAgentHost":
         if not session_id:
             raise ValueError("session_id 不能为空")
@@ -91,10 +107,19 @@ class DurableAgentHost:
         self.model = model
         root = Path(state_dir)
         retry_store = JsonlRetryEventStore(root / "retry-events.jsonl")
-        runtime_store = JsonlRuntimeEventStore(root / "runtime-events.jsonl")
-        self.operation_store = JsonlOperationEventStore(
-            root / "operation-events.jsonl"
-        )
+        if store_backend == "sqlite":
+            database_path = root / "agent-state.sqlite3"
+            runtime_store = SQLiteRuntimeEventStore(database_path)
+            self.operation_store = SQLiteOperationEventStore(database_path)
+        elif store_backend == "jsonl":
+            runtime_store = JsonlRuntimeEventStore(
+                root / "runtime-events.jsonl"
+            )
+            self.operation_store = JsonlOperationEventStore(
+                root / "operation-events.jsonl"
+            )
+        else:
+            raise ValueError(f"不支持的 Store Backend：{store_backend}")
         await RuntimeRecoveryManager(runtime_store).recover()
         self.runtime_tracker = await RuntimeStateTracker.create(runtime_store)
         self.operation_recorder = DurableOperationRecorder(
@@ -141,7 +166,7 @@ class DurableAgentHost:
 
         self.model_runtime = RecoverableModelRuntime(
             model=model,
-            stream_fn=effective_stream,
+            stream_fn=self.agent.stream_fn,
             system_prompt=system_prompt,
             tools=tools,
             retry_event_sink=retry_store.append,
@@ -167,7 +192,10 @@ class DurableAgentHost:
             return value
 
         callbacks = RecoveryCallbacks(
-            request_model=lambda messages: self.model_runtime.request(messages),
+            request_model=lambda messages, policy: self.model_runtime.request(
+                messages,
+                policy=policy,
+            ),
             execute_tool=lambda action: self.tool_runtime.execute(action),
             reconcile_tool=default_reconcile,
         )
@@ -183,6 +211,22 @@ class DurableAgentHost:
         self.writes = WriteOperationService(
             self.operation_store,
             self.approvals,
+        )
+        self.recovered_approval_resumes = ()
+        if auto_recover and approval_resume_handler is not None:
+            async def resume_approval(payload: dict[str, Any]) -> Any:
+                value = approval_resume_handler(payload)
+                if hasattr(value, "__await__"):
+                    return await value
+                return value
+
+            recovered = await self.approval_resume.recover_incomplete(
+                resume_approval,
+                consumer_resolver=approval_consumer_resolver,
+            )
+            self.recovered_approval_resumes = tuple(recovered)
+        self.pending_approval_resumes = tuple(
+            await self.approval_resume.pending_recovery_ids()
         )
         self.startup_recovery_report = (
             await self.startup_recovery.recover_all()
@@ -259,9 +303,26 @@ class DurableAgentHost:
                 }
             ],
         )
+        planned_policy = ModelRequestPolicy(
+            visible_tool_names=(tool_name,),
+            tool_choice={
+                "type": "function",
+                "function": {"name": tool_name},
+            },
+            required_capabilities=tuple(
+                result.decision.required_capabilities
+            ),
+            allowed_tool_names=(tool_name,),
+            expected_tool_arguments=arguments,
+            continuation_policy=ModelRequestPolicy.no_tools(),
+        )
         await self.operation_recorder.record_external(
             "model_request_started",
-            {"requestId": request_id, "source": "host_approval_plan"},
+            {
+                "requestId": request_id,
+                "source": "host_approval_plan",
+                "requestPolicy": planned_policy.to_dict(),
+            },
         )
         await self.operation_recorder.record_external(
             "model_request_completed",
@@ -270,6 +331,12 @@ class DurableAgentHost:
                 "message": planned_call,
                 "source": "host_approval_plan",
             },
+        )
+        # Approval 的 ToolResult 已经产生后只允许模型生成最终文本；如果需要
+        # 新业务动作，必须作为新的 Routed Operation 重新经过 Router/Guard。
+        await self.operation_recorder.record_external(
+            "model_policy_selected",
+            {"policy": ModelRequestPolicy.no_tools().to_dict()},
         )
         pending = await self.approval_resume.request(
             session_id=self.session_id,
@@ -324,6 +391,7 @@ class DurableAgentHost:
                 idempotency_key=idempotency_key,
                 requester=consumer,
                 requires_approval=False,
+                tool_call_id=tool_call_id,
             )
 
             async def invoke(args, key, actor):
@@ -344,12 +412,8 @@ class DurableAgentHost:
                     "source": "approval_resume",
                 },
             )
-            await self.operation_store.append(
-                "tool_dispatch_started",
-                self.session_id,
-                operation_id,
-                {"toolCallId": tool_call_id, "source": "approval_resume"},
-            )
+            # tool_dispatch_started 与 write_submitting 由
+            # WriteOperationService 在同一 Store Transaction 中 Claim。
             write = await self.writes.execute(
                 write.write_id,
                 actor=consumer,
@@ -395,13 +459,48 @@ class DurableAgentHost:
                 )
             )
             request_id = str(uuid4())
+            final_policy = ModelRequestPolicy.no_tools()
             await self.operation_store.append(
                 "model_request_started",
                 self.session_id,
                 operation_id,
-                {"requestId": request_id, "source": "approval_resume"},
+                {
+                    "requestId": request_id,
+                    "source": "approval_resume",
+                    "requestPolicy": final_policy.to_dict(),
+                },
             )
-            final = await self.model_runtime.request(list(operation.messages))
+            try:
+                final = await self.model_runtime.request(
+                    list(operation.messages),
+                    policy=final_policy,
+                )
+                tool_calls = [
+                    block
+                    for block in final.get("content", [])
+                    if isinstance(block, dict)
+                    and block.get("type") == "toolCall"
+                ]
+                if tool_calls:
+                    raise RuntimeError(
+                        "Approval 完成后的最终模型响应禁止包含 Tool Call"
+                    )
+                if final.get("stopReason", "stop") != "stop":
+                    raise RuntimeError(
+                        "Approval 完成后的最终模型响应没有正常结束"
+                    )
+            except Exception as error:
+                await self.operation_store.append(
+                    "model_request_failed",
+                    self.session_id,
+                    operation_id,
+                    {
+                        "requestId": request_id,
+                        "errorCode": "approval_final_response_invalid",
+                        "error": str(error),
+                    },
+                )
+                raise
             await self.operation_store.append(
                 "model_request_completed",
                 self.session_id,
@@ -422,11 +521,9 @@ class DurableAgentHost:
                 if self.operation_recorder.operation_id == resumed_operation_id:
                     await self.operation_recorder.finish_operation("failed")
                 else:
-                    await self.operation_store.append(
-                        "operation_finished",
-                        self.session_id,
+                    await self._finish_persisted_operation(
                         resumed_operation_id,
-                        {"outcome": "failed"},
+                        "failed",
                     )
             if (
                 self.runtime_tracker.state.run_id is not None
@@ -441,11 +538,9 @@ class DurableAgentHost:
             if self.operation_recorder.operation_id == resumed_operation_id:
                 await self.operation_recorder.finish_operation("completed")
             else:
-                await self.operation_store.append(
-                    "operation_finished",
-                    self.session_id,
+                await self._finish_persisted_operation(
                     resumed_operation_id,
-                    {"outcome": "completed"},
+                    "completed",
                 )
         if (
             self.runtime_tracker.state.run_id is not None
@@ -456,6 +551,30 @@ class DurableAgentHost:
                 {"outcome": "completed"},
             )
         return result
+
+    async def _finish_persisted_operation(
+        self,
+        operation_id: str,
+        outcome: str,
+    ) -> None:
+        specs = [("operation_finished", {"outcome": outcome})]
+        for _ in range(20):
+            events = await self.operation_store.load(
+                session_id=self.session_id,
+                operation_id=operation_id,
+            )
+            replay_operation_with_specs(events, specs)
+            try:
+                await self.operation_store.append_batch(
+                    self.session_id,
+                    operation_id,
+                    specs,
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+            except OperationStoreConflictError:
+                continue
+            return
+        raise RuntimeError("Operation Finished 并发冲突")
 
     async def recover_on_startup(self) -> StartupRecoveryReport:
         return await self.startup_recovery.recover_all()

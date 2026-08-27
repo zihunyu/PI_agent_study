@@ -12,6 +12,7 @@ from ..session.resume import DurableSessionRecovery, RecoveryCallbacks
 @dataclass(frozen=True, slots=True)
 class StartupRecoveryReport:
     completed: tuple[str, ...]
+    waiting_approval: tuple[str, ...]
     manual_intervention: tuple[str, ...]
     failed: tuple[str, ...]
 
@@ -36,6 +37,7 @@ class StartupRecoveryCoordinator:
             ).append(event)
 
         completed: list[str] = []
+        waiting_approval: list[str] = []
         manual: list[str] = []
         failed: list[str] = []
         for (session_id, operation_id), operation_events in grouped.items():
@@ -57,12 +59,23 @@ class StartupRecoveryCoordinator:
                 continue
             if result.status == "completed":
                 completed.append(operation_id)
-            elif result.status == "manual_intervention":
+            elif result.status in {
+                "waiting_approval",
+                "approval_consumer_required",
+                "approved_write_runtime_required",
+                "recovery_claimed",
+            }:
+                waiting_approval.append(operation_id)
+            elif result.status in {
+                "manual_intervention",
+                "write_reconciliation_required",
+            }:
                 manual.append(operation_id)
             else:
                 failed.append(operation_id)
         return StartupRecoveryReport(
             completed=tuple(completed),
+            waiting_approval=tuple(waiting_approval),
             manual_intervention=tuple(manual),
             failed=tuple(failed),
         )

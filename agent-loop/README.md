@@ -153,8 +153,12 @@ agent-loop/
 │  ├─ test_runtime_state_machine.py  Runtime/Domain 状态机测试
 │  ├─ test_tool_scheduling.py        Parallel/Exclusive/Resource Lock 测试
 │  ├─ test_parallel_cleanup.py       Listener 异常与嵌套 Task 清理测试
+│  ├─ test_tool_call_closure.py      Tool Call/Result 协议闭合测试
+│  ├─ test_approval_resume_windows.py Approval Resume 崩溃窗口测试
+│  ├─ test_approval_aware_recovery.py Approval/Write 感知恢复测试
 │  ├─ test_durable_agent_host.py     P1 Host/Runtime/Approval Resume 测试
 │  ├─ test_durable_session.py        Context/Approval/写操作/恢复测试
+│  ├─ test_sqlite_transactional_store.py SQLite/CAS/Claim 并发测试
 │  ├─ test_provider_serialize.py     OpenAI 请求序列化测试
 │  ├─ test_provider_sse.py           SSE 分片测试
 │  ├─ test_openai_compatible_provider.py  HTTP 与 Agent 集成测试
@@ -169,6 +173,7 @@ agent-loop/
    ├─ config.py                      TOML 配置加载
    ├─ event_stream.py                异步事件流和最终结果
    ├─ messages.py                    消息构造与复制
+   ├─ model_policy.py                Model Request/Continuation Policy
    ├─ types.py                       Model、Tool、Config 等类型
    ├─ loop.py                        低层 Agent Loop
    ├─ agent.py                       有状态 Agent 封装
@@ -198,7 +203,8 @@ agent-loop/
    │  ├─ replay.py                   Runtime 状态重放
    │  ├─ recovery.py                 崩溃恢复为 Suspended
    │  ├─ operation_events.py         完整 Operation Event
-   │  ├─ operation_store.py          内存/JSONL Operation Store
+   │  ├─ operation_store.py          内存/JSONL Store 与 CAS 接口
+   │  ├─ sqlite.py                   SQLite Transaction Store
    │  ├─ operation_state.py          Context/Model/Tool Reducer
    │  ├─ recorder.py                 Agent 持久事件 Recorder
    │  └─ resume.py                   安全恢复计划与执行协调
@@ -360,13 +366,13 @@ python -m unittest discover -s tests -v
 
 ```text
 ... ok
-Ran 138 tests
+Ran 167 tests
 OK
 ```
 
-表示一百三十八个自动测试全部通过，并不是 Agent 又执行了一百三十八个用户任务。
+表示一百六十七个自动测试全部通过，并不是 Agent 又执行了一百六十七个用户任务。
 
-一百三十八个测试分别检查：
+一百六十七个测试分别检查：
 
 1. 最终回答能否进入 Agent 状态；
 2. 工具结果能否交回模型并触发第二次模型请求；
@@ -505,7 +511,36 @@ OK
 135. 进程中断后是否继续已消费 Approval 的 Resume；
 136. DurableAgentHost 是否自动装配普通 Agent；
 137. Approval 缺少可信申请人时是否安全结束 Operation；
-138. Host Approval 是否执行幂等写并继续模型。
+138. Host Approval 是否执行幂等写并继续模型；
+139. Sequential 中途取消是否补齐全部 Tool Result；
+140. 首个 Tool Preflight 前取消是否补齐整批结果；
+141. Parallel Preflight 取消是否闭合全部 Tool Call；
+142. Exclusive Barrier 取消后续调用是否闭合；
+143. Listener 异常后 Agent State 是否自动修复；
+144. Error/Aborted Assistant 中 Tool Call 是否移除；
+145. Duplicate/Orphan Tool Result 是否拒绝；
+146. OpenAI Serializer 是否拒绝未闭合历史；
+147. Durable Cancelled Operation 是否没有 Unresolved Tool Call；
+148. 下一次 Prompt 前是否自动修复旧的未闭合历史；
+149. Registered+Waiting 是否保持等待且不自动执行；
+150. Granted 未 Consumed/Started 是否可恢复；
+151. Consumed 未 Started 是否可恢复；
+152. Started 未 Completed 是否可恢复；
+153. Completed 重复调用是否不重复执行；
+154. Rejected 是否不恢复并写 Cancelled；
+155. 同进程并发 Resume 是否只执行一次；
+156. Approved 缺少 Consumer 时是否保持可恢复；
+157. Started 后重复副作用是否由 Idempotency 去重；
+158. Waiting Approval 是否规划等待而不是 Execute Tool；
+159. Direct Recovery 是否不会绕过 Waiting Approval；
+160. Approved 缺 Consumer 是否返回明确等待状态；
+161. Consumed Approval 是否规划 Resume Approved Write；
+162. Rejected Approval 是否生成 Denied ToolResult；
+163. Write Outcome Unknown 是否优先 Reconcile Write；
+164. Waiting Approval 是否禁止 Tool Dispatch；
+165. Approval Action Hash 与 Tool Call 不匹配是否拒绝；
+166. Startup Recovery 是否报告 Waiting Approval 而非 Failed；
+167. Never Tool 即使宽授权回调也不会绕过 Planner。
 
 ### 4.5 可选安装
 
@@ -1648,12 +1683,12 @@ python examples/basic_usage.py
 python -m unittest discover -s tests -v
 ```
 
-当前共有 138 项离线测试，覆盖 Agent Loop、P0 清理、P1 DurableAgentHost、恢复 Runtime、Approval Resume、Durable Session、写操作和状态机。
+当前共有 167 项离线测试，覆盖 Agent Loop、Tool Closure、P0 清理、Approval/Write 感知恢复、P1 Host、Durable Session 和状态机。
 
 只有看到：
 
 ```text
-Ran 138 tests
+Ran 167 tests
 OK
 ```
 
@@ -2000,12 +2035,15 @@ agent.prompt("任务二")  再获得一份新预算
 - `tests/test_durable_session.py`：10 项 Context、Recovery、Identity、Approval 和 Write 测试；
 - `tests/test_tool_scheduling.py`：6 项 Parallel/Exclusive/Resource Lock 测试；
 - `tests/test_parallel_cleanup.py`：4 项 Listener 异常和嵌套 Task 清理测试；
-- `tests/test_durable_agent_host.py`：9 项 P1 Host、Recovery Runtime 和 Approval Resume 测试。
+- `tests/test_durable_agent_host.py`：9 项 P1 Host、Recovery Runtime 和 Approval Resume 测试；
+- `tests/test_tool_call_closure.py`：10 项 Tool Call/Result 协议闭合测试；
+- `tests/test_approval_resume_windows.py`：9 项 Approval Resume 崩溃窗口测试；
+- `tests/test_approval_aware_recovery.py`：10 项 Approval/Write 感知恢复测试。
 
 全部测试：
 
 ```text
-Ran 138 tests
+Ran 167 tests
 OK
 ```
 
@@ -2542,10 +2580,10 @@ tests/test_simple_business_config.py
 tests/test_hybrid_router.py
 ```
 
-覆盖 Hybrid 路由、Retry、状态机、Durable Session、P0 清理、P1 Host/Approval Resume、调度和 AI 开发指南契约。
+覆盖 Hybrid 路由、Retry、状态机、Durable Session、P0 清理、Tool Closure、Approval/Write 感知恢复、P1 Host 和调度。
 
 ```text
-Ran 138 tests
+Ran 167 tests
 OK
 ```
 
@@ -3158,13 +3196,14 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 138 tests
+Ran 178 tests
 OK
 ```
 
 ### 27.13 当前边界
 
-- Runtime Event 和完整 Operation Event 目前使用两个 JSONL，后续可统一数据库事务；
+- DurableAgentHost 的 Runtime/Operation Event 默认共用 SQLite 事务数据库；
+- JSONL Store 只保留给单实例示例和兼容入口；
 - 完整 Context 和恢复计划已实现，但真实 Provider/工具恢复要由 Host 注入 Callback；
 - DomainStateMachine 是基础框架，真实项目必须提供自己的状态表；
 - 多 Intent Plan/Task 状态机仍需后续开发；
@@ -3257,9 +3296,15 @@ Tool Result 已持久化但消息未写入
 
 ### 28.4 Recovery Executor
 
-Host 提供可信 Callback：
+Host 提供可信 Callback；模型回调必须接收持久化策略：
 
 ```python
+async def request_model(messages, request_policy):
+    return await model_runtime.request(
+        messages,
+        policy=request_policy,
+    )
+
 callbacks = RecoveryCallbacks(
     request_model=request_model,
     execute_tool=execute_tool,
@@ -3379,13 +3424,14 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 138 tests
+Ran 178 tests
 OK
 ```
 
 ### 28.11 骨架边界
 
-- JSONL 是单进程单写者实现，多 Worker 要替换成事务数据库；
+- SQLite 支持单机多进程事务；跨机器 Worker 仍需 PostgreSQL Store；
+- JSONL 仅适用于单 Store 实例兼容模式；
 - 完整消息和工具参数可能包含敏感业务数据，生产存储必须加密、控制权限和设置保留周期；
 - Recovery Callback 是 Host 信任边界，必须调用真实 Provider/Tool Runtime，不能绕过 Guard；
 - StaticIdentityVerifier 只能用于开发测试；
@@ -3591,7 +3637,7 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 138 tests
+Ran 167 tests
 OK
 ```
 
@@ -3665,7 +3711,7 @@ python -m unittest discover -s tests -v
 -用户取消后没有 Timer/Waiter/Update Task 残留。
 
 ```text
-Ran 138 tests
+Ran 167 tests
 OK
 ```
 
@@ -3861,7 +3907,7 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 138 tests
+Ran 167 tests
 OK
 ```
 
@@ -3871,7 +3917,511 @@ OK
 
 - StaticIdentityVerifier 仍只用于开发测试；
 - Approval UI/API 和通知尚未实现；
-- JSONL 仍是单进程 Store；
-- 多 Worker 事务一致性属于 P2；
+- DurableAgentHost 默认使用 SQLite 单机事务 Store；
+- JSONL 只保留为 `store_backend="jsonl"` 单实例兼容模式；
+- 跨机器多 Worker 需要后续 PostgreSQL Store；
 - 真实业务 Tool/Identity/Reconciliation 需要后续 Adapter；
 - 多 Intent Plan/Task 属于 P3。
+
+---
+
+## 33. Tool Call/Tool Result 协议闭合
+
+### 33.1 全局不变量
+
+```text
+一个 Assistant Message 中的每个 Tool Call
+→ 在下一条 User/Assistant Message 前
+→ 必须有且只有一个对应 ToolResult
+```
+
+缺失结果会导致 OpenAI-compatible API 返回协议错误。
+
+### 33.2 取消时补齐未执行调用
+
+Sequential A/B/C 在 A 执行时取消：
+
+```text
+A → tool_cancelled
+B → tool_aborted_before_dispatch
+C → tool_aborted_before_dispatch
+```
+
+B/C 不会执行，只生成 Synthetic Error ToolResult。
+
+Parallel Preflight、Exclusive Barrier 和 Resource 调度同样保证整批 Tool Call 闭合。
+
+### 33.3 Error/Aborted Assistant
+
+Error/Aborted Assistant 中的 Tool Call 可能不完整，最终提交历史前会移除这些 Tool Call，不执行它们。
+
+模型 Retry 的失败 Partial Attempt 继续整体丢弃。
+
+### 33.4 Agent 异常修复
+
+Listener/Scheduler 异常导致部分 ToolResult 尚未写入时：
+
+```text
+扫描 Agent State
+→ 按 Tool Call 原始顺序补 Synthetic ToolResult
+→ 再追加失败 Assistant
+```
+
+修复通知：
+
+```text
+transcript_repaired
+```
+
+DurableOperationRecorder 会把修复结果写入 Operation Context。
+
+### 33.5 下一次 Prompt 前修复
+
+Agent 在加入新 User Message 前自动检查旧历史：
+
+```text
+明确缺失 Result
+→ 补 tool_result_missing_repaired
+
+Duplicate/Orphan/Name Mismatch
+→ TranscriptIntegrityError
+→ 禁止继续请求模型
+```
+
+### 33.6 Provider 最后防线
+
+`serialize_chat_request()` 在生成 OpenAI Payload 前再次调用：
+
+```python
+validate_closed_tool_call_transcript(messages)
+```
+
+未闭合、重复、孤立或 Name 不匹配的历史不会发送给 Provider。
+
+### 33.7 Durable Operation Invariant
+
+`operation_finished` 前检查：
+
+- 不存在 Started 未完成的 Model Request；
+-每个 Assistant Tool Call 都有 ToolResult；
+-Duplicate/Orphan Result 不存在。
+
+Cancelled/Failed Operation 也必须先闭合 Tool Batch。
+
+### 33.8 公开工具
+
+```python
+analyze_tool_call_transcript(messages)
+repair_unresolved_tool_calls(messages)
+validate_closed_tool_call_transcript(messages)
+```
+
+错误：
+
+```python
+TranscriptIntegrityError
+```
+
+### 33.9 测试
+
+```bat
+python -m unittest tests.test_tool_call_closure -v
+python -m unittest discover -s tests -v
+```
+
+覆盖 Sequential/Parallel/Exclusive 取消、Listener 异常、Error Assistant、Duplicate/Orphan、Serializer 防线、Durable Cancelled Operation 和下一 Prompt 自动修复。
+
+```text
+Ran 167 tests
+OK
+```
+
+---
+
+## 34. Approval Resume 崩溃窗口修复
+
+### 34.1 Durable 锚点
+
+恢复扫描现在从 `approval_resume_registered` 开始，而不是从 `approval_resume_started` 开始。Registered 在 Grant/Consume 之前已经持久化，包含 Approval ID、Action 和 Resume Payload。
+
+### 34.2 幂等状态推进
+
+```text
+waiting  → Grant → Consume → Started → Resume
+approved → Consume → Started → Resume
+consumed → Started → Resume
+started 未完成 → Resume
+completed → 返回持久结果，不重复 Resume
+```
+
+`approve_and_resume()` 不再每次固定从 `grant()` 开始。
+
+### 34.3 恢复扫描
+
+```python
+await coordinator.recover_incomplete(
+    resume_callback,
+    consumer_resolver=resolve_verified_consumer,
+)
+```
+
+```text
+Registered + waiting  → 等待人工审批
+Registered + approved → 解析可信 Consumer、Consume、补 Started、Resume
+Registered + consumed → 补 Started、Resume
+Started               → Resume
+Rejected/Expired      → approval_resume_cancelled
+Completed/Failed      → 跳过
+```
+
+Approved 状态缺少可信 Consumer Resolver 时不会猜测身份，也不会丢失；它保留在 `pending_recovery_ids()` 中等待 Adapter。
+
+### 34.4 并发 Claim
+
+同一 Coordinator 中，两个协程恢复同一 Approval ID 时只创建一个共享 Resume Task。
+
+SQLite Store 进一步使用持久 Lease Claim，让同一台机器上的多个进程/Coordinator 不能同时恢复同一 Approval 或 Operation。跨机器部署仍需 PostgreSQL 等网络数据库。
+
+### 34.5 Completed 幂等返回
+
+Completed Event 保存可 JSON 序列化结果。重复调用直接读取原结果，不再次执行 Resume Callback。
+
+不可序列化结果只保存完成标记，防止为了返回值重复副作用。
+
+### 34.6 Host 启动检查
+
+`DurableAgentHost` 新增：
+
+```text
+pending_approval_resumes
+recovered_approval_resumes
+```
+
+创建时可以注入：
+
+```python
+approval_resume_handler=...
+approval_consumer_resolver=...
+```
+
+有 Adapter 时自动恢复；没有可信 Consumer/Handler 时明确暴露 Pending ID，不会永久隐身。
+
+普通 StartupRecovery 不会把 Approval Pending 写工具误当成普通 `execute_tool`。
+
+### 34.7 Write Idempotency
+
+如果写 Handler 已成功但 Completed Event 前崩溃，Resume 可能再次进入 Handler。因此仍必须结合：
+
+```text
+Idempotency Key
+WriteOperationService
+Outcome Reconciliation
+```
+
+Approval Resume 幂等解决流程卡死，业务 Idempotency 解决重复副作用。
+
+### 34.8 测试
+
+```bat
+python -m unittest tests.test_approval_resume_windows -v
+python -m unittest discover -s tests -v
+```
+
+覆盖 Waiting、Granted、Consumed、Started、Completed、Rejected、并发 Resume、缺少 Consumer 和副作用 Idempotency。
+
+```text
+Ran 167 tests
+OK
+```
+
+---
+
+## 35. Approval/Write 感知的 Operation Recovery
+
+### 35.1 OperationState 正式投影
+
+```python
+OperationState.approvals: dict[str, ApprovalSnapshot]
+OperationState.writes: dict[str, WriteSnapshot]
+```
+
+Approval 状态：
+
+```text
+waiting/approved/consumed/resume_started/resume_completed/
+resume_failed/rejected/expired/resume_cancelled
+```
+
+Write 状态：
+
+```text
+prepared/waiting_approval/approved/submitting/
+succeeded/failed/outcome_unknown/reconciling
+```
+
+Operation Phase 会投影为 `waiting_approval`、`ready_to_resume`、`executing_write` 或 `outcome_unknown`。
+
+### 35.2 Recovery Planner 优先级
+
+```text
+先检查 Write/Approval
+→ 再检查 Pending Model Request
+→ 最后检查普通 Tool Call
+```
+
+新增：
+
+```text
+wait_for_approval
+consume_approval
+resume_approved_write
+reconcile_write
+finalize_rejected_approval
+```
+
+Waiting Approval 不再产生 `execute_tool`。
+
+### 35.3 Approval/Tool Invariant
+
+- Waiting/Approved Approval 禁止 Tool Dispatch；
+- Registered Action Hash 必须匹配 Approval Request；
+- Tool Name/Arguments 必须匹配 Approval Action；
+- Approval 未 Consumed 不能 Resume Started；
+- Operation Completed 前不得存在未完成 Approval Resume；
+- Operation Completed 前 Write 必须进入 Succeeded/Failed。
+
+### 35.4 Rejected/Expired
+
+```text
+生成 approval_not_granted Synthetic ToolResult
+→ 写 approval_resume_cancelled
+→ 使用完整 Context 继续模型说明未执行
+→ Operation Completed
+```
+
+不会执行写工具。
+
+### 35.5 Outcome Unknown
+
+Write 为 `submitting/outcome_unknown/reconciling` 时，Planner 优先返回 `reconcile_write`，不会因为缺少 ToolResult 而重放写工具。
+
+### 35.6 Startup Report
+
+```python
+StartupRecoveryReport.waiting_approval
+```
+
+等待审批或缺少可信 Consumer/Write Runtime 的 Operation 会进入该分类，不会被标记 Failed，也不会进入普通 Tool Recovery。
+
+### 35.7 测试
+
+```bat
+python -m unittest tests.test_approval_aware_recovery -v
+python -m unittest discover -s tests -v
+```
+
+覆盖 Waiting、Approved、Consumed、Rejected、OutcomeUnknown、Action Hash、Dispatch Invariant、Startup Report 和 Direct Recovery 防绕过。
+
+```text
+Ran 178 tests
+OK
+```
+
+---
+
+## 36. Model Request Policy 持久化与 Approval 最终响应闭合
+
+### 36.1 每次请求独立保存策略
+
+新增：
+
+```python
+ModelRequestPolicy
+```
+
+每个 `model_request_started` 保存：
+
+```text
+visibleToolNames
+toolChoice
+requiredCapabilities
+allowedToolNames
+expectedToolArguments
+continuationPolicy
+```
+
+策略按 Model Request/Turn 保存，不能只在 Operation 级保存，因为 Required Tool 完成后的下一轮通常会切换为 Auto 或 None。
+
+### 36.2 Recovery 禁止扩大权限
+
+`RecoveryAction.request_policy` 会把持久策略传给 `RecoverableModelRuntime`。Runtime 只装配 `visibleToolNames` 中的工具，并恢复原始 Tool Choice、Capability、Allowed Tool 和 Expected Arguments。
+
+```text
+策略缺失
+→ manual_intervention
+→ 禁止“全部工具 + tool_choice=auto”兜底
+
+当前 Runtime 缺少策略要求的工具
+→ ModelRequestPolicyError
+→ 禁止静默缩减或替换工具
+```
+
+### 36.3 Continuation Policy
+
+Router 在初始 Required/Named 请求前同时持久化工具完成后的 Continuation Policy。这样即使崩溃发生在 Tool Dispatch/Result 窗口，Recovery 也知道下一次模型请求应使用什么策略。
+
+```text
+初始请求：
+visible=[get_order_status]
+tool_choice=required
+expected={order_id: 1001}
+
+工具完成后：
+visible=[get_order_status]
+tool_choice=auto
+expected={}
+```
+
+### 36.4 Approval 后只允许最终文本
+
+Approval Write 成功后的说明请求固定使用：
+
+```text
+tools=[]
+tool_choice=none
+```
+
+如果模型仍返回 Tool Call 或没有正常 `stop`：
+
+```text
+model_request_failed
+approval_resume_failed
+operation_finished(failed)
+```
+
+不会执行新 Tool Call，也不会写入带未闭合 Tool Call 的 Completed Operation。
+
+### 36.5 完成前预验证
+
+`DurableOperationRecorder.finish_operation()`、Host 和 Recovery 在写 `operation_finished` 前都会：
+
+```text
+重放当前 Operation
+→ 纯函数应用候选 Finished Event
+→ Transcript Closure/Approval/Write Invariant
+→ expected_last_sequence CAS 追加
+```
+
+---
+
+## 37. SQLite 单机事务 Store
+
+### 37.1 默认后端
+
+`DurableAgentHost.create()` 默认：
+
+```python
+store_backend="sqlite"
+```
+
+状态文件：
+
+```text
+<state_dir>/agent-state.sqlite3
+```
+
+兼容旧 JSONL：
+
+```python
+store_backend="jsonl"
+```
+
+### 37.2 Store 类型
+
+```python
+SQLiteOperationEventStore
+SQLiteRuntimeEventStore
+```
+
+两者共用一个 SQLite 文件。Operation Store 使用：
+
+```text
+WAL
+synchronous=FULL
+busy_timeout
+BEGIN IMMEDIATE
+Event Batch Transaction
+Operation expected_last_sequence CAS
+```
+
+### 37.3 唯一约束
+
+SQLite Schema 强制：
+
+```text
+Approval Request approval_id 唯一
+Write Prepared write_id 唯一
+Write idempotency_key_hash 唯一
+Event sequence 单调唯一
+Claim (claim_type, resource_id) 唯一
+```
+
+### 37.4 原子状态转换
+
+Approval Request 与 `approval_resume_registered` 也在同一批事务中提交，避免只留下不可恢复的 Waiting Approval。
+
+Approval 的 Grant/Reject/Consume 和 Write 的 Prepare/Claim/Finalize 都采用：
+
+```text
+读取当前 Operation Version
+→ 纯函数验证转换
+→ BEGIN IMMEDIATE
+→ 检查 expected_last_sequence
+→ 批量追加 Event
+→ COMMIT
+```
+
+冲突方必须重新读取状态，不能使用旧的 Waiting/Approved 快照继续执行。
+
+### 37.5 Write Claim 边界
+
+对于带 Approval 和 Tool Call 的 Write，下列事件在同一事务提交：
+
+```text
+approval_consumed
+write_approved
+tool_dispatch_started
+write_submitting
+```
+
+事务提交后只有获胜 Worker 调用外部 Handler。外部调用不放进长 SQLite 事务；它继续依赖 Idempotency Key 和 Outcome Reconciliation。
+
+### 37.6 跨进程 Lease
+
+SQLite `operation_claims` 防止同机多个进程同时执行：
+
+```text
+approval_resume
+operation_recovery
+```
+
+进程崩溃后 Lease 到期可由新 Worker 接管。
+
+### 37.7 测试
+
+新增 `tests/test_sqlite_transactional_store.py`，覆盖：
+
+1. Operation/Runtime 重启持久化；
+2. 两个 Store 并发 Grant 只有一个获胜；
+3. 两个 Store 并发 Execute 外部 Handler 只执行一次；
+4. 跨 Operation Idempotency Key 唯一去重；
+5. Approval Consume/Write Claim/Tool Dispatch 批量事务；
+6. 两个 Coordinator 的 Approval Resume 互斥；
+7. 跨 Store Lease Claim 互斥。
+
+全部测试：
+
+```text
+Ran 178 tests
+OK
+```

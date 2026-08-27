@@ -29,8 +29,11 @@ Thumbs.db
 .env.*
 !.env.example
 
-# Retry Journal、Checkpoint 等本地运行状态禁止提交。
+# Retry Journal、Checkpoint、SQLite/WAL 等本地运行状态禁止提交。
 /state/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # 本地订单业务演示不提交到代码仓库。
 /test_demo/

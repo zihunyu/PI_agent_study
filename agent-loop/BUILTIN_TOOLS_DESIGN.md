@@ -1,6 +1,6 @@
 # Python Agent 内置工具系统架构设计
 
-> 状态：总体架构设计已完成；当前已完成 P0 清理、P1 DurableAgentHost/Recovery Runtime/Approval Resume、三种调度策略、分层重试、Durable Session、幂等写操作和状态机。
+> 状态：总体架构设计已完成；当前已完成 P0 Task 清理与 Tool Call Closure、P1 DurableAgentHost/Approval Resume、三种调度策略、分层重试、Durable Session、幂等写操作和状态机。
 > 目标项目：`agent-loop/`  
 > 目标：为现有 Python Agent Loop 增加安全、可测试、可扩展的内置工具系统。  
 > 当前教学工具：`add`、`multiply`、`divide`。

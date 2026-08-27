@@ -7,6 +7,11 @@ from collections.abc import Awaitable
 from typing import Any, cast
 
 from ..cancellation import CancellationToken
+from ..model_policy import (
+    ModelRequestPolicy,
+    ModelRequestPolicyError,
+    validate_model_response_policy,
+)
 from ..types import AgentTool, Model, StreamFn
 
 
@@ -26,14 +31,33 @@ class RecoverableModelRuntime:
         self.stream_fn = stream_fn
         self.system_prompt = system_prompt
         self.tools = list(tools)
+        self._tools_by_name = {tool.name: tool for tool in self.tools}
         self.retry_event_sink = retry_event_sink
 
     async def request(
         self,
         messages: list[dict[str, Any]],
         *,
+        policy: ModelRequestPolicy,
         cancellation: CancellationToken | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(policy, ModelRequestPolicy):
+            raise ModelRequestPolicyError(
+                "恢复模型请求必须提供持久化 ModelRequestPolicy"
+            )
+        missing = [
+            name
+            for name in policy.visible_tool_names
+            if name not in self._tools_by_name
+        ]
+        if missing:
+            raise ModelRequestPolicyError(
+                "当前 Runtime 缺少策略要求的工具：" + "、".join(missing)
+            )
+        selected_tools = [
+            self._tools_by_name[name]
+            for name in policy.visible_tool_names
+        ]
         token = cancellation or CancellationToken()
         context = {
             "systemPrompt": self.system_prompt,
@@ -44,12 +68,17 @@ class RecoverableModelRuntime:
                     "description": tool.description,
                     "parameters": tool.parameters,
                 }
-                for tool in self.tools
+                for tool in selected_tools
             ],
         }
         options = {
             "cancellation_token": token,
-            "tool_choice": "auto",
+            "tool_choice": policy.tool_choice,
+            "required_capabilities": list(policy.required_capabilities),
+            "allowed_tool_names": list(policy.allowed_tool_names),
+            "expected_tool_arguments": dict(
+                policy.expected_tool_arguments
+            ),
             "retry_event_sink": self.retry_event_sink,
         }
         value = self.stream_fn(self.model, context, options)
@@ -67,4 +96,5 @@ class RecoverableModelRuntime:
             raise RuntimeError(
                 str(message.get("errorMessage", "恢复模型请求失败"))
             )
+        validate_model_response_policy(message, policy)
         return message
