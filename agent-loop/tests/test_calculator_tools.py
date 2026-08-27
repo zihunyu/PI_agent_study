@@ -17,6 +17,7 @@ from pi_agent_loop import (  # noqa: E402
     assistant_message,
     create_add_tool,
     create_calculator_registry,
+    create_divide_tool,
     create_multiply_tool,
 )
 
@@ -56,6 +57,32 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.details["value"], 20)
         self.assertEqual(len(updates), 1)
 
+    async def test_除法工具返回正确结果(self) -> None:
+        tool = create_divide_tool()
+        updates = []
+        self.assertEqual(tool.timeout_seconds, 3)
+
+        result = await tool.execute(
+            "divide-id",
+            tool.validate_args({"a": 10, "b": 4}),
+            CancellationToken(),
+            updates.append,
+        )
+
+        self.assertEqual(result.content[0]["text"], "2.5")
+        self.assertEqual(result.details["operation"], "divide")
+        self.assertEqual(result.details["value"], 2.5)
+        self.assertEqual(len(updates), 1)
+
+    async def test_除法工具拒绝除数为零(self) -> None:
+        tool = create_divide_tool()
+
+        with self.assertRaisesRegex(ValueError, "除数 b 不能为 0"):
+            tool.validate_args({"a": 10, "b": 0})
+
+        with self.assertRaisesRegex(ValueError, "除数 b 不能为 0"):
+            tool.validate_args({"a": 10, "b": -0.0})
+
     async def test_参数校验拒绝缺少字段和布尔值(self) -> None:
         tool = create_add_tool()
 
@@ -90,6 +117,12 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
                     "name": "multiply",
                     "arguments": {"a": 4, "b": 5},
                 },
+                {
+                    "type": "toolCall",
+                    "id": "divide-call",
+                    "name": "divide",
+                    "arguments": {"a": 10, "b": 4},
+                },
             ],
         )
 
@@ -104,7 +137,10 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
                 content=[
                     {
                         "type": "text",
-                        "text": f"加法={values[0]}，乘法={values[1]}",
+                        "text": (
+                            f"加法={values[0]}，乘法={values[1]}，"
+                            f"除法={values[2]}"
+                        ),
                     }
                 ],
             )
@@ -117,13 +153,13 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
             tools=registry.all(),
         )
 
-        await agent.prompt("同时计算 2+3 和 4×5")
+        await agent.prompt("同时计算 2+3、4×5 和 10÷4")
 
-        self.assertEqual(registry.names(), ["add", "multiply"])
+        self.assertEqual(registry.names(), ["add", "multiply", "divide"])
         self.assertEqual(provider.call_count, 2)
         self.assertEqual(
             agent.state.messages[-1]["content"][0]["text"],
-            "加法=5，乘法=20",
+            "加法=5，乘法=20，除法=2.5",
         )
 
 

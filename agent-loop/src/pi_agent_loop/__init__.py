@@ -43,6 +43,7 @@ from .tools import (
     create_add_tool,
     create_calculator_registry,
     create_calculator_tools,
+    create_divide_tool,
     create_multiply_tool,
 )
 from .types import (
@@ -106,6 +107,7 @@ __all__ = [
     "create_add_tool",
     "create_calculator_registry",
     "create_calculator_tools",
+    "create_divide_tool",
     "create_multiply_tool",
     "create_provider",
     "empty_usage",

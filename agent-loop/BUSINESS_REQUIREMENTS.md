@@ -272,6 +272,8 @@ message = "..."
 
 ## 11. 工具实现生成规则
 
+完整工程规范见项目根目录 `TOOLS_IMPLEMENTATION_GUIDE.md`。AI 实现任何 AgentTool 前必须完整阅读该文件。
+
 每个真实工具至少包含：
 
 ```text

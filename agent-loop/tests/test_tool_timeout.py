@@ -16,6 +16,7 @@ from pi_agent_loop import (  # noqa: E402
     Model,
     ScriptedProvider,
     assistant_message,
+    create_divide_tool,
 )
 
 
@@ -173,6 +174,33 @@ class ToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["details"]["code"], "tool_timeout")
         self.assertFalse(results[1]["isError"])
         self.assertEqual(results[1]["content"][0]["text"], "fast-ok")
+
+    async def test_除法工具使用自己的独立_timeout(self) -> None:
+        tool = create_divide_tool(delay_seconds=0.05)
+        # 保留真实工具 execute，只把测试中的限制缩短，避免等待 3 秒。
+        tool.timeout_seconds = 0.01
+        provider = self.provider_for_calls(
+            [
+                {
+                    "type": "toolCall",
+                    "id": "divide-timeout",
+                    "name": "divide",
+                    "arguments": {"a": 10, "b": 2},
+                }
+            ]
+        )
+        agent = Agent(model=self.model, stream_fn=provider.stream, tools=[tool])
+
+        await agent.prompt("测试除法工具超时")
+
+        result = next(
+            message
+            for message in agent.state.messages
+            if message["role"] == "toolResult"
+        )
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["details"]["code"], "tool_timeout")
+        self.assertEqual(result["details"]["timeoutSeconds"], 0.01)
 
     async def test_Agent_默认超时用于没有独立配置的工具(self) -> None:
         async def execute(_id, _args, _token, _on_update):

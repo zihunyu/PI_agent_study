@@ -13,6 +13,8 @@
 
 `BUSINESS_REQUIREMENTS.md` 是业务需求的唯一入口。若其中的信息不足，AI 必须先向用户提问，不得自行编造 API、数据库字段、权限、幂等规则或业务成功结果。
 
+新增、修改或删除任何 `AgentTool` 时，还必须完整阅读 `TOOLS_IMPLEMENTATION_GUIDE.md`，按其中的 Schema、校验、取消、Timeout、结果、注册、测试和 Definition of Done 执行。
+
 ## 配置和秘密
 
 - 真实 `config/*.toml` 不得提交；

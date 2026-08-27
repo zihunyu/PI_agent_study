@@ -3,7 +3,7 @@
 > 状态：总体架构设计已完成；当前已完成工具执行基础、运行预算、简化 business.toml、HybridModelRouter、CapabilityRegistry、Approval Gate 和 RequiredToolCallGuard。
 > 目标项目：`agent-loop/`  
 > 目标：为现有 Python Agent Loop 增加安全、可测试、可扩展的内置工具系统。  
-> 当前教学工具：`add`、`multiply`。  
+> 当前教学工具：`add`、`multiply`、`divide`。
 > 后续文件工具：`read`、`list_dir`、`write`、`edit`、`shell`、`find`、`grep`。
 
 ---

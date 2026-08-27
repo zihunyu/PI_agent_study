@@ -118,6 +118,7 @@ Pi 原项目采用 MIT License。本目录保留了原许可证文件；若继�
 agent-loop/
 ├─ AGENTS.md                         要求 AI 先读业务需求文件
 ├─ BUSINESS_REQUIREMENTS.md          业务功能与工具的唯一需求入口
+├─ TOOLS_IMPLEMENTATION_GUIDE.md     AI 必读的完整工具开发规范
 ├─ README.md                         中文说明
 ├─ LICENSE                           Pi 原项目 MIT 许可证
 ├─ pyproject.toml                    Python 包配置
@@ -134,7 +135,7 @@ agent-loop/
 │  └─ business_routing_usage.py      强制业务工具路由示例
 ├─ tests/
 │  ├─ test_agent_loop.py             Agent Loop 核心语义测试
-│  ├─ test_calculator_tools.py       加法、乘法与注册表测试
+│  ├─ test_calculator_tools.py       加法、乘法、除法与注册表测试
 │  ├─ test_tool_timeout.py           独立超时与取消隔离测试
 │  ├─ test_cancellation.py           父子取消令牌传播测试
 │  ├─ test_config.py                 TOML 配置校验测试
@@ -180,6 +181,7 @@ agent-loop/
       ├─ validators.py               a、b 参数校验
       ├─ add.py                      加法工具
       ├─ multiply.py                 乘法工具
+      ├─ divide.py                   除法工具与除零保护
       └─ registry.py                 工具注册表
 ```
 
@@ -302,13 +304,13 @@ python -m unittest discover -s tests -v
 
 ```text
 ... ok
-Ran 76 tests
+Ran 80 tests
 OK
 ```
 
-表示七十六个自动测试全部通过，并不是 Agent 又执行了七十六个用户任务。
+表示八十个自动测试全部通过，并不是 Agent 又执行了八十个用户任务。
 
-七十六个测试分别检查：
+八十个测试分别检查：
 
 1. 最终回答能否进入 Agent 状态；
 2. 工具结果能否交回模型并触发第二次模型请求；
@@ -385,7 +387,11 @@ OK
 73. Hybrid No-tool Intent 是否不选择业务工具；
 74. Hybrid Intent 已识别但能力缺失是否结构化返回；
 75. AGENTS.md 是否强制 AI 先读取业务需求；
-76. 业务需求 MD 是否包含配置和工具生成所需章节。
+76. 业务需求 MD 是否包含配置和工具生成所需章节；
+77. 工具指南是否包含实现、注册、测试和完成标准；
+78. 除法工具是否返回正确商和结构化 Details；
+79. 除法工具是否拒绝正零和负零；
+80. 除法工具是否使用独立 Timeout。
 
 ### 4.5 可选安装
 
@@ -1111,13 +1117,14 @@ Session/Host
 
 ---
 
-## 20. 加法工具、乘法工具和注册流程教学
+## 20. 加法、乘法、除法工具和注册流程教学
 
-本阶段只实现两个工具：
+当前实现三个计算工具：
 
 ```text
 add          加法工具
 multiply     乘法工具
+divide       除法工具（包含除零保护）
 ```
 
 目标不是建设完整文件工具系统，而是先学懂一条最小工具链：
@@ -1126,7 +1133,7 @@ multiply     乘法工具
 编写工具
   -> 注册工具
   -> 把工具交给 Agent
-  -> 假模型返回 toolCall
+  -> 模型返回 toolCall
   -> Agent Loop 找到同名工具
   -> 执行 Python 函数
   -> ToolResult 写回模型上下文
@@ -1137,9 +1144,10 @@ multiply     乘法工具
 
 ```text
 src/pi_agent_loop/tools/
-├─ validators.py       加法、乘法共用参数校验
+├─ validators.py       二元数字与除法参数校验
 ├─ add.py              加法工具
 ├─ multiply.py         乘法工具
+├─ divide.py           除法工具
 ├─ registry.py         工具注册表
 └─ __init__.py         对外导出
 ```
@@ -1220,9 +1228,36 @@ value = a * b
 20
 ```
 
+### 20.3.1 除法工具
+
+打开：
+
+`src/pi_agent_loop/tools/divide.py`
+
+工厂：
+
+```python
+create_divide_tool()
+```
+
+核心计算：
+
+```python
+value = a / b
+```
+
+除法额外使用 `validate_division_args()` 拒绝：
+
+```text
+b = 0
+b = -0.0
+```
+
+默认独立 Timeout 为 3 秒，成功结果会返回 operation、a、b、value 和 toolCallId。
+
 ### 20.4 参数校验为什么独立
 
-两个工具都需要 `a` 和 `b`，所以共享：
+三个工具都需要 `a` 和 `b`，所以共享：
 
 `src/pi_agent_loop/tools/validators.py`
 
@@ -1233,7 +1268,8 @@ value = a * b
 - 两者必须是 `int` 或 `float`；
 - 拒绝布尔值；
 - 拒绝 NaN；
-- 拒绝正负无穷。
+- 拒绝正负无穷；
+- 除法额外拒绝正零和负零。
 
 工具给模型看的 JSON Schema 和 Python 真正运行的校验是两件事：
 
@@ -1254,6 +1290,7 @@ validate_args    防止错误参数真正进入 Python 计算
 registry = ToolRegistry()
 registry.register(create_add_tool())
 registry.register(create_multiply_tool())
+registry.register(create_divide_tool())
 ```
 
 此时：
@@ -1265,7 +1302,7 @@ registry.names()
 返回：
 
 ```python
-["add", "multiply"]
+["add", "multiply", "divide"]
 ```
 
 ### 20.6 为什么需要 ToolRegistry
@@ -1273,7 +1310,7 @@ registry.names()
 也可以直接写：
 
 ```python
-tools = [create_add_tool(), create_multiply_tool()]
+tools = [create_add_tool(), create_multiply_tool(), create_divide_tool()]
 ```
 
 但 Registry 可以：
@@ -1312,7 +1349,7 @@ agent = Agent(
 
 这一步完成两个连接：
 
-1. Provider 请求时可以看到 `add`、`multiply` 的名称、描述和参数 Schema；
+1. Provider 请求时可以看到 `add`、`multiply`、`divide` 的名称、描述和参数 Schema；
 2. 模型返回 `toolCall(name="add")` 时，Agent Loop 能找到真正的 Python 加法函数。
 
 ### 20.8 完整注册代码
@@ -1323,6 +1360,7 @@ agent = Agent(
 registry = ToolRegistry()
 registry.register(create_add_tool())
 registry.register(create_multiply_tool())
+registry.register(create_divide_tool())
 
 agent = Agent(
     model=model,
@@ -1423,7 +1461,7 @@ name=multiply
 - 工具 parameters；
 - 历史 Tool Result；
 
-自行决定直接回答，还是调用 `add`/`multiply`。
+自行决定直接回答，还是调用 `add`/`multiply`/`divide`。
 
 `ScriptedProvider` 仍保留在单元测试和 `minimal_text.py` 中，以保证离线测试稳定。
 
@@ -1457,27 +1495,28 @@ python examples/basic_usage.py
 python -m unittest discover -s tests -v
 ```
 
-当前共有 76 项离线测试，覆盖 Agent Loop、Provider、简化业务配置、Hybrid Router、AI 需求入口、Capability、Approval 和 Guard。
+当前共有 80 项离线测试，覆盖 Agent Loop、Provider、业务路由、工具开发规范、加法/乘法/除法、Timeout、Approval 和 Guard。
 
 只有看到：
 
 ```text
-Ran 76 tests
+Ran 80 tests
 OK
 ```
 
 才表示本阶段全部通过。
 
-### 20.15 加法 2 秒、乘法 5 秒的独立 Timeout
+### 20.15 加法 2 秒、乘法 5 秒、除法 3 秒的独立 Timeout
 
 当前工具配置：
 
 ```text
 add.timeout_seconds = 2
 multiply.timeout_seconds = 5
+divide.timeout_seconds = 3
 ```
 
-Timeout 是“最多允许执行多久”，不是故意等待多久。正常加法和乘法会立即完成，所以普通示例不会等待 2 秒或 5 秒。
+Timeout 是“最多允许执行多久”，不是故意等待多久。正常计算会立即完成。
 
 #### 在 `basic_usage.py` 哪里设置模拟延时
 
@@ -1490,14 +1529,10 @@ Timeout 是“最多允许执行多久”，不是故意等待多久。正常加
 ```python
 ADD_TOOL_DELAY_SECONDS = 0.0
 MULTIPLY_TOOL_DELAY_SECONDS = 0.0
+DIVIDE_TOOL_DELAY_SECONDS = 0.0
 ```
 
-正常成功：
-
-```python
-ADD_TOOL_DELAY_SECONDS = 0.0
-MULTIPLY_TOOL_DELAY_SECONDS = 0.0
-```
+正常成功时三个值都保持 `0.0`。
 
 只触发加法超时：
 
@@ -1509,18 +1544,24 @@ MULTIPLY_TOOL_DELAY_SECONDS = 0.0
 只触发乘法超时：
 
 ```python
-ADD_TOOL_DELAY_SECONDS = 0.0
 MULTIPLY_TOOL_DELAY_SECONDS = 6.0  # 大于乘法限制 5 秒
 ```
 
-两个工具都触发超时：
+只触发除法超时：
+
+```python
+DIVIDE_TOOL_DELAY_SECONDS = 4.0    # 大于除法限制 3 秒
+```
+
+多个工具同时触发超时：
 
 ```python
 ADD_TOOL_DELAY_SECONDS = 3.0
 MULTIPLY_TOOL_DELAY_SECONDS = 6.0
+DIVIDE_TOOL_DELAY_SECONDS = 4.0
 ```
 
-两个工具是并行执行的，因此同时超时时总等待大约 5 秒，而不是 3+6=9 秒。
+同一批工具会受最大并行数控制，单个工具超时不会取消兄弟工具。
 
 然后运行：
 
@@ -1534,30 +1575,29 @@ python examples\basic_usage.py
 工具 add 执行失败，结果为 工具 add 执行超时（限制 2 秒）
 ```
 
-或者：
-
-```text
-工具 multiply 执行失败，结果为 工具 multiply 执行超时（限制 5 秒）
-```
+还可能看到 multiply（5 秒）或 divide（3 秒）的独立超时错误。
 
 工具自己的 timeout 配置位置：
 
 - `src/pi_agent_loop/tools/add.py`；
-- `src/pi_agent_loop/tools/multiply.py`。
+- `src/pi_agent_loop/tools/multiply.py`；
+- `src/pi_agent_loop/tools/divide.py`。
 
 每个工具执行时会从 Agent 总 CancellationToken 创建自己的子令牌：
 
 ```text
 Agent 总令牌
   ├─ add 子令牌，2 秒
-  └─ multiply 子令牌，5 秒
+  ├─ multiply 子令牌，5 秒
+  └─ divide 子令牌，3 秒
 ```
 
 行为：
 
-- 用户取消 Agent：两个工具全部取消；
+- 用户取消 Agent：全部工具取消；
 - add 超过 2 秒：只取消 add；
 - multiply 超过 5 秒：只取消 multiply；
+- divide 超过 3 秒：只取消 divide；
 - 一个工具超时不会误伤另一个工具；
 - 超时后的迟到 update 会被忽略；
 - timeout timer 和子令牌在工具结束后清理。
@@ -1602,6 +1642,7 @@ AgentTool.timeout_seconds
 - [x] 创建 `tools` 目录；
 - [x] 加法工具独立文件；
 - [x] 乘法工具独立文件；
+- [x] 除法工具独立文件和除零保护；
 - [x] 公共参数校验；
 - [x] ToolRegistry；
 - [x] 防止工具重名；
@@ -1612,9 +1653,12 @@ AgentTool.timeout_seconds
 - [x] 每个工具独立 timeout；
 - [x] 加法 timeout 为 2 秒；
 - [x] 乘法 timeout 为 5 秒；
+- [x] 除法 timeout 为 3 秒；
 - [x] 父子 CancellationToken；
 - [x] 并行 timeout 隔离；
-- [x] timeout 和取消测试。
+- [x] timeout 和取消测试；
+- [x] `TOOLS_IMPLEMENTATION_GUIDE.md` 完整工具规范；
+- [x] AGENTS.md 强制 AI 开发工具前读取指南。
 
 最大 Turn/Tool Call 预算和最大并行工具数已经完成，详细配置见下一节。
 
@@ -1796,12 +1840,12 @@ agent.prompt("任务二")  再获得一份新预算
 - `tests/test_routed_agent.py`：6 项强制工具与 Capability 测试；
 - `tests/test_simple_business_config.py`：3 项简化配置测试；
 - `tests/test_hybrid_router.py`：8 项混合路由测试；
-- `tests/test_business_requirements.py`：2 项 AI 需求入口契约测试。
+- `tests/test_business_requirements.py`：3 项 AI 需求与工具指南契约测试。
 
 全部测试：
 
 ```text
-Ran 76 tests
+Ran 80 tests
 OK
 ```
 
@@ -1900,7 +1944,7 @@ python examples/real_model_usage.py
 
 程序将读取本地配置并打印 Provider 和模型 ID，但绝不会打印 API Key。
 
-示例同时注册 `add` 和 `multiply`，因此可以测试：
+示例同时注册 `add`、`multiply` 和 `divide`，因此可以测试：
 
 ```text
 用户问题
@@ -2338,10 +2382,10 @@ tests/test_simple_business_config.py
 tests/test_hybrid_router.py
 ```
 
-覆盖简化配置矛盾、自由表达分类、低置信度、缺字段、Denied、Approval 和完整业务工具闭环。
+覆盖简化配置矛盾、自由表达分类、低置信度、缺字段、Denied、Approval、工具指南契约和完整业务工具闭环。
 
 ```text
-Ran 76 tests
+Ran 80 tests
 OK
 ```
 
@@ -2357,3 +2401,44 @@ BUSINESS_REQUIREMENTS.md
 ```
 
 旧正则配置和 RuleBasedRouter 已删除，避免两套路由逻辑并存造成维护歧义。
+
+---
+
+## 25. AI 工具开发指南
+
+新增：
+
+```text
+TOOLS_IMPLEMENTATION_GUIDE.md
+```
+
+后续 AI 新增或修改任何 AgentTool 前，必须同时阅读：
+
+```text
+AGENTS.md
+BUSINESS_REQUIREMENTS.md
+TOOLS_IMPLEMENTATION_GUIDE.md
+```
+
+指南完整定义：
+
+- Tool、Capability、Intent 和 Tool Call 的区别；
+- 工具文件位置和命名；
+- JSON Schema；
+- Python 运行时校验；
+- Execute 标准签名；
+- CancellationToken；
+- Update；
+- 独立 Timeout；
+- 结构化 Result；
+- 错误脱敏；
+- 只读和写工具差异；
+- ToolRegistry 注册；
+- CapabilityRegistry 注册；
+- 包公开导出；
+- 单元测试和 Agent 集成测试；
+- 完整工具模板；
+- AI 开发步骤；
+- Definition of Done。
+
+`AGENTS.md` 已加入强制规则，契约测试会防止该指南或引用被误删。

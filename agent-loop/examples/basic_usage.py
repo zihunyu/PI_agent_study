@@ -26,6 +26,7 @@ from pi_agent_loop import (  # noqa: E402
     ProviderConfigError,
     ToolRegistry,
     create_add_tool,
+    create_divide_tool,
     create_multiply_tool,
     create_provider,
     load_agent_limits,
@@ -35,11 +36,13 @@ from pi_agent_loop import (  # noqa: E402
 # ============================================================================
 # Tool Timeout 教学配置区
 # ============================================================================
-# 正常成功：两个值都保持 0。
+# 正常成功：三个值都保持 0。
 # 触发加法超时：改成 3，因为 add 的独立 timeout 是 2 秒。
 # 触发乘法超时：改成 6，因为 multiply 的独立 timeout 是 5 秒。
+# 触发除法超时：改成 4，因为 divide 的独立 timeout 是 3 秒。
 ADD_TOOL_DELAY_SECONDS = 0.0
 MULTIPLY_TOOL_DELAY_SECONDS = 0.0
+DIVIDE_TOOL_DELAY_SECONDS = 0.0
 
 
 def parse_user_message() -> str:
@@ -134,6 +137,9 @@ async def main() -> None:
     registry.register(create_add_tool(delay_seconds=ADD_TOOL_DELAY_SECONDS))
     registry.register(
         create_multiply_tool(delay_seconds=MULTIPLY_TOOL_DELAY_SECONDS)
+    )
+    registry.register(
+        create_divide_tool(delay_seconds=DIVIDE_TOOL_DELAY_SECONDS)
     )
 
     agent = Agent(
@@ -237,7 +243,10 @@ async def main() -> None:
     print(f"Provider：{model.provider}")
     print(f"模型：{model.id}")
     print(f"用户消息：{user_message}")
-    print("已注册工具：add（独立超时 2 秒）、multiply（独立超时 5 秒）。")
+    print(
+        "已注册工具：add（独立超时 2 秒）、"
+        "multiply（独立超时 5 秒）、divide（独立超时 3 秒）。"
+    )
     print(
         "运行预算："
         f"max_turns={limits.max_turns}，"

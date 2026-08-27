@@ -38,3 +38,12 @@ def validate_two_numbers(arguments: Any) -> dict[str, Number]:
         raise ValueError("a 和 b 必须是有限数字，不能是布尔值、NaN 或无穷")
 
     return {"a": a, "b": b}
+
+
+def validate_division_args(arguments: Any) -> dict[str, Number]:
+    """在二元数字校验基础上拒绝除数为正零或负零。"""
+
+    values = validate_two_numbers(arguments)
+    if values["b"] == 0:
+        raise ValueError("除数 b 不能为 0")
+    return values

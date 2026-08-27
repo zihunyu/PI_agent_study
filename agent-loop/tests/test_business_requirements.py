@@ -13,6 +13,7 @@ class BusinessRequirementsDocumentTests(unittest.TestCase):
     def test_agents_要求业务开发前读取需求文件(self) -> None:
         instructions = (self.root / "AGENTS.md").read_text(encoding="utf-8")
         self.assertIn("BUSINESS_REQUIREMENTS.md", instructions)
+        self.assertIn("TOOLS_IMPLEMENTATION_GUIDE.md", instructions)
         self.assertIn("必须先完整阅读", instructions)
 
     def test_需求文件包含生成可用配置和工具所需章节(self) -> None:
@@ -32,6 +33,25 @@ class BusinessRequirementsDocumentTests(unittest.TestCase):
         ):
             with self.subTest(heading=heading):
                 self.assertIn(heading, requirements)
+
+    def test_工具指南包含实现注册测试和完成标准(self) -> None:
+        guide = (self.root / "TOOLS_IMPLEMENTATION_GUIDE.md").read_text(
+            encoding="utf-8"
+        )
+        for heading in (
+            "什么叫一个“完整工具”",
+            "JSON Schema 要求",
+            "运行时参数校验",
+            "CancellationToken",
+            "独立 Timeout",
+            "注册方式一：ToolRegistry",
+            "注册方式三：CapabilityRegistry",
+            "公开导出",
+            "Agent 集成测试",
+            "Definition of Done",
+        ):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, guide)
 
 
 if __name__ == "__main__":
