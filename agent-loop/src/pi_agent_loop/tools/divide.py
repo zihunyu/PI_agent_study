@@ -84,4 +84,5 @@ def create_divide_tool(*, delay_seconds: float = 0.0) -> AgentTool:
         execute=execute,
         execution_mode="parallel",
         timeout_seconds=3,
+        replay_policy="safe",
     )

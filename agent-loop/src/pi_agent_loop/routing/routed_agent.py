@@ -27,10 +27,19 @@ class RoutedAgent:
         agent: Agent,
         router: RouterLike,
         capabilities: CapabilityRegistry,
+        *,
+        runtime_tracker: Any | None = None,
+        operation_recorder: Any | None = None,
     ) -> None:
         self.agent = agent
         self.router = router
         self.capabilities = capabilities
+        self.runtime_tracker = runtime_tracker
+        self.operation_recorder = operation_recorder
+        if runtime_tracker is not None:
+            self.agent.subscribe(runtime_tracker.listener)
+        if operation_recorder is not None:
+            self.agent.subscribe(operation_recorder.listener)
         self.guard = RequiredToolCallGuard(capabilities)
         self.agent.stream_fn = guard_stream_fn(self.agent.stream_fn, self.guard)
         self.last_decision: RequestDecision | None = None
@@ -44,18 +53,59 @@ class RoutedAgent:
         return self.agent.subscribe(listener)
 
     async def prompt(self, user_text: str) -> RoutedPromptResult:
-        route_value = self.router.route(user_text)
-        decision = (
-            await cast(Awaitable[Any], route_value)
-            if inspect.isawaitable(route_value)
-            else route_value
-        )
+        if self.runtime_tracker is not None:
+            await self.runtime_tracker.start_run()
+            await self.runtime_tracker.record_external("routing_started")
+        if self.operation_recorder is not None:
+            await self.operation_recorder.start_operation()
+            await self.operation_recorder.record_external("routing_started")
+        try:
+            route_value = self.router.route(user_text)
+            decision = (
+                await cast(Awaitable[Any], route_value)
+                if inspect.isawaitable(route_value)
+                else route_value
+            )
+        except BaseException:
+            if self.runtime_tracker is not None:
+                await self.runtime_tracker.record_external(
+                    "routing_finished",
+                    {"status": "routing_error"},
+                )
+                await self.runtime_tracker.record_external(
+                    "run_finished",
+                    {"outcome": "failed"},
+                )
+            if self.operation_recorder is not None:
+                await self.operation_recorder.record_external(
+                    "routing_finished",
+                    {"status": "routing_error"},
+                )
+                await self.operation_recorder.finish_operation("failed")
+            raise
         self.last_decision = decision
+        if self.runtime_tracker is not None:
+            await self.runtime_tracker.record_external(
+                "routing_finished",
+                {"status": decision.status},
+            )
+        if self.operation_recorder is not None:
+            await self.operation_recorder.record_external(
+                "routing_finished",
+                {"status": decision.status},
+            )
 
         if decision.status not in {
             "in_scope_no_tool",
             "in_scope_tool_ready",
         }:
+            if self.runtime_tracker is not None:
+                await self.runtime_tracker.record_external(
+                    "run_finished",
+                    {"outcome": "completed"},
+                )
+            if self.operation_recorder is not None:
+                await self.operation_recorder.finish_operation("completed")
             return RoutedPromptResult(
                 decision=decision,
                 model_called=False,

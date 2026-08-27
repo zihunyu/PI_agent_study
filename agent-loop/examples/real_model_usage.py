@@ -20,13 +20,19 @@ sys.path.insert(0, str(ROOT / "src"))
 from pi_agent_loop import (  # noqa: E402
     Agent,
     CompactionRetryPolicy,
+    DurableOperationRecorder,
+    JsonlOperationEventStore,
     JsonlRetryEventStore,
+    JsonlRuntimeEventStore,
     ProviderConfigError,
+    RuntimeRecoveryManager,
+    RuntimeStateTracker,
     compact_on_context_overflow,
     create_calculator_tools,
     create_provider,
     load_agent_limits,
     load_provider_settings,
+    project_runtime_state,
 )
 
 
@@ -44,6 +50,15 @@ async def main() -> None:
     model, provider = create_provider(provider_settings)
 
     retry_store = JsonlRetryEventStore(ROOT / "state" / "retry-events.jsonl")
+    runtime_store = JsonlRuntimeEventStore(ROOT / "state" / "runtime-events.jsonl")
+    await RuntimeRecoveryManager(runtime_store).recover()
+    runtime_tracker = await RuntimeStateTracker.create(runtime_store)
+    operation_recorder = DurableOperationRecorder(
+        JsonlOperationEventStore(ROOT / "state" / "operation-events.jsonl"),
+        session_id="real-model-usage",
+        tools=create_calculator_tools(),
+        configuration={"provider": model.provider, "model": model.id},
+    )
     compacting_stream = compact_on_context_overflow(
         provider.stream,
         CompactionRetryPolicy(max_retries=1, keep_recent_messages=20),
@@ -52,10 +67,10 @@ async def main() -> None:
         model=model,
         stream_fn=compacting_stream,
         system_prompt=(
-            "你是一个中文助手。需要计算加法或乘法时必须调用已有工具，"
+            "你是一个中文助手。需要加法、乘法或除法时必须调用已有工具，"
             "读取工具结果后再回答。"
         ),
-        tools=create_calculator_tools(),
+        tools=list(operation_recorder.tools.values()),
         tool_execution="parallel",
         max_tool_calls=limits.max_tool_calls,
         max_parallel_tools=limits.max_parallel_tools,
@@ -70,6 +85,8 @@ async def main() -> None:
         if assistant_event.get("type") == "text_delta":
             print(assistant_event.get("delta", ""), end="", flush=True)
 
+    agent.subscribe(runtime_tracker.listener)
+    agent.subscribe(operation_recorder.listener)
     agent.subscribe(print_stream)
 
     print(f"Provider：{model.provider}")
@@ -85,6 +102,10 @@ async def main() -> None:
 
     if agent.state.error_message:
         print(f"错误：{agent.state.error_message}")
+    runtime_view = project_runtime_state(runtime_tracker.state)
+    print(f"运行状态：{runtime_view['phaseLabel']}")
+    print(f"Runtime Run ID：{runtime_view['runId']}")
+    print(f"Durable Operation ID：{operation_recorder.last_operation_id}")
 
 
 if __name__ == "__main__":

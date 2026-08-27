@@ -24,8 +24,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from pi_agent_loop import (  # noqa: E402
     Agent,
     CompactionRetryPolicy,
+    DurableOperationRecorder,
+    JsonlOperationEventStore,
     JsonlRetryEventStore,
+    JsonlRuntimeEventStore,
     ProviderConfigError,
+    RuntimeRecoveryManager,
+    RuntimeStateTracker,
     ToolRegistry,
     create_add_tool,
     create_divide_tool,
@@ -34,6 +39,7 @@ from pi_agent_loop import (  # noqa: E402
     create_provider,
     load_agent_limits,
     load_provider_settings,
+    project_runtime_state,
 )
 
 # ============================================================================
@@ -146,6 +152,16 @@ async def main() -> None:
     )
 
     retry_store = JsonlRetryEventStore(ROOT / "state" / "retry-events.jsonl")
+    runtime_store = JsonlRuntimeEventStore(ROOT / "state" / "runtime-events.jsonl")
+    operation_store = JsonlOperationEventStore(ROOT / "state" / "operation-events.jsonl")
+    operation_recorder = DurableOperationRecorder(
+        operation_store,
+        session_id="basic-usage",
+        tools=registry.all(),
+        configuration={"provider": model.provider, "model": model.id},
+    )
+    await RuntimeRecoveryManager(runtime_store).recover()
+    runtime_tracker = await RuntimeStateTracker.create(runtime_store)
     compacting_stream = compact_on_context_overflow(
         provider.stream,
         CompactionRetryPolicy(max_retries=1, keep_recent_messages=20),
@@ -225,6 +241,10 @@ async def main() -> None:
             explanation = (
                 f"开始执行工具 {event['toolName']}，参数为 {event['args']}。"
             )
+        elif event_type == "tool_execution_dispatch_start":
+            explanation = (
+                f"工具 {event['toolName']} 第 {event['attempt']} 次实际进入执行函数。"
+            )
         elif event_type == "tool_execution_update":
             explanation = (
                 f"工具 {event['toolName']} 报告中间进度："
@@ -301,6 +321,9 @@ async def main() -> None:
         print("安全警告：当前使用远程明文 HTTP，Bearer 和消息没有 TLS 保护。")
     print("=" * 68)
 
+    # 状态事实先写入 Runtime Event Store，再交给终端故事线。
+    agent.subscribe(runtime_tracker.listener)
+    agent.subscribe(operation_recorder.listener)
     agent.subscribe(print_event)
     await agent.prompt(user_message)
 
@@ -319,6 +342,10 @@ async def main() -> None:
             print(explanation)
     else:
         print("  本次没有形成 assistant 消息。")
+    runtime_view = project_runtime_state(runtime_tracker.state)
+    print("运行状态：", runtime_view["phaseLabel"])
+    print("Runtime Run ID：", runtime_view["runId"])
+    print("Durable Operation ID：", operation_recorder.last_operation_id)
     print("=" * 68)
 
 

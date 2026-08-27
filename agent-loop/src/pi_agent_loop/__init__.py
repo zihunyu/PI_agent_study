@@ -1,8 +1,16 @@
 """Pi Agent Loop 的纯 Python 教学改写。"""
 
 from .agent import Agent
+from .approval import ApprovalError, ApprovalRecord, ApprovalService
 from .cancellation import CancellationToken, OperationCancelledError
 from .config import AgentLimits, load_agent_limits
+from .domains import (
+    DomainEvent,
+    DomainStateMachine,
+    DomainTransition,
+    DomainTransitionError,
+    EntityState,
+)
 from .event_stream import AgentEventStream, AssistantMessageEventStream, EventStream
 from .loop import (
     agent_loop,
@@ -66,6 +74,37 @@ from .routing import (
     guard_stream_fn,
     load_simple_business_config,
 )
+from .runtime import (
+    RunState,
+    RuntimeEvent,
+    RuntimeInvariantError,
+    RuntimeStateTracker,
+    ToolCallState,
+    project_runtime_state,
+    reduce_runtime_state,
+)
+from .security import (
+    IdentityClaim,
+    IdentityVerificationError,
+    StaticIdentityVerifier,
+    VerifiedIdentity,
+)
+from .session import (
+    DurableOperationRecorder,
+    DurableSessionRecovery,
+    InMemoryOperationEventStore,
+    InMemoryRuntimeEventStore,
+    JsonlOperationEventStore,
+    JsonlRuntimeEventStore,
+    OperationRecoveryPlan,
+    OperationState,
+    RecoveryAction,
+    RecoveryCallbacks,
+    RecoveryExecutionResult,
+    RuntimeRecoveryManager,
+    replay_operation,
+    replay_runtime_events,
+)
 from .testing import ScriptedProvider
 from .tools import (
     ToolRegistry,
@@ -89,6 +128,7 @@ from .types import (
     Model,
     TurnCompletedContext,
 )
+from .writes import WriteOperation, WriteOperationError, WriteOperationService
 
 __all__ = [
     "Agent",
@@ -100,6 +140,9 @@ __all__ = [
     "AgentState",
     "AgentTool",
     "AgentToolResult",
+    "ApprovalError",
+    "ApprovalRecord",
+    "ApprovalService",
     "AfterToolCallContext",
     "AfterToolCallResult",
     "AssistantMessageEventStream",
@@ -113,24 +156,47 @@ __all__ = [
     "CompactionRetryPolicy",
     "ContextOverflowCompactingStreamFn",
     "CapabilityRegistry",
+    "DomainEvent",
+    "DomainStateMachine",
+    "DomainTransition",
+    "DomainTransitionError",
+    "DurableOperationRecorder",
+    "DurableSessionRecovery",
+    "EntityState",
     "EventStream",
     "HybridModelRouter",
+    "IdentityClaim",
+    "IdentityVerificationError",
+    "InMemoryOperationEventStore",
+    "InMemoryRuntimeEventStore",
+    "JsonlOperationEventStore",
     "JsonlRetryEventStore",
+    "JsonlRuntimeEventStore",
     "Model",
     "ModelRetryPolicy",
     "OperationCancelledError",
     "OpenAICompatibleProvider",
     "OutcomeReconciliationRegistry",
+    "OperationRecoveryPlan",
+    "OperationState",
     "OutcomeUnknownToolError",
     "ProviderConfigError",
     "ProviderError",
     "ProviderProfile",
     "ProviderSettings",
+    "RecoveryAction",
+    "RecoveryCallbacks",
+    "RecoveryExecutionResult",
     "RequestDecision",
     "RetryableTaskError",
     "RetryableToolError",
     "RetryingStreamFn",
     "RequiredToolCallGuard",
+    "RunState",
+    "RuntimeEvent",
+    "RuntimeInvariantError",
+    "RuntimeRecoveryManager",
+    "RuntimeStateTracker",
     "RoutedAgent",
     "RetryChain",
     "RetryRecoveryManager",
@@ -141,13 +207,19 @@ __all__ = [
     "SimpleDeniedRule",
     "SimpleIntent",
     "SimpleProduct",
+    "StaticIdentityVerifier",
     "TaskRetryExecutor",
     "TaskRetryPolicy",
+    "ToolCallState",
     "ToolCapability",
     "ToolChoicePolicy",
     "ToolRetryPolicy",
     "ToolRegistry",
     "TurnCompletedContext",
+    "VerifiedIdentity",
+    "WriteOperation",
+    "WriteOperationError",
+    "WriteOperationService",
     "agent_loop",
     "agent_loop_continue",
     "assistant_message",
@@ -164,6 +236,10 @@ __all__ = [
     "load_provider_settings",
     "load_simple_business_config",
     "now_ms",
+    "project_runtime_state",
+    "reduce_runtime_state",
+    "replay_operation",
+    "replay_runtime_events",
     "run_agent_loop",
     "retry_model_stream",
     "run_agent_loop_continue",

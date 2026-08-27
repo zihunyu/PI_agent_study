@@ -19,6 +19,7 @@
 CancellationToken
 进度 update
 独立 Timeout
+崩溃恢复 replay_policy
 结构化 Tool Result
 错误和敏感信息处理
 注册与公开导出
@@ -397,6 +398,19 @@ raise RetryableToolError(
 
 写工具默认不配置自动 Retry。只有服务端具备 Idempotency Key 和结果核对机制时，才能单独设计。
 
+### 12.2 崩溃恢复 Replay Policy
+
+每个工具必须明确：
+
+```python
+replay_policy="safe"   # 只读或严格幂等，可在 Dispatch 后安全重放
+replay_policy="never"  # 写操作或结果不确定，必须先 Reconcile
+```
+
+默认是 `never`。只有经过幂等性评估的工具才能设置 `safe`。
+
+`DurableOperationRecorder` 会在工具实际进入函数前记录 `tool_dispatch_started`；恢复时根据 `replay_policy` 选择重放或状态核对。
+
 ---
 
 ## 13. 只读工具与写工具
@@ -695,6 +709,7 @@ def create_example_tool() -> AgentTool:
         execute=execute,
         execution_mode="parallel",
         timeout_seconds=5,
+        replay_policy="safe",  # 只有只读/幂等工具可以使用 safe
     )
 ```
 
@@ -739,6 +754,8 @@ AI 每次新增工具必须按顺序执行：
 - [ ] 进度 Update；
 - [ ] 独立 Timeout；
 - [ ] 已评估幂等性和 Retry Policy；
+- [ ] 已声明 replay_policy；
+- [ ] 写工具已设计 Approval/Idempotency/outcome_unknown；
 - [ ] Retryable/Permanent 错误已区分；
 - [ ] 成功 Details 结构化；
 - [ ] 错误脱敏；

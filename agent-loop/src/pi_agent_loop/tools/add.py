@@ -97,4 +97,5 @@ def create_add_tool(*, delay_seconds: float = 0.0) -> AgentTool:
         execution_mode="parallel",
         # 加法工具最多执行 2 秒；超时只取消当前加法，不影响并行工具。
         timeout_seconds=2,
+        replay_policy="safe",
     )

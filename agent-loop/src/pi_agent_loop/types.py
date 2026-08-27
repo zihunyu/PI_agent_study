@@ -18,6 +18,7 @@ if False:  # 仅供静态类型工具理解，运行时不会导入，避免循�
     from .event_stream import AssistantMessageEventStream
 
 ToolExecutionMode: TypeAlias = Literal["sequential", "parallel"]
+ToolReplayPolicy: TypeAlias = Literal["never", "safe"]
 QueueMode: TypeAlias = Literal["all", "one-at-a-time"]
 ThinkingLevel: TypeAlias = Literal[
     "off", "minimal", "low", "medium", "high", "xhigh", "max"
@@ -79,10 +80,14 @@ class AgentTool:
     timeout_seconds: float | None = None
     # 只有显式幂等并声明可重试错误码的工具才能自动重试。
     retry_policy: ToolRetryPolicy | None = None
+    # 崩溃发生在 Dispatch 后时，safe 才允许 Recovery 重放。
+    replay_policy: ToolReplayPolicy = "never"
 
     def __post_init__(self) -> None:
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("工具 timeout_seconds 必须大于 0")
+        if self.replay_policy not in {"never", "safe"}:
+            raise ValueError("工具 replay_policy 必须是 never 或 safe")
 
 
 @dataclass(slots=True)

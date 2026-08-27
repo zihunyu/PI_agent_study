@@ -119,6 +119,7 @@ agent-loop/
 ├─ AGENTS.md                         要求 AI 先读业务需求文件
 ├─ BUSINESS_REQUIREMENTS.md          业务功能与工具的唯一需求入口
 ├─ TOOLS_IMPLEMENTATION_GUIDE.md     AI 必读的完整工具开发规范
+├─ STATE_MACHINE_IMPLEMENTATION_GUIDE.md  AI 必读的业务状态机规范
 ├─ README.md                         中文说明
 ├─ LICENSE                           Pi 原项目 MIT 许可证
 ├─ pyproject.toml                    Python 包配置
@@ -132,6 +133,8 @@ agent-loop/
 │  ├─ basic_usage.py                 任意输入、真实模型和编号事件示例
 │  ├─ real_model_usage.py            真实 OpenAI-compatible 模型示例
 │  ├─ retry_usage.py                 全部 Retry 能力离线演示
+│  ├─ state_machine_usage.py         Runtime/业务状态机离线演示
+│  ├─ durable_session_usage.py       Approval/写操作/恢复离线演示
 │  ├─ mock_order_tools.py            模拟订单业务工具
 │  └─ business_routing_usage.py      强制业务工具路由示例
 ├─ tests/
@@ -145,6 +148,8 @@ agent-loop/
 │  ├─ test_provider_settings.py      Provider 配置测试
 │  ├─ test_retry.py                  模型和单工具重试测试
 │  ├─ test_retry_advanced.py         持久化/Circuit/Task/Compaction 测试
+│  ├─ test_runtime_state_machine.py  Runtime/Domain 状态机测试
+│  ├─ test_durable_session.py        Context/Approval/写操作/恢复测试
 │  ├─ test_provider_serialize.py     OpenAI 请求序列化测试
 │  ├─ test_provider_sse.py           SSE 分片测试
 │  ├─ test_openai_compatible_provider.py  HTTP 与 Agent 集成测试
@@ -175,6 +180,31 @@ agent-loop/
    │  ├─ compaction.py               Context Overflow 压缩重试
    │  ├─ outcome.py                  outcome_unknown 状态核对
    │  └─ errors.py                   Retryable/OutcomeUnknown Error
+   ├─ runtime/
+   │  ├─ states.py                   Run/Tool 状态
+   │  ├─ events.py                   Runtime Event
+   │  ├─ reducer.py                  Event → State
+   │  ├─ invariants.py               非法转换检查
+   │  ├─ projection.py               UI 状态视图
+   │  └─ tracker.py                  Agent Event 适配与持久化
+   ├─ session/
+   │  ├─ store.py                    Runtime Store 接口
+   │  ├─ jsonl.py                    Runtime Event JSONL
+   │  ├─ replay.py                   Runtime 状态重放
+   │  ├─ recovery.py                 崩溃恢复为 Suspended
+   │  ├─ operation_events.py         完整 Operation Event
+   │  ├─ operation_store.py          内存/JSONL Operation Store
+   │  ├─ operation_state.py          Context/Model/Tool Reducer
+   │  ├─ recorder.py                 Agent 持久事件 Recorder
+   │  └─ resume.py                   安全恢复计划与执行协调
+   ├─ security/
+   │  └─ identity.py                 可信身份验证边界
+   ├─ approval/
+   │  └─ state_machine.py            持久 Approval 状态机
+   ├─ writes/
+   │  └─ state_machine.py            幂等写操作状态机
+   ├─ domains/
+   │  └─ state_machine.py            项目业务实体状态机
    ├─ providers/                     第三方大模型 Provider
    │  ├─ settings.py                 Provider TOML 配置
    │  ├─ factory.py                  Model/Provider 工厂
@@ -319,13 +349,13 @@ python -m unittest discover -s tests -v
 
 ```text
 ... ok
-Ran 98 tests
+Ran 119 tests
 OK
 ```
 
-表示九十八个自动测试全部通过，并不是 Agent 又执行了九十八个用户任务。
+表示一百一十九个自动测试全部通过，并不是 Agent 又执行了一百一十九个用户任务。
 
-九十八个测试分别检查：
+一百一十九个测试分别检查：
 
 1. 最终回答能否进入 Agent 状态；
 2. 工具结果能否交回模型并触发第二次模型请求；
@@ -424,7 +454,28 @@ OK
 95. Tool Retry 是否受最大总耗时限制；
 96. outcome_unknown 是否不重试并支持状态核对；
 97. TaskRetryExecutor 是否持久化并最终成功；
-98. Context Overflow 是否压缩后重试同一 Turn。
+98. Context Overflow 是否压缩后重试同一 Turn；
+99. Run/Tool/Retry 完整状态生命周期；
+100. 并行工具是否在全部结束前保持 executing_tools；
+101. 未知 Tool Call 终止事件是否被 Invariant 拒绝；
+102. Run 终态后是否禁止继续写事件；
+103. Runtime JSONL 重放是否得到相同状态；
+104. 进程中断是否恢复为 suspended；
+105. Runtime Tracker 是否可直接订阅现有 Agent Event；
+106. Hybrid 路由阶段是否进入同一个 Run；
+107. Domain 状态是否只能由可信事实来源推进；
+108. Domain 状态是否执行 Approval 和乐观版本检查；
+109. Recorder 是否持久化完整消息和工具事实；
+110. 无模型路由结果是否形成完整 Durable Operation；
+111. Recovery 是否识别未完成模型请求；
+112. Recovery 是否区分 Safe Replay 和 Reconcile；
+113. Safe Tool Replay 后是否继续模型并完成；
+114. 可信身份是否拒绝错误凭证；
+115. Approval 是否检查角色、自审、操作绑定和一次消费；
+116. 写操作是否执行审批、幂等和重复请求去重；
+117. outcome_unknown 写操作是否通过核对完成；
+118. JSONL 重启后是否恢复完整消息 Context；
+119. 状态机指南是否包含业务实现和恢复安全契约。
 
 ### 4.5 可选安装
 
@@ -1528,12 +1579,12 @@ python examples/basic_usage.py
 python -m unittest discover -s tests -v
 ```
 
-当前共有 98 项离线测试，覆盖 Agent Loop、Provider、Durable Retry、Circuit Breaker、Task Retry、Compaction、Outcome Reconciliation、业务路由和 Guard。
+当前共有 119 项离线测试，覆盖 Agent Loop、完整 Context Session、恢复、可信身份、Approval、幂等写操作、Runtime/Domain 状态机和 AI 开发契约。
 
 只有看到：
 
 ```text
-Ran 98 tests
+Ran 119 tests
 OK
 ```
 
@@ -1873,14 +1924,16 @@ agent.prompt("任务二")  再获得一份新预算
 - `tests/test_routed_agent.py`：6 项强制工具与 Capability 测试；
 - `tests/test_simple_business_config.py`：3 项简化配置测试；
 - `tests/test_hybrid_router.py`：8 项混合路由测试；
-- `tests/test_business_requirements.py`：3 项 AI 需求与工具指南契约测试；
+- `tests/test_business_requirements.py`：4 项 AI 需求、工具与状态机指南契约测试；
 - `tests/test_retry.py`：7 项模型和单工具重试测试；
-- `tests/test_retry_advanced.py`：9 项持久化、Circuit、Task、Outcome 和 Compaction 测试。
+- `tests/test_retry_advanced.py`：9 项持久化、Circuit、Task、Outcome 和 Compaction 测试；
+- `tests/test_runtime_state_machine.py`：10 项 Runtime/Domain 状态机测试；
+- `tests/test_durable_session.py`：10 项 Context、Recovery、Identity、Approval 和 Write 测试。
 
 全部测试：
 
 ```text
-Ran 98 tests
+Ran 119 tests
 OK
 ```
 
@@ -2417,10 +2470,10 @@ tests/test_simple_business_config.py
 tests/test_hybrid_router.py
 ```
 
-覆盖简化配置、Hybrid 路由、Denied、Approval、全部 Retry 层和完整业务工具闭环。
+覆盖简化配置、Hybrid 路由、Retry、Runtime/Domain 状态机、Durable Session、Approval、写操作和 AI 开发指南契约。
 
 ```text
-Ran 98 tests
+Ran 119 tests
 OK
 ```
 
@@ -2763,3 +2816,556 @@ python -m unittest discover -s tests -v
 - TaskRetryExecutor 不是多 Intent PlanExecutor；
 - Outcome Reconciliation 需要真实业务提供查询 API；
 - 写工具默认不配置自动 Retry。
+
+---
+
+## 27. Runtime 与项目业务状态机
+
+### 27.1 分层
+
+```text
+loop.py
+只负责模型、工具和消息执行，并继续发出事实事件
+
+runtime/
+定义 Run/Tool 状态、Runtime Event、Reducer、Invariant 和 Projection
+
+session/
+保存 Runtime Event、重放和崩溃恢复
+
+domains/
+定义具体项目业务实体的状态转换
+```
+
+没有把订单、退款、JSONL 或 UI 状态逻辑塞入低层 Agent Loop。
+
+### 27.2 通用 Run 状态
+
+```text
+idle
+running
+routing
+requesting_model
+executing_tools
+retrying
+compacting
+waiting_approval
+outcome_unknown
+completed
+failed
+cancelled
+suspended
+```
+
+每个并行 Tool Call 另有独立状态：
+
+```text
+queued
+executing
+retry_backoff
+succeeded
+failed
+timed_out
+cancelled
+outcome_unknown
+```
+
+### 27.3 Runtime Event
+
+```text
+run_started/run_finished/run_interrupted
+routing_started/routing_finished
+turn_started/turn_finished
+model_request_started/model_response_finished
+model_retry_*
+context_compaction_*
+tool_started/tool_retry_*/tool_finished
+approval_*
+outcome_unknown/reconciliation_*
+budget_exceeded
+```
+
+`RuntimeStateTracker` 可以直接传给：
+
+```python
+agent.subscribe(runtime_tracker.listener)
+```
+
+它先验证状态转换，再写 Store，最后提交内存快照。
+
+### 27.4 Reducer 和 Invariant
+
+```python
+next_state = reduce_runtime_state(current_state, event)
+```
+
+已经拒绝：
+
+- Event sequence 不连续；
+- 没有活动 Run 却写运行事件；
+- Run ID 不匹配；
+- 终态后继续写事件；
+- 未知 Tool Call 完成或重试；
+- Tool 终态后继续更新；
+- 重复 Tool Start；
+- 非 waiting_approval 状态批准/拒绝；
+- Run Completed 时仍有未完成工具。
+
+### 27.5 Session Store 与恢复
+
+```python
+store = JsonlRuntimeEventStore("state/runtime-events.jsonl")
+await RuntimeRecoveryManager(store).recover()
+tracker = await RuntimeStateTracker.create(store)
+```
+
+正常启动会重放 JSONL 得到当前状态。若上次进程停在非终态，恢复管理器追加：
+
+```text
+run_interrupted
+```
+
+并把状态变为：
+
+```text
+suspended
+```
+
+状态文件位于已忽略的 `state/`。
+
+### 27.6 Projection
+
+```python
+view = project_runtime_state(tracker.state)
+```
+
+返回：
+
+```text
+Run ID
+phase/中文 phaseLabel
+terminal
+turn
+modelRetryAttempt
+activeToolCount
+每个工具状态
+failureCode
+routingStatus
+lastEvent
+sequence
+```
+
+CLI、TUI 和 Web 应读取 Projection，而不是各自猜测状态。
+
+### 27.7 Hybrid Router 同一个 Run
+
+`RoutedAgent` 可接收：
+
+```python
+runtime_tracker=tracker
+```
+
+流程：
+
+```text
+run_started
+→ routing_started
+→ HybridModelRouter
+→ routing_finished
+→ Agent Loop 模型/工具事件
+→ run_finished
+```
+
+Capability Missing、Out of Scope、Prohibited 等不调用回答模型的结果也会形成一个完整 Run。
+
+### 27.8 业务 Domain 状态机
+
+```python
+machine = DomainStateMachine(
+    initial_state="pending_payment",
+    transitions=[
+        DomainTransition(
+            event_type="payment_succeeded",
+            from_states=frozenset({"pending_payment"}),
+            to_state="paid",
+            allowed_sources=frozenset({"payment_api"}),
+        )
+    ],
+)
+```
+
+应用可信事件：
+
+```python
+state = machine.apply(
+    state,
+    DomainEvent(
+        entity_id="order-1001",
+        type="payment_succeeded",
+        source="payment_api",
+        expected_version=0,
+    ),
+)
+```
+
+状态机检查：
+
+- Entity ID；
+- 当前状态是否允许该事件；
+- 事件来源是否可信；
+- 是否完成 Approval；
+- expected_version 是否与当前版本一致。
+
+用户或模型说“订单已发货”不能直接改变订单状态；必须由业务 API/工具产生可信事件。
+
+### 27.9 运行演示
+
+```bat
+python examples\state_machine_usage.py
+```
+
+演示内容：
+
+```text
+ScriptedProvider → divide → Tool Result
+→ Runtime Event JSONL
+→ RunState completed
+
+订单 pending_payment
+→ payment_api
+→ paid
+→ order_api
+→ shipped
+→ 非法转换被拒绝
+```
+
+查看状态事件：
+
+```bat
+type state\state-machine-demo.jsonl
+```
+
+### 27.10 当前示例已接入
+
+```text
+examples/basic_usage.py
+examples/real_model_usage.py
+examples/business_routing_usage.py
+```
+
+会写入：
+
+```text
+state/runtime-events.jsonl
+```
+
+并显示最终运行状态和 Run ID。
+
+### 27.11 业务需求文件
+
+`BUSINESS_REQUIREMENTS.md` 已增加业务状态转换表，要求填写：
+
+```text
+实体
+事件
+允许来源状态
+目标状态
+可信事实来源
+是否审批
+```
+
+AI 不得自行发明生产业务状态和转换。
+
+### 27.12 测试
+
+```bat
+python -m unittest tests.test_runtime_state_machine -v
+python -m unittest discover -s tests -v
+```
+
+当前：
+
+```text
+Ran 119 tests
+OK
+```
+
+### 27.13 当前边界
+
+- Runtime Event 和完整 Operation Event 目前使用两个 JSONL，后续可统一数据库事务；
+- 完整 Context 和恢复计划已实现，但真实 Provider/工具恢复要由 Host 注入 Callback；
+- DomainStateMachine 是基础框架，真实项目必须提供自己的状态表；
+- 多 Intent Plan/Task 状态机仍需后续开发；
+- 分布式多写者需要数据库事务或单写者协议。
+
+---
+
+## 28. Durable Session、可信 Approval 和幂等写操作骨架
+
+### 28.1 完整 Operation Event
+
+新增持久事实：
+
+```text
+operation_started/operation_finished
+message_appended
+model_request_started/completed/failed
+tool_intent_recorded
+tool_dispatch_started
+tool_completed/tool_outcome_unknown/tool_reconciled
+routing_started/routing_finished
+approval_*
+write_*
+```
+
+与 Runtime Projection 不同，Operation Store 会保存恢复所需的完整 User/Assistant/ToolResult Message、Tool Arguments 和结果。文件位于已忽略的 `state/operation-events.jsonl`，生产系统应加密并执行数据保留策略。
+
+### 28.2 DurableOperationRecorder
+
+```python
+recorder = DurableOperationRecorder(
+    JsonlOperationEventStore("state/operation-events.jsonl"),
+    session_id="my-session",
+    tools=tools,
+    configuration={"provider": model.provider, "model": model.id},
+)
+agent.subscribe(recorder.listener)
+```
+
+Recorder 在实际工具函数前记录 `tool_dispatch_started`。工具声明：
+
+```python
+replay_policy="safe"   # 只读/幂等，崩溃后可重放
+replay_policy="never"  # 写操作，崩溃后必须核对
+```
+
+### 28.3 Recovery Planner
+
+```python
+plan = await DurableSessionRecovery(store).plan(
+    session_id="my-session",
+    operation_id="...",
+)
+```
+
+可能动作：
+
+```text
+retry_model_request
+continue_model
+execute_tool
+replay_safe_tool
+reconcile_tool
+materialize_tool_result
+finish_operation
+manual_intervention
+```
+
+判断规则：
+
+```text
+Model Started 无 Completed
+→ 重试模型请求
+
+Assistant Tool Call 尚未 Dispatch
+→ 可以执行
+
+Tool 已 Dispatch + replay_policy=safe
+→ 可以安全重放
+
+Tool 已 Dispatch + replay_policy=never
+→ 必须核对，不能重放
+
+Tool Result 已持久化但消息未写入
+→ 补写 ToolResult Message
+
+最后消息是 User/ToolResult
+→ 继续模型
+```
+
+### 28.4 Recovery Executor
+
+Host 提供可信 Callback：
+
+```python
+callbacks = RecoveryCallbacks(
+    request_model=request_model,
+    execute_tool=execute_tool,
+    reconcile_tool=reconcile_tool,
+)
+
+result = await recovery.resume(
+    session_id="...",
+    operation_id="...",
+    callbacks=callbacks,
+)
+```
+
+恢复器会循环规划、持久化 Attempt、执行安全动作、补齐消息，再继续模型，直到 Operation 完成或需要人工介入。
+
+### 28.5 可信身份
+
+```python
+identity = await verifier.verify(
+    IdentityClaim("operator", credential)
+)
+```
+
+后续 Approval 和写操作只接受 `VerifiedIdentity`。项目提供的 `StaticIdentityVerifier` 仅用于开发测试；生产必须替换为 OAuth、IAM、企业 SSO 或其他可信认证系统。
+
+持久事件只保存 Principal ID、Role、Issuer/Verification ID，不保存 Credential。
+
+### 28.6 Approval 状态机
+
+```text
+waiting
+→ approved/rejected/expired
+approved
+→ consumed
+```
+
+检查：
+
+- 所需角色；
+-禁止默认自审；
+- Approval 与操作 Hash 绑定；
+-过期时间；
+-一次性消费；
+-可信审批人身份。
+
+```python
+approval = await approvals.request(...)
+await approvals.grant(approval.approval_id, approver)
+await approvals.consume(
+    approval.approval_id,
+    action=exact_action,
+    consumer=operator,
+)
+```
+
+参数或工具发生变化后，旧 Approval 无法消费。
+
+### 28.7 写操作状态机
+
+```text
+prepared
+waiting_approval
+approved
+submitting
+succeeded/failed/outcome_unknown
+outcome_unknown
+→ reconciling
+→ succeeded/failed
+```
+
+写操作使用 Idempotency Key，但持久化只保存 SHA-256 Hash。
+
+同一个 Idempotency Key 和相同 Action 返回原 Write ID；同一个 Key 用于不同 Action 会返回 `idempotency_conflict`。
+
+写操作 `outcome_unknown` 不会自动重放，而是进入状态核对。
+
+### 28.8 离线演示
+
+```bat
+python examples\durable_session_usage.py
+```
+
+输出包括：
+
+```text
+写操作 waiting_approval
+→ 可信 approver 批准
+→ succeeded
+→ 同 Idempotency Key 重复请求不重复执行
+
+崩溃在 safe divide Dispatch 后
+→ Recovery Planner 选择 replay_safe_tool
+→ 补写 ToolResult
+→ 继续模型
+→ Operation completed
+```
+
+Journal：
+
+```bat
+type state\durable-session-demo.jsonl
+```
+
+### 28.9 当前真实示例
+
+`basic_usage.py`、`real_model_usage.py`、`business_routing_usage.py` 已接入 `DurableOperationRecorder`，会显示 Durable Operation ID 并保存完整 Context。
+
+业务入口的 Routing 也在同一个 Operation 中，Capability Missing、Prohibited 等零模型结果同样会正常结束 Operation。
+
+### 28.10 测试
+
+```bat
+python -m unittest tests.test_durable_session -v
+python -m unittest discover -s tests -v
+```
+
+当前：
+
+```text
+Ran 119 tests
+OK
+```
+
+### 28.11 骨架边界
+
+- JSONL 是单进程单写者实现，多 Worker 要替换成事务数据库；
+- 完整消息和工具参数可能包含敏感业务数据，生产存储必须加密、控制权限和设置保留周期；
+- Recovery Callback 是 Host 信任边界，必须调用真实 Provider/Tool Runtime，不能绕过 Guard；
+- StaticIdentityVerifier 只能用于开发测试；
+- Approval 尚未提供 Web/TUI 交互界面；
+- 真实业务状态机继续由 `BUSINESS_REQUIREMENTS.md` 状态表生成。
+
+---
+
+## 29. AI 必读真实业务状态机指南
+
+新增：
+
+```text
+STATE_MACHINE_IMPLEMENTATION_GUIDE.md
+```
+
+以后新增或修改真实业务 State、Event、Transition、Reducer、Approval、WriteOperation 或 Recovery 时，AI 必须依次阅读：
+
+```text
+AGENTS.md
+BUSINESS_REQUIREMENTS.md
+TOOLS_IMPLEMENTATION_GUIDE.md（涉及工具时）
+STATE_MACHINE_IMPLEMENTATION_GUIDE.md
+```
+
+指南完整规定：
+
+- State、Command、Event、Guard、Action 的区别；
+- Runtime 状态与业务 Domain 状态分离；
+- 业务人员需要填写的状态转换表；
+- AI 编码前必须确认的问题；
+- 推荐 Domain 目录；
+- DomainStateMachine 使用方法；
+- Command 不能直接修改状态；
+- 可信事实来源；
+- VerifiedIdentity 和权限；
+- Approval 与 Action Hash；
+- WriteOperation 和 Idempotency；
+- replay_policy；
+-完整 Context 和 Recovery；
+-expected_version 和并发控制；
+-纯 Reducer；
+-事件持久化；
+-Snapshot/Migration；
+-终态、可恢复状态和 Manual Intervention；
+-错误、Reconcile 和 Compensation；
+-Projection；
+-测试矩阵；
+-AI 实现步骤；
+-常见错误设计；
+-Definition of Done。
+
+`BUSINESS_REQUIREMENTS.md` 仍是唯一真实业务需求来源；状态机指南只定义实现方法，不复制具体业务状态，避免两份配置冲突。
+
+`AGENTS.md` 和契约测试会防止 AI 忘记阅读该指南。

@@ -1043,25 +1043,35 @@ async def _execute_prepared_tool(
 
     tool_call_id = str(prepared.tool_call.get("id", ""))
     execution_started = asyncio.Event()
+    dispatch_attempt = 0
+
+    async def dispatch_tool_body() -> AgentToolResult:
+        nonlocal dispatch_attempt
+        dispatch_attempt += 1
+        await _emit(
+            emit,
+            {
+                "type": "tool_execution_dispatch_start",
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "attempt": dispatch_attempt,
+            },
+        )
+        return await prepared.tool.execute(
+            tool_call_id,
+            prepared.args,
+            tool_cancellation,
+            on_update,
+        )
 
     async def execute_once() -> AgentToolResult:
         if execution_semaphore is None:
             execution_started.set()
-            return await prepared.tool.execute(
-                tool_call_id,
-                prepared.args,
-                tool_cancellation,
-                on_update,
-            )
+            return await dispatch_tool_body()
         # Retry Backoff 不占并发槽；每个新 Attempt 重新申请。
         async with execution_semaphore:
             execution_started.set()
-            return await prepared.tool.execute(
-                tool_call_id,
-                prepared.args,
-                tool_cancellation,
-                on_update,
-            )
+            return await dispatch_tool_body()
 
     async def emit_retry_event(event: AgentEvent) -> None:
         # 持久化 Hook 先完成，再向 UI 发布，接近 DeepSeek Harness 的 Durable 语义。

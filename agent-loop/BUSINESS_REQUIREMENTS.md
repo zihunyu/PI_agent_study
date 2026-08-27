@@ -165,6 +165,45 @@ AI 不得根据不完整描述自行编造真实 API、数据库字段、权限�
 
 敏感参数必须说明脱敏、日志和持久化规则。
 
+### 8.1 业务状态机定义
+
+完整实现规范见项目根目录 `STATE_MACHINE_IMPLEMENTATION_GUIDE.md`。AI 新增或修改任何真实业务状态机前必须完整阅读该文件。
+
+每个真实业务实体应填写允许的状态转换。状态只能由可信工具/API/审批事件推进，不能根据模型文本猜测。
+
+| 实体 | 事件 | 允许来源状态 | 目标状态 | 事实来源 | 是否审批 |
+|---|---|---|---|---|---|
+| order | `payment_succeeded` | `pending_payment` | `paid` | 支付 API | 否 |
+| order | `shipment_created` | `paid` | `shipped` | 订单 API | 否 |
+| order | `cancel_approved` | `paid` | `cancelled` | 取消 API | 是 |
+
+填写要求：
+
+- 状态和事件使用稳定英文标识；
+- 必须列出可信事实来源；
+- 用户自然语言不能直接成为状态事实；
+- 写状态必须说明 Approval、幂等和版本检查；
+- AI 根据该表生成 DomainTransition、Reducer/StateMachine 和非法转换测试；
+- 未提供状态表时，AI 不得自行发明生产业务状态。
+
+### 8.2 Session、Approval 和恢复要求
+
+真实写工具和可恢复 Operation 还必须填写：
+
+| Tool/Intent | replay_policy | Approval Role | Idempotency Key 来源 | Outcome Unknown 核对 API | 恢复时允许动作 |
+|---|---|---|---|---|---|
+| `orders.read_current` | `safe` | 无 | 无 | 无 | 可重放查询 |
+| `order.cancel` | `never` | `approver` | 调用方生成 | 待提供 | 只核对，不重放 |
+
+规则：
+
+- `safe` 只能用于只读或严格幂等工具；
+- 写工具默认 `never`；
+- Approval 必须绑定精确操作 Hash，并且只能消费一次；
+- Idempotency Key 不得明文写入事件日志；
+- Outcome Unknown 必须提供状态核对入口；
+- AI 不得在缺少核对 API 时声称写操作可自动恢复。
+
 ---
 
 ## 9. 预期对话验收用例

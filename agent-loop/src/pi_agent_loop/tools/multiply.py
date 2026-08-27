@@ -82,4 +82,5 @@ def create_multiply_tool(*, delay_seconds: float = 0.0) -> AgentTool:
         execution_mode="parallel",
         # 乘法工具最多执行 5 秒；超时只取消当前乘法，不影响并行工具。
         timeout_seconds=5,
+        replay_policy="safe",
     )

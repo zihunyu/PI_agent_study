@@ -27,6 +27,7 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
         tool = create_add_tool()
         updates = []
         self.assertEqual(tool.timeout_seconds, 2)
+        self.assertEqual(tool.replay_policy, "safe")
 
         result = await tool.execute(
             "add-id",
@@ -44,6 +45,7 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
         tool = create_multiply_tool()
         updates = []
         self.assertEqual(tool.timeout_seconds, 5)
+        self.assertEqual(tool.replay_policy, "safe")
 
         result = await tool.execute(
             "multiply-id",
@@ -61,6 +63,7 @@ class CalculatorToolTests(unittest.IsolatedAsyncioTestCase):
         tool = create_divide_tool()
         updates = []
         self.assertEqual(tool.timeout_seconds, 3)
+        self.assertEqual(tool.replay_policy, "safe")
 
         result = await tool.execute(
             "divide-id",

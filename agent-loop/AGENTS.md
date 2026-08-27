@@ -15,6 +15,8 @@
 
 新增、修改或删除任何 `AgentTool` 时，还必须完整阅读 `TOOLS_IMPLEMENTATION_GUIDE.md`，按其中的 Schema、校验、取消、Timeout、结果、注册、测试和 Definition of Done 执行。
 
+新增或修改业务 State、Event、Transition、Reducer、Approval、WriteOperation 或 Recovery 时，必须完整阅读 `STATE_MACHINE_IMPLEMENTATION_GUIDE.md`，并以 `BUSINESS_REQUIREMENTS.md` 中经业务确认的状态转换表为唯一需求来源。
+
 ## 配置和秘密
 
 - 真实 `config/*.toml` 不得提交；
@@ -30,4 +32,12 @@
 - 外部操作放在 `tools/`；
 - Capability 与具体工具名分离；
 - 实时数据和写操作不得仅依赖 `tool_choice="auto"`；
-- 写操作在 Approval 完成前不得执行。
+- 写操作在 Approval 完成前不得执行；
+- 通用状态 Reducer/Invariant 放在 `runtime/`，持久化放在 `session/`；
+- 具体业务状态转换放在 `domains/`，不得写入 `loop.py`；
+- 用户或模型文本不是业务状态事实，状态必须来自工具、业务 API、审批或持久事件；
+- 新增状态和转换时必须更新 `BUSINESS_REQUIREMENTS.md` 并增加非法转换测试；
+- 可恢复工具必须声明 `replay_policy`，写工具默认 `never`；
+- Approval 必须绑定可信身份和精确 Action Hash，禁止仅使用布尔 `approved=True`；
+- 写操作必须使用 Idempotency Key Hash、持久事件和 outcome_unknown 核对；
+- Recovery Callback 是 Host 信任边界，不能绕过 Tool Guard、权限或审批。

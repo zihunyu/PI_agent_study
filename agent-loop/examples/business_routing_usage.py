@@ -18,15 +18,21 @@ from pi_agent_loop import (  # noqa: E402
     BusinessConfigError,
     CompactionRetryPolicy,
     CapabilityRegistry,
+    DurableOperationRecorder,
     HybridModelRouter,
+    JsonlOperationEventStore,
     JsonlRetryEventStore,
+    JsonlRuntimeEventStore,
     ProviderConfigError,
     RoutedAgent,
+    RuntimeRecoveryManager,
+    RuntimeStateTracker,
     compact_on_context_overflow,
     create_provider,
     load_agent_limits,
     load_provider_settings,
     load_simple_business_config,
+    project_runtime_state,
 )
 
 
@@ -72,6 +78,15 @@ async def main() -> None:
     )
     model, provider = create_provider(provider_settings)
     retry_store = JsonlRetryEventStore(ROOT / "state" / "retry-events.jsonl")
+    runtime_store = JsonlRuntimeEventStore(ROOT / "state" / "runtime-events.jsonl")
+    await RuntimeRecoveryManager(runtime_store).recover()
+    runtime_tracker = await RuntimeStateTracker.create(runtime_store)
+    operation_recorder = DurableOperationRecorder(
+        JsonlOperationEventStore(ROOT / "state" / "operation-events.jsonl"),
+        session_id="business-routing",
+        tools=capabilities.all_tools(),
+        configuration={"provider": model.provider, "model": model.id},
+    )
     router = HybridModelRouter(
         business_config,
         capabilities,
@@ -95,7 +110,13 @@ async def main() -> None:
         max_parallel_tools=limits.max_parallel_tools,
         retry_event_sink=retry_store.append,
     )
-    routed = RoutedAgent(agent, router, capabilities)
+    routed = RoutedAgent(
+        agent,
+        router,
+        capabilities,
+        runtime_tracker=runtime_tracker,
+        operation_recorder=operation_recorder,
+    )
 
     def event_listener(event, _token) -> None:
         if event.get("type") == "tool_execution_start":
@@ -133,6 +154,11 @@ async def main() -> None:
     print("错误代码：", result.error_code)
     print("最终结果：", result.response_text)
     print("模型调用次数：", provider.call_count)
+    runtime_view = project_runtime_state(runtime_tracker.state)
+    print("运行状态：", runtime_view["phaseLabel"])
+    print("路由状态投影：", runtime_view["routingStatus"])
+    print("Runtime Run ID：", runtime_view["runId"])
+    print("Durable Operation ID：", operation_recorder.last_operation_id)
     print("=" * 68)
 
 
