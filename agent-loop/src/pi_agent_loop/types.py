@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
 from .cancellation import CancellationToken
+from .retry.types import ToolRetryPolicy
 
 if False:  # 仅供静态类型工具理解，运行时不会导入，避免循环依赖。
     from .event_stream import AssistantMessageEventStream
@@ -76,6 +77,8 @@ class AgentTool:
     execution_mode: ToolExecutionMode | None = None
     # 单工具超时优先于 Agent 的默认超时。None 表示使用 Agent 默认值。
     timeout_seconds: float | None = None
+    # 只有显式幂等并声明可重试错误码的工具才能自动重试。
+    retry_policy: ToolRetryPolicy | None = None
 
     def __post_init__(self) -> None:
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -165,6 +168,8 @@ class AgentLoopConfig:
     model: Model
     convert_to_llm: Callable[[list[AgentMessage]], MaybeAwaitable]
     stream_options: dict[str, Any] = field(default_factory=dict)
+    # Retry 元数据持久化 Hook；不得记录 Prompt、工具参数或密钥。
+    retry_event_sink: Callable[[AgentEvent], MaybeAwaitable] | None = None
     thinking_level: ThinkingLevel = "off"
     tool_execution: ToolExecutionMode = "parallel"
     # 当工具没有自己的 timeout_seconds 时使用这个默认值。

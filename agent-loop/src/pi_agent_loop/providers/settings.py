@@ -9,6 +9,8 @@ from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from ..retry.circuit_breaker import CircuitBreakerPolicy
+from ..retry.types import ModelRetryPolicy
 from .errors import ProviderConfigError
 
 _SUPPORTED_PROTOCOL = "openai_chat_completions"
@@ -28,8 +30,24 @@ _PROFILE_FIELDS = {
     "connect_timeout_seconds",
     "request_timeout_seconds",
     "allow_insecure_http",
+    "retry",
 }
-_REQUIRED_PROFILE_FIELDS = set(_PROFILE_FIELDS)
+_REQUIRED_PROFILE_FIELDS = set(_PROFILE_FIELDS) - {"retry"}
+_RETRY_FIELDS = {
+    "enabled",
+    "max_retries",
+    "initial_delay_seconds",
+    "max_delay_seconds",
+    "jitter_ratio",
+    "retryable_statuses",
+    "max_elapsed_seconds",
+    "circuit_breaker",
+}
+_CIRCUIT_BREAKER_FIELDS = {
+    "enabled",
+    "failure_threshold",
+    "recovery_timeout_seconds",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +66,7 @@ class ProviderProfile:
     connect_timeout_seconds: float
     request_timeout_seconds: float
     allow_insecure_http: bool
+    retry_policy: ModelRetryPolicy = field(default_factory=ModelRetryPolicy)
 
     @property
     def request_url(self) -> str:
@@ -126,6 +145,96 @@ def _validate_url(
         )
 
 
+def _parse_retry_policy(raw: Any, profile: str) -> ModelRetryPolicy:
+    if raw is None:
+        return ModelRetryPolicy()
+    data = _require_table(raw, f"[profiles.{profile}.retry]")
+    unknown = sorted(data.keys() - _RETRY_FIELDS)
+    if unknown:
+        raise ProviderConfigError(
+            f"Profile {profile}.retry 包含未知字段：{', '.join(unknown)}"
+        )
+
+    enabled = data.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ProviderConfigError(
+            f"Profile {profile}.retry.enabled 必须是布尔值"
+        )
+    max_retries = data.get("max_retries", 2 if enabled else 0)
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+        raise ProviderConfigError(
+            f"Profile {profile}.retry.max_retries 必须是整数"
+        )
+
+    numeric_defaults = {
+        "initial_delay_seconds": 0.5,
+        "max_delay_seconds": 30.0,
+        "jitter_ratio": 0.2,
+        "max_elapsed_seconds": 120.0,
+    }
+    numeric_values: dict[str, float] = {}
+    for field_name, default in numeric_defaults.items():
+        value = data.get(field_name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ProviderConfigError(
+                f"Profile {profile}.retry.{field_name} 必须是数字"
+            )
+        numeric_values[field_name] = float(value)
+
+    circuit_raw = data.get("circuit_breaker")
+    circuit = CircuitBreakerPolicy()
+    if circuit_raw is not None:
+        circuit_data = _require_table(
+            circuit_raw,
+            f"[profiles.{profile}.retry.circuit_breaker]",
+        )
+        unknown_circuit = sorted(
+            circuit_data.keys() - _CIRCUIT_BREAKER_FIELDS
+        )
+        if unknown_circuit:
+            raise ProviderConfigError(
+                f"Profile {profile}.retry.circuit_breaker 包含未知字段："
+                f"{', '.join(unknown_circuit)}"
+            )
+        try:
+            circuit = CircuitBreakerPolicy(
+                enabled=circuit_data.get("enabled", False),
+                failure_threshold=circuit_data.get("failure_threshold", 3),
+                recovery_timeout_seconds=circuit_data.get(
+                    "recovery_timeout_seconds",
+                    30.0,
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise ProviderConfigError(
+                f"Profile {profile}.retry.circuit_breaker 配置无效：{error}"
+            ) from error
+
+    retryable_statuses = data.get(
+        "retryable_statuses",
+        [408, 409, 429, 500, 502, 503, 504],
+    )
+    if not isinstance(retryable_statuses, list):
+        raise ProviderConfigError(
+            f"Profile {profile}.retry.retryable_statuses 必须是整数数组"
+        )
+    try:
+        return ModelRetryPolicy(
+            enabled=enabled,
+            max_retries=max_retries,
+            initial_delay_seconds=numeric_values["initial_delay_seconds"],
+            max_delay_seconds=numeric_values["max_delay_seconds"],
+            jitter_ratio=numeric_values["jitter_ratio"],
+            retryable_statuses=frozenset(retryable_statuses),
+            max_elapsed_seconds=numeric_values["max_elapsed_seconds"],
+            circuit_breaker=circuit,
+        )
+    except (TypeError, ValueError) as error:
+        raise ProviderConfigError(
+            f"Profile {profile}.retry 配置无效：{error}"
+        ) from error
+
+
 def _parse_profile(name: str, raw: Any) -> ProviderProfile:
     data = _require_table(raw, f"[profiles.{name}]")
     missing = sorted(_REQUIRED_PROFILE_FIELDS - data.keys())
@@ -196,6 +305,7 @@ def _parse_profile(name: str, raw: Any) -> ProviderProfile:
             data, "request_timeout_seconds", name
         ),
         allow_insecure_http=allow_insecure_http,
+        retry_policy=_parse_retry_policy(data.get("retry"), name),
     )
 
 

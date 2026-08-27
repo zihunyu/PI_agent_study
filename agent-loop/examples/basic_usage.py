@@ -23,11 +23,14 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from pi_agent_loop import (  # noqa: E402
     Agent,
+    CompactionRetryPolicy,
+    JsonlRetryEventStore,
     ProviderConfigError,
     ToolRegistry,
     create_add_tool,
     create_divide_tool,
     create_multiply_tool,
+    compact_on_context_overflow,
     create_provider,
     load_agent_limits,
     load_provider_settings,
@@ -142,9 +145,14 @@ async def main() -> None:
         create_divide_tool(delay_seconds=DIVIDE_TOOL_DELAY_SECONDS)
     )
 
+    retry_store = JsonlRetryEventStore(ROOT / "state" / "retry-events.jsonl")
+    compacting_stream = compact_on_context_overflow(
+        provider.stream,
+        CompactionRetryPolicy(max_retries=1, keep_recent_messages=20),
+    )
     agent = Agent(
         model=model,
-        stream_fn=provider.stream,
+        stream_fn=compacting_stream,
         system_prompt=(
             "你是一个中文助手。先理解用户的真实请求。只有在请求适合当前工具时"
             "才调用工具；工具执行后必须读取 Tool Result 再回答。没有合适工具时，"
@@ -155,6 +163,7 @@ async def main() -> None:
         max_tool_calls=limits.max_tool_calls,
         max_parallel_tools=limits.max_parallel_tools,
         max_turns=limits.max_turns,
+        retry_event_sink=retry_store.append,
     )
 
     # 保留原来的 01、02、03……中文事件显示模式。message_update 是逐字流事件，
@@ -227,6 +236,31 @@ async def main() -> None:
                 f"工具 {event['toolName']} 执行{status}，结果为 "
                 f"{result_text(event['result'])}。"
             )
+        elif event_type == "model_retry_scheduled":
+            explanation = (
+                f"模型请求出现瞬时错误 {event['errorCode']}，"
+                f"将在 {event['delayMs']} 毫秒后进行第 {event['attempt']} 次重试。"
+            )
+        elif event_type == "model_retry_attempt_start":
+            explanation = f"开始第 {event['attempt']} 次模型重试。"
+        elif event_type == "model_retry_finished":
+            explanation = (
+                "模型重试成功。" if event["success"] else "模型重试最终失败。"
+            )
+        elif event_type == "tool_retry_scheduled":
+            explanation = (
+                f"工具 {event['toolName']} 出现瞬时错误 {event['errorCode']}，"
+                f"将在 {event['delayMs']} 毫秒后重试。"
+            )
+        elif event_type == "tool_retry_attempt_start":
+            explanation = (
+                f"工具 {event['toolName']} 开始第 {event['attempt']} 次重试。"
+            )
+        elif event_type == "tool_retry_finished":
+            explanation = (
+                f"工具 {event['toolName']} 重试"
+                f"{'成功' if event['success'] else '失败'}。"
+            )
         elif event_type == "budget_exceeded":
             explanation = f"运行预算不足：{event['message']}。"
         elif event_type == "turn_end":
@@ -252,6 +286,11 @@ async def main() -> None:
         f"max_turns={limits.max_turns}，"
         f"max_tool_calls={limits.max_tool_calls}，"
         f"max_parallel_tools={limits.max_parallel_tools}。"
+    )
+    print(
+        "模型重试："
+        f"enabled={profile.retry_policy.enabled}，"
+        f"max_retries={profile.retry_policy.max_retries}。"
     )
     parsed_url = urlsplit(profile.base_url)
     if parsed_url.scheme == "http" and parsed_url.hostname not in {

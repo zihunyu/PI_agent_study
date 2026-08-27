@@ -7,8 +7,8 @@
 - 处理 steering 与 follow-up 队列；
 - 发出 Agent/Turn/Message/Tool 生命周期事件。
 
-自动重试、上下文压缩、JSONL/SQLite 持久化和 UI 不属于低层循环，应该由
-更高层 Session/Host 编排。这正是 Pi 原设计最值得借鉴的分层之一。
+模型重试策略、上下文压缩、JSONL/SQLite 持久化和 UI 不属于低层循环，
+应该由更高层 Session/Host 编排。低层只调用独立 Tool Retry 包装器。
 """
 
 from __future__ import annotations
@@ -20,12 +20,17 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from .cancellation import CancellationToken
+from .cancellation import (
+    CancellationToken,
+    OperationCancelledError,
+)
 from .event_stream import (
     AgentEventStream,
     AssistantMessageEventStream,
 )
 from .messages import clone_message, error_tool_result, now_ms
+from .retry.errors import OutcomeUnknownToolError, RetryableToolError
+from .retry.tool import execute_tool_with_retry
 from .types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -46,6 +51,14 @@ from .types import (
 )
 
 # Provider 流更新 assistant partial 时可能出现的事件。
+_MODEL_RETRY_EVENT_TYPES = {
+    "model_retry_scheduled",
+    "model_retry_attempt_start",
+    "model_retry_finished",
+    "context_compaction_started",
+    "context_compaction_finished",
+}
+
 _ASSISTANT_UPDATE_TYPES = {
     "text_start",
     "text_delta",
@@ -519,6 +532,7 @@ async def _stream_assistant_response(
             "reasoning": None
             if config.thinking_level == "off"
             else config.thinking_level,
+            "retry_event_sink": config.retry_event_sink,
         }
     )
 
@@ -543,6 +557,9 @@ async def _stream_assistant_response(
                     "message": clone_message(partial_message),
                 },
             )
+        elif event_type in _MODEL_RETRY_EVENT_TYPES:
+            # Retry 实现在 StreamFn/Host；低层循环只把结构化事件转发给 UI。
+            await _emit(emit, dict(event))
         elif event_type in _ASSISTANT_UPDATE_TYPES:
             if partial_message is None:
                 continue
@@ -772,6 +789,7 @@ async def _execute_tools_sequential(
                 cancellation,
                 emit,
                 config.default_tool_timeout_seconds,
+                retry_event_sink=config.retry_event_sink,
             )
             finalized = await _finalize_executed_tool(
                 context,
@@ -841,25 +859,26 @@ async def _execute_tools_parallel(
             async def run_one(
                 prepared: _PreparedToolCall = preparation,
             ) -> _FinalizedToolCall:
-                async with semaphore:
-                    result, is_error = await _execute_prepared_tool(
-                        prepared,
-                        cancellation,
-                        emit,
-                        config.default_tool_timeout_seconds,
-                    )
-                    finalized_result = await _finalize_executed_tool(
-                        context,
-                        assistant_message,
-                        prepared,
-                        result,
-                        is_error,
-                        config,
-                        cancellation,
-                    )
-                    # end 在每个任务中发，因此谁先完成谁先发。
-                    await _emit_tool_end(finalized_result, emit)
-                    return finalized_result
+                result, is_error = await _execute_prepared_tool(
+                    prepared,
+                    cancellation,
+                    emit,
+                    config.default_tool_timeout_seconds,
+                    execution_semaphore=semaphore,
+                    retry_event_sink=config.retry_event_sink,
+                )
+                finalized_result = await _finalize_executed_tool(
+                    context,
+                    assistant_message,
+                    prepared,
+                    result,
+                    is_error,
+                    config,
+                    cancellation,
+                )
+                # end 在每个任务中发，因此谁先完成谁先发。
+                await _emit_tool_end(finalized_result, emit)
+                return finalized_result
 
             entries.append(run_one)
 
@@ -974,6 +993,9 @@ async def _execute_prepared_tool(
     cancellation: CancellationToken,
     emit: EventSink,
     default_timeout_seconds: float | None,
+    *,
+    execution_semaphore: asyncio.Semaphore | None = None,
+    retry_event_sink: Callable[[AgentEvent], Any] | None = None,
 ) -> tuple[AgentToolResult, bool]:
     """执行一个已验证工具，并实现单工具独立超时。
 
@@ -1019,17 +1041,53 @@ async def _execute_prepared_tool(
             )
         )
 
+    tool_call_id = str(prepared.tool_call.get("id", ""))
+    execution_started = asyncio.Event()
+
+    async def execute_once() -> AgentToolResult:
+        if execution_semaphore is None:
+            execution_started.set()
+            return await prepared.tool.execute(
+                tool_call_id,
+                prepared.args,
+                tool_cancellation,
+                on_update,
+            )
+        # Retry Backoff 不占并发槽；每个新 Attempt 重新申请。
+        async with execution_semaphore:
+            execution_started.set()
+            return await prepared.tool.execute(
+                tool_call_id,
+                prepared.args,
+                tool_cancellation,
+                on_update,
+            )
+
+    async def emit_retry_event(event: AgentEvent) -> None:
+        # 持久化 Hook 先完成，再向 UI 发布，接近 DeepSeek Harness 的 Durable 语义。
+        if retry_event_sink is not None:
+            await _maybe_await(retry_event_sink(dict(event)))
+        await _emit(emit, event)
+
     execute_task = asyncio.create_task(
-        prepared.tool.execute(
-            str(prepared.tool_call.get("id", "")),
-            prepared.args,
-            tool_cancellation,
-            on_update,
+        execute_tool_with_retry(
+            execute=execute_once,
+            policy=prepared.tool.retry_policy,
+            cancellation=tool_cancellation,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            emit=emit_retry_event,
         )
     )
     cancellation_wait_task = asyncio.create_task(tool_cancellation.wait())
+
+    async def wait_for_timeout() -> None:
+        # 初次排队等待并发槽不消耗工具 Timeout；第一次真正执行后开始计时。
+        await execution_started.wait()
+        await asyncio.sleep(cast(float, timeout_seconds))
+
     timeout_task = (
-        asyncio.create_task(asyncio.sleep(timeout_seconds))
+        asyncio.create_task(wait_for_timeout())
         if timeout_seconds is not None
         else None
     )
@@ -1065,10 +1123,36 @@ async def _execute_prepared_tool(
             try:
                 result = await execute_task
                 is_error = False
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, OperationCancelledError):
                 result = error_tool_result(
                     f"工具 {tool_name} 已取消：{tool_cancellation.reason}",
                     details={"code": "tool_cancelled"},
+                )
+                is_error = True
+            except OutcomeUnknownToolError as error:
+                result = error_tool_result(
+                    str(error),
+                    details={
+                        "code": "outcome_unknown",
+                        "operationId": error.operation_id,
+                        "reconciliationName": error.reconciliation_name,
+                        "retryable": False,
+                    },
+                )
+                is_error = True
+            except RetryableToolError as error:
+                result = error_tool_result(
+                    str(error),
+                    details={
+                        "code": error.code,
+                        "retryable": True,
+                        "attempts": error.attempts,
+                        **(
+                            {"retryId": error.retry_id}
+                            if error.retry_id is not None
+                            else {}
+                        ),
+                    },
                 )
                 is_error = True
             except Exception as error:

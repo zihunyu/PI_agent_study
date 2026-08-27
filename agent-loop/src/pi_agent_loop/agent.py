@@ -129,6 +129,7 @@ class Agent:
         max_parallel_tools: int | None = None,
         max_turns: int | None = None,
         stream_options: dict[str, Any] | None = None,
+        retry_event_sink: Callable[[AgentEvent], Any] | None = None,
     ) -> None:
         if (
             default_tool_timeout_seconds is not None
@@ -166,6 +167,7 @@ class Agent:
         self.max_parallel_tools = max_parallel_tools
         self.max_turns = max_turns
         self.stream_options = dict(stream_options or {})
+        self.retry_event_sink = retry_event_sink
 
         self._steering_queue = _PendingMessageQueue(steering_mode)
         self._follow_up_queue = _PendingMessageQueue(follow_up_mode)
@@ -399,6 +401,7 @@ class Agent:
             max_parallel_tools=self.max_parallel_tools,
             max_turns=self.max_turns,
             stream_options=dict(self.stream_options),
+            retry_event_sink=self.retry_event_sink,
         )
 
     async def _run_with_lifecycle(

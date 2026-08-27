@@ -26,3 +26,18 @@ request_timeout_seconds = 60
 
 # 远程 API 默认必须使用 HTTPS。本地 localhost/127.0.0.1 测试可使用 HTTP。
 allow_insecure_http = false
+
+# 同一个逻辑模型 Turn 的瞬时错误重试。401/403/404、配额和业务错误不会重试。
+[profiles.third_party.retry]
+enabled = true
+max_retries = 2
+initial_delay_seconds = 0.5
+max_delay_seconds = 30
+jitter_ratio = 0.2
+max_elapsed_seconds = 120
+retryable_statuses = [408, 409, 429, 500, 502, 503, 504]
+
+[profiles.third_party.retry.circuit_breaker]
+enabled = true
+failure_threshold = 3
+recovery_timeout_seconds = 30

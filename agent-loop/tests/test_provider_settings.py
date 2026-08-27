@@ -95,6 +95,34 @@ class ProviderSettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ProviderConfigError, "未知字段"):
             self.load(config_text(extra="unexpected = 1"))
 
+    def test_读取模型重试配置(self) -> None:
+        settings = self.load(
+            config_text(
+                extra="""
+[profiles.third_party.retry]
+enabled = true
+max_retries = 3
+initial_delay_seconds = 0.1
+max_delay_seconds = 5
+jitter_ratio = 0
+max_elapsed_seconds = 10
+retryable_statuses = [429, 503]
+
+[profiles.third_party.retry.circuit_breaker]
+enabled = true
+failure_threshold = 2
+recovery_timeout_seconds = 4
+"""
+            )
+        )
+        policy = settings.active.retry_policy
+        self.assertTrue(policy.enabled)
+        self.assertEqual(policy.max_retries, 3)
+        self.assertEqual(policy.retryable_statuses, frozenset({429, 503}))
+        self.assertEqual(policy.max_elapsed_seconds, 10)
+        self.assertTrue(policy.circuit_breaker.enabled)
+        self.assertEqual(policy.circuit_breaker.failure_threshold, 2)
+
     def test_stream_false_被拒绝(self) -> None:
         with self.assertRaisesRegex(ProviderConfigError, "stream=true"):
             self.load(config_text(stream="false"))

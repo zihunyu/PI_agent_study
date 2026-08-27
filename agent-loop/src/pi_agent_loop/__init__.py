@@ -20,6 +20,35 @@ from .providers import (
     create_provider,
     load_provider_settings,
 )
+from .retry import (
+    ModelRetryPolicy,
+    OutcomeUnknownToolError,
+    RetryableToolError,
+    ToolRetryPolicy,
+)
+from .retry.circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerPolicy,
+    CircuitOpenError,
+)
+from .retry.compaction import (
+    CompactionRetryPolicy,
+    ContextOverflowCompactingStreamFn,
+    SlidingWindowCompactor,
+    compact_on_context_overflow,
+)
+from .retry.events import (
+    JsonlRetryEventStore,
+    RetryChain,
+    RetryRecoveryManager,
+)
+from .retry.model import RetryingStreamFn, retry_model_stream
+from .retry.outcome import OutcomeReconciliationRegistry
+from .retry.task import (
+    RetryableTaskError,
+    TaskRetryExecutor,
+    TaskRetryPolicy,
+)
 from .routing import (
     BusinessConfigError,
     CapabilityRegistry,
@@ -78,27 +107,45 @@ __all__ = [
     "BeforeToolCallResult",
     "BusinessConfigError",
     "CancellationToken",
+    "CircuitBreaker",
+    "CircuitBreakerPolicy",
+    "CircuitOpenError",
+    "CompactionRetryPolicy",
+    "ContextOverflowCompactingStreamFn",
     "CapabilityRegistry",
     "EventStream",
     "HybridModelRouter",
+    "JsonlRetryEventStore",
     "Model",
+    "ModelRetryPolicy",
     "OperationCancelledError",
     "OpenAICompatibleProvider",
+    "OutcomeReconciliationRegistry",
+    "OutcomeUnknownToolError",
     "ProviderConfigError",
     "ProviderError",
     "ProviderProfile",
     "ProviderSettings",
     "RequestDecision",
+    "RetryableTaskError",
+    "RetryableToolError",
+    "RetryingStreamFn",
     "RequiredToolCallGuard",
     "RoutedAgent",
+    "RetryChain",
+    "RetryRecoveryManager",
     "RoutedPromptResult",
     "ScriptedProvider",
+    "SlidingWindowCompactor",
     "SimpleBusinessConfig",
     "SimpleDeniedRule",
     "SimpleIntent",
     "SimpleProduct",
+    "TaskRetryExecutor",
+    "TaskRetryPolicy",
     "ToolCapability",
     "ToolChoicePolicy",
+    "ToolRetryPolicy",
     "ToolRegistry",
     "TurnCompletedContext",
     "agent_loop",
@@ -109,6 +156,7 @@ __all__ = [
     "create_calculator_tools",
     "create_divide_tool",
     "create_multiply_tool",
+    "compact_on_context_overflow",
     "create_provider",
     "empty_usage",
     "guard_stream_fn",
@@ -117,6 +165,7 @@ __all__ = [
     "load_simple_business_config",
     "now_ms",
     "run_agent_loop",
+    "retry_model_stream",
     "run_agent_loop_continue",
     "user_message",
 ]

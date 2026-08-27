@@ -372,6 +372,31 @@ invalid_response
 工具失败后编造业务结果
 ```
 
+### 12.1 瞬时错误和 Tool Retry
+
+只有幂等工具可以声明自动重试：
+
+```python
+retry_policy=ToolRetryPolicy(
+    max_retries=2,
+    retryable_codes=frozenset({"upstream_unavailable"}),
+    idempotent=True,
+)
+```
+
+工具只对明确瞬时错误抛出：
+
+```python
+raise RetryableToolError(
+    "上游暂时不可用",
+    code="upstream_unavailable",
+)
+```
+
+参数错误、权限拒绝、Approval 拒绝、业务校验失败和用户取消不得标记为 Retryable。
+
+写工具默认不配置自动 Retry。只有服务端具备 Idempotency Key 和结果核对机制时，才能单独设计。
+
 ---
 
 ## 13. 只读工具与写工具
@@ -713,6 +738,8 @@ AI 每次新增工具必须按顺序执行：
 - [ ] CancellationToken；
 - [ ] 进度 Update；
 - [ ] 独立 Timeout；
+- [ ] 已评估幂等性和 Retry Policy；
+- [ ] Retryable/Permanent 错误已区分；
 - [ ] 成功 Details 结构化；
 - [ ] 错误脱敏；
 - [ ] ToolRegistry 注册；

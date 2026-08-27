@@ -131,6 +131,7 @@ agent-loop/
 │  ├─ minimal_text.py                最简单的纯文本示例
 │  ├─ basic_usage.py                 任意输入、真实模型和编号事件示例
 │  ├─ real_model_usage.py            真实 OpenAI-compatible 模型示例
+│  ├─ retry_usage.py                 全部 Retry 能力离线演示
 │  ├─ mock_order_tools.py            模拟订单业务工具
 │  └─ business_routing_usage.py      强制业务工具路由示例
 ├─ tests/
@@ -142,6 +143,8 @@ agent-loop/
 │  ├─ test_budgets.py                Turn/Tool/并行预算测试
 │  ├─ test_basic_usage.py            动态命令行和调用原因测试
 │  ├─ test_provider_settings.py      Provider 配置测试
+│  ├─ test_retry.py                  模型和单工具重试测试
+│  ├─ test_retry_advanced.py         持久化/Circuit/Task/Compaction 测试
 │  ├─ test_provider_serialize.py     OpenAI 请求序列化测试
 │  ├─ test_provider_sse.py           SSE 分片测试
 │  ├─ test_openai_compatible_provider.py  HTTP 与 Agent 集成测试
@@ -160,6 +163,18 @@ agent-loop/
    ├─ loop.py                        低层 Agent Loop
    ├─ agent.py                       有状态 Agent 封装
    ├─ testing.py                     ScriptedProvider
+   ├─ retry/
+   │  ├─ types.py                    Model/Tool Retry Policy
+   │  ├─ classifier.py               瞬时错误分类
+   │  ├─ backoff.py                  Backoff/Jitter/可取消等待
+   │  ├─ model.py                    RetryingStreamFn
+   │  ├─ tool.py                     单逻辑 Tool Call 重试
+   │  ├─ task.py                     Task/Workflow Retry
+   │  ├─ events.py                   JSONL Retry Journal/Recovery
+   │  ├─ circuit_breaker.py          Circuit Breaker
+   │  ├─ compaction.py               Context Overflow 压缩重试
+   │  ├─ outcome.py                  outcome_unknown 状态核对
+   │  └─ errors.py                   Retryable/OutcomeUnknown Error
    ├─ providers/                     第三方大模型 Provider
    │  ├─ settings.py                 Provider TOML 配置
    │  ├─ factory.py                  Model/Provider 工厂
@@ -304,13 +319,13 @@ python -m unittest discover -s tests -v
 
 ```text
 ... ok
-Ran 80 tests
+Ran 98 tests
 OK
 ```
 
-表示八十个自动测试全部通过，并不是 Agent 又执行了八十个用户任务。
+表示九十八个自动测试全部通过，并不是 Agent 又执行了九十八个用户任务。
 
-八十个测试分别检查：
+九十八个测试分别检查：
 
 1. 最终回答能否进入 Agent 状态；
 2. 工具结果能否交回模型并触发第二次模型请求；
@@ -391,7 +406,25 @@ OK
 77. 工具指南是否包含实现、注册、测试和完成标准；
 78. 除法工具是否返回正确商和结构化 Details；
 79. 除法工具是否拒绝正零和负零；
-80. 除法工具是否使用独立 Timeout。
+80. 除法工具是否使用独立 Timeout；
+81. Provider 模型重试 TOML 是否正确加载；
+82. HTTP 429 Retry 是否保持一个逻辑模型调用；
+83. 模型 429 后是否重试同一个逻辑 Turn；
+84. 模型 401 是否明确不重试；
+85. 模型 Backoff 是否可被用户取消；
+86. 并行工具是否只重试失败的那个；
+87. 非 Retryable Tool Code 是否不重试；
+88. Tool Retry 耗尽是否只返回一个最终错误；
+89. 非幂等工具是否禁止配置自动重试；
+90. Retry JSONL 是否脱敏并支持进程恢复；
+91. Agent Retry 事件是否直接持久化；
+92. Circuit Breaker 是否支持 Open/Half-open/Closed；
+93. Circuit Open 是否阻止后续 Provider Attempt；
+94. 模型 Retry 是否受最大总耗时限制；
+95. Tool Retry 是否受最大总耗时限制；
+96. outcome_unknown 是否不重试并支持状态核对；
+97. TaskRetryExecutor 是否持久化并最终成功；
+98. Context Overflow 是否压缩后重试同一 Turn。
 
 ### 4.5 可选安装
 
@@ -1495,12 +1528,12 @@ python examples/basic_usage.py
 python -m unittest discover -s tests -v
 ```
 
-当前共有 80 项离线测试，覆盖 Agent Loop、Provider、业务路由、工具开发规范、加法/乘法/除法、Timeout、Approval 和 Guard。
+当前共有 98 项离线测试，覆盖 Agent Loop、Provider、Durable Retry、Circuit Breaker、Task Retry、Compaction、Outcome Reconciliation、业务路由和 Guard。
 
 只有看到：
 
 ```text
-Ran 80 tests
+Ran 98 tests
 OK
 ```
 
@@ -1840,12 +1873,14 @@ agent.prompt("任务二")  再获得一份新预算
 - `tests/test_routed_agent.py`：6 项强制工具与 Capability 测试；
 - `tests/test_simple_business_config.py`：3 项简化配置测试；
 - `tests/test_hybrid_router.py`：8 项混合路由测试；
-- `tests/test_business_requirements.py`：3 项 AI 需求与工具指南契约测试。
+- `tests/test_business_requirements.py`：3 项 AI 需求与工具指南契约测试；
+- `tests/test_retry.py`：7 项模型和单工具重试测试；
+- `tests/test_retry_advanced.py`：9 项持久化、Circuit、Task、Outcome 和 Compaction 测试。
 
 全部测试：
 
 ```text
-Ran 80 tests
+Ran 98 tests
 OK
 ```
 
@@ -2382,10 +2417,10 @@ tests/test_simple_business_config.py
 tests/test_hybrid_router.py
 ```
 
-覆盖简化配置矛盾、自由表达分类、低置信度、缺字段、Denied、Approval、工具指南契约和完整业务工具闭环。
+覆盖简化配置、Hybrid 路由、Denied、Approval、全部 Retry 层和完整业务工具闭环。
 
 ```text
-Ran 80 tests
+Ran 98 tests
 OK
 ```
 
@@ -2442,3 +2477,289 @@ TOOLS_IMPLEMENTATION_GUIDE.md
 - Definition of Done。
 
 `AGENTS.md` 已加入强制规则，契约测试会防止该指南或引用被误删。
+
+---
+
+## 26. 模型和单工具重试
+
+### 26.1 Provider 配置
+
+`providers.toml.example` 增加：
+
+```toml
+[profiles.third_party.retry]
+enabled = true
+max_retries = 2
+initial_delay_seconds = 0.5
+max_delay_seconds = 30
+jitter_ratio = 0.2
+retryable_statuses = [408, 409, 429, 500, 502, 503, 504]
+```
+
+旧本地配置没有 `[retry]` 时默认关闭，避免升级后突然产生额外收费请求。
+
+### 26.2 模型 Retry
+
+```text
+OpenAICompatibleProvider.stream
+→ RetryingStreamFn
+→ 一个逻辑模型 Turn
+→ 多个 HTTP/SSE Attempt
+```
+
+`provider.call_count` 统计逻辑模型调用，`provider.attempt_count` 统计包含重试的实际 HTTP Attempt。
+
+支持：
+
+- 结构化 Provider Error；
+- 408/409/429/5xx；
+- Timeout 和连接错误；
+- Retry-After；
+- 指数 Backoff；
+- Jitter；
+- CancellationToken；
+- 重试生命周期事件；
+- 失败 Partial Assistant 不进入 Agent Context。
+
+401/403/404、配额、业务错误和用户取消不重试。
+
+启用 Retry 时，每次 Attempt 的流事件会先缓冲；失败 Attempt 被丢弃，最终成功或最终失败 Attempt 才交给 Agent Loop。这样更安全，但会牺牲该次模型响应的实时 Token 展示。
+
+### 26.3 模型 Retry 事件
+
+```text
+model_retry_scheduled
+model_retry_attempt_start
+model_retry_finished
+```
+
+`basic_usage.py` 已提供中文解释。
+
+### 26.4 单工具 Retry
+
+工具显式声明：
+
+```python
+retry_policy=ToolRetryPolicy(
+    max_retries=2,
+    retryable_codes=frozenset({
+        "network_error",
+        "rate_limited",
+        "upstream_unavailable",
+    }),
+    idempotent=True,
+)
+```
+
+工具遇到瞬时错误时抛出：
+
+```python
+raise RetryableToolError(
+    "上游暂时不可用",
+    code="upstream_unavailable",
+    retry_after_seconds=1,
+)
+```
+
+非幂等工具无法创建自动 Retry Policy。
+
+### 26.5 并行工具
+
+```text
+A 成功
+B 瞬时失败
+C 成功
+```
+
+只重试 B，A/C 不会重复执行。Retry Backoff 不占 `max_parallel_tools` 槽位，每个新 Attempt 重新申请 Semaphore。
+
+同一个逻辑 Tool Call 最终只生成一个 ToolResult，重试耗尽时 details 包含：
+
+```text
+code
+retryable
+attempts
+retryId
+```
+
+### 26.6 Tool Retry 事件
+
+```text
+tool_retry_scheduled
+tool_retry_attempt_start
+tool_retry_finished
+```
+
+事件不会包含 API Key 或完整敏感参数。
+
+### 26.7 预算语义
+
+```text
+模型 Retry Attempt
+不增加 max_turns，但受 max_retries 限制
+
+工具 Retry Attempt
+不增加 max_tool_calls，但受 ToolRetryPolicy.max_retries 限制
+```
+
+工具总 Timeout 从第一次真正获得执行槽开始计算，包含后续 Attempt 和 Backoff；初次排队等待并发槽不消耗工具 Timeout。
+
+### 26.8 Durable Retry Journal
+
+```python
+store = JsonlRetryEventStore("state/retry-events.jsonl")
+agent = Agent(..., retry_event_sink=store.append)
+```
+
+模型和工具 Retry 的 Scheduled/AttemptStart/Finished 会在 Backoff 或 UI 发布前写入 JSONL。Journal 只允许脱敏元数据，不保存 Prompt、完整工具参数或 API Key。
+
+`state/` 已加入 `.gitignore`。
+
+### 26.9 进程恢复
+
+```python
+manager = RetryRecoveryManager(store)
+await manager.recover(handler)
+```
+
+启动时扫描没有 Finished 的 Retry Chain，并把每条 Chain 交给 Host 提供的恢复处理器。恢复开始和结束也会写入 Journal。
+
+恢复管理器不自行持久化或重放 Prompt；Host 必须根据 Session/业务状态安全重建操作。
+
+### 26.10 Circuit Breaker
+
+Provider Retry Policy 支持：
+
+```toml
+[profiles.third_party.retry.circuit_breaker]
+enabled = true
+failure_threshold = 3
+recovery_timeout_seconds = 30
+```
+
+状态：
+
+```text
+Closed
+→ 连续瞬时失败达到阈值
+→ Open 快速失败
+→ 等待恢复窗口
+→ Half-open 只允许一个探测
+→ 成功后 Closed
+```
+
+Circuit 当前是进程内状态，重启后重置。
+
+### 26.11 最大 Retry 总耗时
+
+模型：
+
+```toml
+max_elapsed_seconds = 120
+```
+
+工具和 Task Policy 也拥有 `max_elapsed_seconds`。如果下一次 Backoff 会超过总耗时，立即停止，不再等待。
+
+### 26.12 outcome_unknown
+
+写工具在“服务端可能成功、客户端未收到结果”时抛出：
+
+```python
+OutcomeUnknownToolError(
+    "操作结果不确定",
+    operation_id="operation-1",
+    idempotency_key="...",
+    reconciliation_name="check_operation",
+)
+```
+
+Agent 返回：
+
+```text
+code=outcome_unknown
+retryable=false
+```
+
+幂等键不会进入 ToolResult。使用 `OutcomeReconciliationRegistry` 注册状态核对器；核对器查询最终状态，不重放原写操作。
+
+### 26.13 Task/Workflow Retry
+
+```python
+executor = TaskRetryExecutor(
+    TaskRetryPolicy(
+        max_retries=2,
+        retryable_codes=frozenset({"worker_unavailable"}),
+        idempotent=True,
+    ),
+    event_store=store,
+)
+```
+
+该执行器适用于 Host 已经定义好的一个幂等 Task。它不负责把自然语言拆成多 Intent Plan，也不允许非幂等 Workflow 自动重试。
+
+### 26.14 Context Overflow Compaction Retry
+
+```python
+stream_fn = compact_on_context_overflow(
+    provider.stream,
+    CompactionRetryPolicy(
+        max_retries=1,
+        keep_recent_messages=20,
+    ),
+)
+```
+
+检测到 `context_overflow/context_length_exceeded` 后：
+
+```text
+丢弃失败 Assistant
+→ 压缩消息
+→ 同一逻辑 Turn 重试一次
+```
+
+默认 `SlidingWindowCompactor` 只是教学实现。生产系统应替换为 token-aware 摘要器，并维护 Tool Call/Tool Result 配对。
+
+### 26.15 使用当前工具测试全部 Retry
+
+全部离线演示：
+
+```bat
+python examples\retry_usage.py all
+```
+
+单独测试：
+
+```bat
+python examples\retry_usage.py model
+python examples\retry_usage.py tool
+python examples\retry_usage.py circuit
+python examples\retry_usage.py task
+python examples\retry_usage.py outcome
+python examples\retry_usage.py compaction
+python examples\retry_usage.py recovery
+```
+
+其中 `tool` 场景使用当前真实 `divide` 工具：第一次模拟上游瞬时失败，第二次执行 `10÷4` 成功。该模拟故障是工厂外层测试包装，不会污染 divide 的模型参数 Schema。
+
+查看持久 Journal：
+
+```bat
+type state\retry-demo.jsonl
+```
+
+运行自动测试：
+
+```bat
+python -m unittest tests.test_retry -v
+python -m unittest tests.test_retry_advanced -v
+python -m unittest discover -s tests -v
+```
+
+### 26.16 当前边界
+
+- Process Recovery 已实现 Chain 发现和 Handler 协调，但完整模型请求恢复仍依赖未来 Session Store；
+- Circuit 状态尚未跨进程持久化；
+- Sliding Window Compactor 不是生产摘要器；
+- TaskRetryExecutor 不是多 Intent PlanExecutor；
+- Outcome Reconciliation 需要真实业务提供查询 API；
+- 写工具默认不配置自动 Retry。

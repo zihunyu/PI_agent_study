@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -11,6 +14,7 @@ import httpx
 from ..cancellation import CancellationToken, OperationCancelledError
 from ..event_stream import AssistantMessageEventStream
 from ..messages import assistant_message
+from ..retry.model import RetryingStreamFn
 from ..types import Model
 from .errors import (
     ProviderAuthenticationError,
@@ -38,9 +42,13 @@ class OpenAICompatibleProvider:
     ) -> None:
         self.profile = profile
         self._transport = transport
-        # 供示例、监控和测试解释“本次 Agent 一共请求了几轮模型”。
-        # 每次调用 StreamFn 计一次，不记录 API Key 或请求正文。
+        # call_count 是逻辑模型 Turn；attempt_count 包含内部 Retry Attempt。
         self.call_count = 0
+        self.attempt_count = 0
+        self._retrying_stream = RetryingStreamFn(
+            self._stream_attempt,
+            profile.retry_policy,
+        )
 
     def stream(
         self,
@@ -50,8 +58,17 @@ class OpenAICompatibleProvider:
     ) -> AssistantMessageEventStream:
         """满足 Agent Loop 的 StreamFn 契约，并在后台执行 HTTP 请求。"""
 
-        stream = AssistantMessageEventStream()
         self.call_count += 1
+        return self._retrying_stream(model, context, options)
+
+    def _stream_attempt(
+        self,
+        model: Model,
+        context: dict[str, Any],
+        options: dict[str, Any],
+    ) -> AssistantMessageEventStream:
+        stream = AssistantMessageEventStream()
+        self.attempt_count += 1
         asyncio.create_task(self._run(stream, model, context, options))
         return stream
 
@@ -102,7 +119,7 @@ class OpenAICompatibleProvider:
                 await asyncio.gather(work, return_exceptions=True)
             self._push_error(stream, model, "aborted", str(error))
         except ProviderError as error:
-            self._push_error(stream, model, "error", str(error))
+            self._push_provider_error(stream, model, error)
         except asyncio.CancelledError:
             if not work.done():
                 work.cancel()
@@ -149,7 +166,7 @@ class OpenAICompatibleProvider:
                     headers=headers,
                     json=payload,
                 ) as response:
-                    self._raise_for_status(response.status_code)
+                    self._raise_for_status(response.status_code, response.headers)
                     content_type = response.headers.get("content-type", "")
                     if content_type and "text/event-stream" not in content_type:
                         raise ProviderProtocolError(
@@ -182,28 +199,55 @@ class OpenAICompatibleProvider:
             raise ProviderHTTPError("无法连接第三方模型 API") from error
 
     @staticmethod
-    def _raise_for_status(status_code: int) -> None:
+    def _raise_for_status(status_code: int, headers: httpx.Headers) -> None:
         if 200 <= status_code < 300:
             return
+        retry_after_ms = _retry_after_ms(headers)
         if status_code in {401, 403}:
             raise ProviderAuthenticationError(
                 "第三方 API 鉴权失败，请检查本地 providers.toml 中的 API Key。",
                 status_code=status_code,
+                retryable=False,
             )
         if status_code == 404:
             raise ProviderModelNotFoundError(
                 "第三方 API Endpoint 或配置的模型不存在",
                 status_code=status_code,
+                retryable=False,
             )
         if status_code == 429:
             raise ProviderRateLimitError(
                 "第三方 API 请求过多，请稍后重试",
                 status_code=status_code,
+                retry_after_ms=retry_after_ms,
+                retryable=True,
             )
         raise ProviderHTTPError(
             f"第三方 API 返回 HTTP {status_code}",
             status_code=status_code,
+            retry_after_ms=retry_after_ms,
+            retryable=status_code in {408, 409} or status_code >= 500,
         )
+
+    @staticmethod
+    def _push_provider_error(
+        stream: AssistantMessageEventStream,
+        model: Model,
+        error: ProviderError,
+    ) -> None:
+        final = assistant_message(
+            model=model,
+            content=[],
+            stop_reason="error",
+            error_message=str(error),
+        )
+        final["providerError"] = {
+            "code": error.code,
+            "statusCode": error.status_code,
+            "retryAfterMs": error.retry_after_ms,
+            "retryable": error.retryable,
+        }
+        stream.push({"type": "error", "reason": "error", "error": final})
 
     @staticmethod
     def _push_error(
@@ -219,3 +263,34 @@ class OpenAICompatibleProvider:
             error_message=message,
         )
         stream.push({"type": "error", "reason": reason, "error": final})
+
+
+def _retry_after_ms(headers: httpx.Headers) -> int | None:
+    """读取常见 Retry-After Header；无效或过去时间返回 None/0。"""
+
+    raw_ms = headers.get("retry-after-ms")
+    if raw_ms:
+        try:
+            value = float(raw_ms)
+            if math.isfinite(value) and value >= 0:
+                return round(value)
+        except ValueError:
+            pass
+
+    raw = headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+        if math.isfinite(seconds) and seconds >= 0:
+            return round(seconds * 1000)
+    except ValueError:
+        pass
+    try:
+        date = parsedate_to_datetime(raw)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        delta = (date - datetime.now(timezone.utc)).total_seconds()
+        return max(0, round(delta * 1000))
+    except (TypeError, ValueError, OverflowError):
+        return None

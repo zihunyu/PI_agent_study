@@ -30,6 +30,7 @@ class HybridModelRouter:
         model: Model,
         stream_fn: StreamFn,
         confidence_threshold: float = 0.65,
+        retry_event_sink: Any | None = None,
     ) -> None:
         if not 0 <= confidence_threshold <= 1:
             raise ValueError("confidence_threshold 必须在 0 到 1 之间")
@@ -38,6 +39,7 @@ class HybridModelRouter:
         self.model = model
         self.stream_fn = stream_fn
         self.confidence_threshold = confidence_threshold
+        self.retry_event_sink = retry_event_sink
         self.call_count = 0
 
     async def route(self, user_text: str) -> RequestDecision:
@@ -92,6 +94,7 @@ class HybridModelRouter:
                 "function": {"name": _ROUTE_TOOL_NAME},
             },
             "cancellation_token": CancellationToken(),
+            "retry_event_sink": self.retry_event_sink,
         }
         self.call_count += 1
         value = self.stream_fn(self.model, context, options)

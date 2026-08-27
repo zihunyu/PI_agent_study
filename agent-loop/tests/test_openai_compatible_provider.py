@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -16,6 +17,7 @@ from pi_agent_loop import (  # noqa: E402
     Agent,
     CancellationToken,
     Model,
+    ModelRetryPolicy,
     create_add_tool,
 )
 from pi_agent_loop.providers import (  # noqa: E402
@@ -132,6 +134,55 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(provider.call_count, 1)
 
+    async def test_429_按照_provider_policy_重试但逻辑调用只计一次(self) -> None:
+        attempts = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(
+                    429,
+                    headers={"retry-after-ms": "0"},
+                )
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse(
+                    chunk(delta={"content": "重试成功"}),
+                    chunk(finish_reason="stop"),
+                    "[DONE]",
+                ),
+            )
+
+        profile = replace(
+            self.profile,
+            retry_policy=ModelRetryPolicy(
+                enabled=True,
+                max_retries=2,
+                initial_delay_seconds=0,
+                max_delay_seconds=1,
+                jitter_ratio=0,
+            ),
+        )
+        provider = OpenAICompatibleProvider(
+            profile,
+            transport=httpx.MockTransport(handler),
+        )
+
+        events, result = await self.collect(
+            provider.stream(
+                self.model,
+                {"systemPrompt": "", "messages": [], "tools": []},
+                {},
+            )
+        )
+
+        self.assertEqual(result["content"][0]["text"], "重试成功")
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(provider.attempt_count, 2)
+        self.assertIn("model_retry_scheduled", [event["type"] for event in events])
+
     async def test_流式_tool_call_参数被安全组装(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -210,6 +261,15 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["type"], "error")
         self.assertEqual(result["stopReason"], "error")
         self.assertIn("鉴权失败", result["errorMessage"])
+        self.assertEqual(
+            result["providerError"],
+            {
+                "code": "provider_authentication_error",
+                "statusCode": 401,
+                "retryAfterMs": None,
+                "retryable": False,
+            },
+        )
         self.assertNotIn(self.secret, repr(events))
         self.assertNotIn(self.secret, repr(result))
 

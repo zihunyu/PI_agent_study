@@ -16,10 +16,13 @@ from mock_order_tools import create_mock_order_status_tool  # noqa: E402
 from pi_agent_loop import (  # noqa: E402
     Agent,
     BusinessConfigError,
+    CompactionRetryPolicy,
     CapabilityRegistry,
     HybridModelRouter,
+    JsonlRetryEventStore,
     ProviderConfigError,
     RoutedAgent,
+    compact_on_context_overflow,
     create_provider,
     load_agent_limits,
     load_provider_settings,
@@ -68,15 +71,21 @@ async def main() -> None:
         risk="low",
     )
     model, provider = create_provider(provider_settings)
+    retry_store = JsonlRetryEventStore(ROOT / "state" / "retry-events.jsonl")
     router = HybridModelRouter(
         business_config,
         capabilities,
         model=model,
         stream_fn=provider.stream,
+        retry_event_sink=retry_store.append,
+    )
+    compacting_stream = compact_on_context_overflow(
+        provider.stream,
+        CompactionRetryPolicy(max_retries=1, keep_recent_messages=20),
     )
     agent = Agent(
         model=model,
-        stream_fn=provider.stream,
+        stream_fn=compacting_stream,
         system_prompt=(
             "你是订单业务助手。必须遵守 Tool Choice 和业务范围策略；"
             "不能根据语言模型知识猜测订单实时状态。"
@@ -84,6 +93,7 @@ async def main() -> None:
         max_turns=limits.max_turns,
         max_tool_calls=limits.max_tool_calls,
         max_parallel_tools=limits.max_parallel_tools,
+        retry_event_sink=retry_store.append,
     )
     routed = RoutedAgent(agent, router, capabilities)
 

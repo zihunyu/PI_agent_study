@@ -28,3 +28,6 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Retry Journal、Checkpoint 等本地运行状态禁止提交。
+/state/

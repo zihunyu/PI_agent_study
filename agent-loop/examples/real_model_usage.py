@@ -19,7 +19,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from pi_agent_loop import (  # noqa: E402
     Agent,
+    CompactionRetryPolicy,
+    JsonlRetryEventStore,
     ProviderConfigError,
+    compact_on_context_overflow,
     create_calculator_tools,
     create_provider,
     load_agent_limits,
@@ -40,9 +43,14 @@ async def main() -> None:
 
     model, provider = create_provider(provider_settings)
 
+    retry_store = JsonlRetryEventStore(ROOT / "state" / "retry-events.jsonl")
+    compacting_stream = compact_on_context_overflow(
+        provider.stream,
+        CompactionRetryPolicy(max_retries=1, keep_recent_messages=20),
+    )
     agent = Agent(
         model=model,
-        stream_fn=provider.stream,
+        stream_fn=compacting_stream,
         system_prompt=(
             "你是一个中文助手。需要计算加法或乘法时必须调用已有工具，"
             "读取工具结果后再回答。"
@@ -52,6 +60,7 @@ async def main() -> None:
         max_tool_calls=limits.max_tool_calls,
         max_parallel_tools=limits.max_parallel_tools,
         max_turns=limits.max_turns,
+        retry_event_sink=retry_store.append,
     )
 
     def print_stream(event, _cancellation) -> None:
