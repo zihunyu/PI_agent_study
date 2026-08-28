@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..async_utils import durable_to_thread
 from .operation_events import OperationEvent
 
 OperationEventSpec = tuple[str, dict[str, Any]]
@@ -18,7 +19,13 @@ class OperationStoreConflictError(RuntimeError):
     """条件追加或唯一约束失败；调用方必须重新读取并重新判断。"""
 
 
+class OperationStoreDeadlineExceeded(OperationStoreConflictError):
+    """事务开始后发现业务截止时间已经到期。"""
+
+
 class OperationEventStore(Protocol):
+    supports_atomic_transactions: bool
+
     async def append(
         self,
         event_type: str,
@@ -34,6 +41,7 @@ class OperationEventStore(Protocol):
         events: list[OperationEventSpec],
         *,
         expected_last_sequence: int | None = None,
+        deadline_ms: int | None = None,
     ) -> list[OperationEvent]: ...
 
     async def load(
@@ -61,6 +69,8 @@ class OperationEventStore(Protocol):
 
 
 class InMemoryOperationEventStore:
+    supports_atomic_transactions = True
+
     def __init__(self) -> None:
         self._events: list[OperationEvent] = []
         self._lock = asyncio.Lock()
@@ -82,6 +92,7 @@ class InMemoryOperationEventStore:
         events: list[OperationEventSpec],
         *,
         expected_last_sequence: int | None = None,
+        deadline_ms: int | None = None,
     ) -> list[OperationEvent]:
         _validate_batch(events)
         async with self._lock:
@@ -91,6 +102,8 @@ class InMemoryOperationEventStore:
                 operation_id,
             )
             _check_expected(current, expected_last_sequence)
+            _check_deadline(deadline_ms)
+            _check_unique_operation_facts(self._events, events)
             appended: list[OperationEvent] = []
             for event_type, data in events:
                 event = OperationEvent(
@@ -149,7 +162,9 @@ class InMemoryOperationEventStore:
 
 
 class JsonlOperationEventStore:
-    """单实例、单进程 JSONL 兼容实现；生产多写者使用 SQLite Store。"""
+    """单实例、单进程 JSONL 兼容实现；不承诺崩溃时批次原子性。"""
+
+    supports_atomic_transactions = False
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -174,16 +189,19 @@ class JsonlOperationEventStore:
         events: list[OperationEventSpec],
         *,
         expected_last_sequence: int | None = None,
+        deadline_ms: int | None = None,
     ) -> list[OperationEvent]:
         _validate_batch(events)
         async with self._lock:
-            existing = await asyncio.to_thread(self._load_sync)
+            existing = await durable_to_thread(self._load_sync)
             current = _last_operation_sequence(
                 existing,
                 session_id,
                 operation_id,
             )
             _check_expected(current, expected_last_sequence)
+            _check_deadline(deadline_ms)
+            _check_unique_operation_facts(existing, events)
             if self._next_sequence is None:
                 self._next_sequence = (
                     existing[-1].sequence + 1 if existing else 0
@@ -200,7 +218,7 @@ class JsonlOperationEventStore:
                     )
                 )
                 self._next_sequence += 1
-            await asyncio.to_thread(self._append_many_sync, appended)
+            await durable_to_thread(self._append_many_sync, appended)
             return appended
 
     def _append_many_sync(self, events: list[OperationEvent]) -> None:
@@ -220,7 +238,7 @@ class JsonlOperationEventStore:
 
     async def load(self, *, session_id=None, operation_id=None):
         async with self._lock:
-            events = await asyncio.to_thread(self._load_sync)
+            events = await durable_to_thread(self._load_sync)
         return [
             event
             for event in events
@@ -316,6 +334,13 @@ def _check_expected(current: int, expected: int | None) -> None:
         )
 
 
+def _check_deadline(deadline_ms: int | None) -> None:
+    if deadline_ms is not None and int(time.time() * 1000) >= deadline_ms:
+        raise OperationStoreDeadlineExceeded(
+            f"事务截止时间已到：deadline={deadline_ms}"
+        )
+
+
 def _validate_batch(events: list[OperationEventSpec]) -> None:
     if not events:
         raise ValueError("Operation Event Batch 不能为空")
@@ -334,3 +359,33 @@ def _validate_claim(
         raise ValueError("Claim 必须包含 type/resource/owner")
     if lease_seconds <= 0:
         raise ValueError("Claim lease_seconds 必须大于 0")
+
+
+def _check_unique_operation_facts(
+    existing: list[OperationEvent],
+    specs: list[OperationEventSpec],
+) -> None:
+    """让内存/JSONL Store 与 SQLite 的关键全局唯一约束一致。"""
+
+    constraints = (
+        ("approval_requested", "approvalId"),
+        ("write_prepared", "writeId"),
+        ("write_prepared", "idempotencyKeyHash"),
+    )
+    for event_type, key in constraints:
+        known = {
+            str(event.data.get(key))
+            for event in existing
+            if event.type == event_type and event.data.get(key) is not None
+        }
+        incoming = [
+            str(data.get(key))
+            for candidate_type, data in specs
+            if candidate_type == event_type and data.get(key) is not None
+        ]
+        if len(incoming) != len(set(incoming)) or any(
+            value in known for value in incoming
+        ):
+            raise OperationStoreConflictError(
+                f"Operation 唯一事实冲突：{event_type}.{key}"
+            )

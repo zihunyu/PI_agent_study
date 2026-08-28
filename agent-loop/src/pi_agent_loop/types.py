@@ -14,9 +14,6 @@ from typing import Any, Literal, TypeAlias
 from .cancellation import CancellationToken
 from .retry.types import ToolRetryPolicy
 
-if False:  # 仅供静态类型工具理解，运行时不会导入，避免循环依赖。
-    from .event_stream import AssistantMessageEventStream
-
 ToolExecutionMode: TypeAlias = Literal["sequential", "parallel"]
 ToolExecutionPolicyMode: TypeAlias = Literal[
     "parallel",
@@ -25,6 +22,7 @@ ToolExecutionPolicyMode: TypeAlias = Literal[
     "sequential",  # 向后兼容别名，调度时等价于 exclusive。
 ]
 ToolReplayPolicy: TypeAlias = Literal["never", "safe"]
+ToolResourceAccess: TypeAlias = Literal["read", "write"]
 QueueMode: TypeAlias = Literal["all", "one-at-a-time"]
 ThinkingLevel: TypeAlias = Literal[
     "off", "minimal", "low", "medium", "high", "xhigh", "max"
@@ -90,12 +88,26 @@ class AgentTool:
     retry_policy: ToolRetryPolicy | None = None
     # 崩溃发生在 Dispatch 后时，safe 才允许 Recovery 重放。
     replay_policy: ToolReplayPolicy = "never"
+    # 调度优先级，数值越大越先获得并发槽；相同优先级保持 FIFO。
+    priority: int = 0
+    # resource_locked 工具可声明共享读或独占写，默认保持旧版独占语义。
+    resource_access: ToolResourceAccess = "write"
+    # 等待资源锁的最长时间；None 表示由 Runtime 使用默认值。
+    lock_timeout_seconds: float | None = None
+    # 可选租户解析器，用于同租户并发限制。
+    resolve_tenant_id: Callable[[Any], str | None] | None = None
 
     def __post_init__(self) -> None:
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("工具 timeout_seconds 必须大于 0")
         if self.replay_policy not in {"never", "safe"}:
             raise ValueError("工具 replay_policy 必须是 never 或 safe")
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int):
+            raise ValueError("工具 priority 必须是整数")
+        if self.resource_access not in {"read", "write"}:
+            raise ValueError("工具 resource_access 必须是 read 或 write")
+        if self.lock_timeout_seconds is not None and self.lock_timeout_seconds <= 0:
+            raise ValueError("工具 lock_timeout_seconds 必须大于 0")
         if self.execution_mode not in {
             None,
             "parallel",
@@ -108,6 +120,8 @@ class AgentTool:
             raise ValueError("resource_locked 工具必须提供 resolve_resource_keys")
         if self.execution_mode != "resource_locked" and self.resolve_resource_keys is not None:
             raise ValueError("只有 resource_locked 工具可以提供 resolve_resource_keys")
+        if self.execution_mode != "resource_locked" and self.resource_access != "write":
+            raise ValueError("只有 resource_locked 工具可以声明 read 资源访问")
 
 
 @dataclass(slots=True)
@@ -203,6 +217,10 @@ class AgentLoopConfig:
     max_tool_calls: int | None = None
     max_parallel_tools: int | None = None
     max_turns: int | None = None
+    # 普通 Loop 与 Recovery 可共享同一个 ToolDispatchRuntime。
+    tool_runtime: Any | None = None
+    # 由 Host/认证边界注入；不得从模型 Tool Arguments 推导租户身份。
+    tenant_id: str | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -219,6 +237,10 @@ class AgentLoopConfig:
             and self.default_tool_timeout_seconds <= 0
         ):
             raise ValueError("default_tool_timeout_seconds 必须大于 0 或为 None")
+        if self.tenant_id is not None and (
+            not isinstance(self.tenant_id, str) or not self.tenant_id.strip()
+        ):
+            raise ValueError("tenant_id 必须是非空字符串或 None")
 
     transform_context: Callable[
         [list[AgentMessage], CancellationToken], MaybeAwaitable

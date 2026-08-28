@@ -20,6 +20,7 @@ class RuntimeStateTracker:
         self.store = store
         self.state = state
         self._lock = asyncio.Lock()
+        self._active_model_identity: dict[str, Any] = {}
 
     @classmethod
     async def create(cls, store: RuntimeEventStore) -> "RuntimeStateTracker":
@@ -35,12 +36,25 @@ class RuntimeStateTracker:
 
     async def listener(self, event: dict[str, Any], cancellation: Any) -> None:
         async with self._lock:
+            if event.get("type") == "model_request_start":
+                # The Operation recorder and model boundary consume the same
+                # mutable lifecycle event after this listener runs.
+                if self.state.run_id is not None and not self.state.terminal:
+                    event["runId"] = self.state.run_id
             converted = self._convert_agent_event(
                 event,
                 cancelled=bool(getattr(cancellation, "cancelled", False)),
             )
             for event_type, data in converted:
                 await self._append(event_type, data)
+            if event.get("type") == "model_request_start":
+                self._active_model_identity = _model_identity_data(event)
+            elif (
+                event.get("type") == "message_end"
+                and isinstance(event.get("message"), dict)
+                and event["message"].get("role") == "assistant"
+            ):
+                self._active_model_identity = {}
 
     async def record_external(
         self,
@@ -88,10 +102,18 @@ class RuntimeStateTracker:
             return [("run_started", {})]
         if event_type == "turn_start":
             return [("turn_started", {"turn": self.state.turn + 1})]
+        if event_type == "model_request_start":
+            return [(
+                "model_request_started",
+                _model_identity_data(event),
+            )]
         if event_type == "message_start":
             message = event.get("message", {})
             if message.get("role") == "assistant":
-                return [("model_request_started", {})]
+                # Compatibility fallback for custom/legacy loops that do not
+                # emit the explicit model_request_start boundary.
+                if "requestId" not in self._active_model_identity:
+                    return [("model_request_started", {})]
             return []
         if event_type == "message_end":
             message = event.get("message", {})
@@ -105,6 +127,10 @@ class RuntimeStateTracker:
                     "errorCode": details.get("code")
                     if isinstance(details, dict)
                     else None,
+                    **_model_identity_data(
+                        event,
+                        fallback=self._active_model_identity,
+                    ),
                 },
             )]
         if event_type == "tool_execution_start":
@@ -170,6 +196,19 @@ class RuntimeStateTracker:
                 outcome = "completed"
             return [("run_finished", {"outcome": outcome})]
         return []
+
+
+def _model_identity_data(
+    event: dict[str, Any],
+    *,
+    fallback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data: dict[str, Any] = dict(fallback or {})
+    for name in ("requestId", "sessionId", "operationId"):
+        value = event.get(name)
+        if isinstance(value, str) and value:
+            data[name] = value
+    return data
 
 
 def _retry_data(event: dict[str, Any]) -> dict[str, Any]:

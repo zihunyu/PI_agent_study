@@ -236,7 +236,7 @@ class RoutedAgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(second.visible_tool_names, ("get_order_status",))
         self.assertEqual(second.tool_choice, "auto")
-        self.assertEqual(second.expected_tool_arguments, {})
+        self.assertIsNone(second.expected_tool_arguments)
 
     async def test_capability_missing_不调用模型(self) -> None:
         provider = ScriptedProvider([])

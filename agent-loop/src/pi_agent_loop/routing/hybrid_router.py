@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
 
 from ..cancellation import CancellationToken
@@ -40,9 +41,56 @@ class HybridModelRouter:
         self.stream_fn = stream_fn
         self.confidence_threshold = confidence_threshold
         self.retry_event_sink = retry_event_sink
+        self._durable_metadata_provider: (
+            Callable[[], Mapping[str, Any]] | None
+        ) = None
         self.call_count = 0
+        self._evaluation_metrics: dict[str, int | float] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost": 0.0,
+        }
+
+    def bind_runtime(
+        self,
+        *,
+        stream_fn: StreamFn,
+        retry_event_sink: Any | None,
+        durable_metadata_provider: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> HybridModelRouter:
+        """Create an independent per-Host router bound to one model runtime.
+
+        A router passed to ``DurableAgentHost.create`` is caller-owned and may
+        be reused as a configuration template.  Mutating that object would let
+        a later Host replace the stream and journal callbacks used by an
+        earlier Host.  The shallow copy intentionally shares the immutable
+        business configuration and capability registry, while all known
+        request-scoped state is reset on the bound instance.
+
+        Subclasses with additional mutable request state should override this
+        method and clone that state as well.
+        """
+
+        bound = copy.copy(self)
+        bound.stream_fn = stream_fn
+        bound.retry_event_sink = retry_event_sink
+        bound._durable_metadata_provider = durable_metadata_provider
+        bound.call_count = 0
+        bound._evaluation_metrics = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost": 0.0,
+        }
+        return bound
 
     async def route(self, user_text: str) -> RequestDecision:
+        # Rule-only routes and failed calls must not inherit metrics from the
+        # preceding evaluation case.
+        self._evaluation_metrics = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost": 0.0,
+        }
         text = user_text.strip()
         if not text:
             return RequestDecision(
@@ -95,7 +143,17 @@ class HybridModelRouter:
             },
             "cancellation_token": CancellationToken(),
             "retry_event_sink": self.retry_event_sink,
+            "model_request_source": "router",
         }
+        if self._durable_metadata_provider is not None:
+            metadata = self._durable_metadata_provider()
+            if not isinstance(metadata, Mapping):
+                raise TypeError("Router durable metadata provider 必须返回 Mapping")
+            options["durable_metadata"] = {
+                str(key): copy.deepcopy(value)
+                for key, value in metadata.items()
+                if isinstance(value, str) and value
+            }
         self.call_count += 1
         value = self.stream_fn(self.model, context, options)
         stream = (
@@ -108,6 +166,7 @@ class HybridModelRouter:
         async for _event in stream:
             pass
         message = await stream.result()
+        self._evaluation_metrics = _message_evaluation_metrics(message)
         if message.get("stopReason") in {"error", "aborted"}:
             raise RuntimeError("业务 Intent 分类模型请求失败")
         calls = [
@@ -120,6 +179,11 @@ class HybridModelRouter:
         if len(calls) != 1 or not isinstance(calls[0].get("arguments"), dict):
             raise ValueError("分类模型没有返回唯一的结构化 Intent Tool Call")
         return calls[0]["arguments"]
+
+    def evaluation_metrics(self) -> dict[str, int | float]:
+        """Return measured usage for the immediately preceding route call."""
+
+        return dict(self._evaluation_metrics)
 
     def _routing_tool(self) -> dict[str, Any]:
         decisions = [intent.id for intent in self.config.intents]
@@ -384,3 +448,25 @@ def _normalize(value: str) -> str:
 
 def _domain_from_intent(intent_id: str) -> str:
     return intent_id.split(".", 1)[0] if "." in intent_id else "business"
+
+
+def _message_evaluation_metrics(message: Any) -> dict[str, int | float]:
+    if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
+        return {"input_tokens": 0, "output_tokens": 0, "cost": 0.0}
+    usage = message["usage"]
+    input_tokens = usage.get("input", usage.get("inputTokens", 0))
+    output_tokens = usage.get("output", usage.get("outputTokens", 0))
+    cost_value = usage.get("cost", 0.0)
+    if isinstance(cost_value, dict):
+        cost_value = cost_value.get("total", 0.0)
+    if isinstance(input_tokens, bool) or not isinstance(input_tokens, int) or input_tokens < 0:
+        input_tokens = 0
+    if isinstance(output_tokens, bool) or not isinstance(output_tokens, int) or output_tokens < 0:
+        output_tokens = 0
+    if isinstance(cost_value, bool) or not isinstance(cost_value, (int, float)):
+        cost_value = 0.0
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost": float(cost_value),
+    }

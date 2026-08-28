@@ -54,9 +54,9 @@ class ParallelCleanupTests(unittest.IsolatedAsyncioTestCase):
             execution_mode="parallel",
         )
 
-    async def test_tool_end_listener_异常会取消兄弟工具内部_execute_task(self) -> None:
+    async def test_tool_end_listener_异常不会取消已提交的兄弟工具(self) -> None:
         slow_started = asyncio.Event()
-        slow_cancelled = asyncio.Event()
+        slow_completed = asyncio.Event()
 
         async def fast(_id, _args, _token, _update):
             await slow_started.wait()
@@ -64,11 +64,8 @@ class ParallelCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         async def slow(_id, _args, _token, _update):
             slow_started.set()
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                slow_cancelled.set()
-                raise
+            await asyncio.sleep(0.01)
+            slow_completed.set()
             return AgentToolResult(content=[], details={})
 
         agent = Agent(
@@ -89,11 +86,12 @@ class ParallelCleanupTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("primary-listener-error")
 
         agent.subscribe(listener)
-        await agent.prompt("触发并行清理")
+        await agent.prompt("触发 Commit Boundary")
         await asyncio.sleep(0)
 
-        self.assertTrue(slow_cancelled.is_set())
-        self.assertEqual(agent.state.error_message, "primary-listener-error")
+        self.assertTrue(slow_completed.is_set())
+        self.assertTrue(agent.listener_errors)
+        self.assertIn("primary-listener-error", agent.listener_errors[0])
         self.assertEqual(_live_tool_tasks(), [])
 
     async def test_update_listener_异常后仍然_detach_子令牌(self) -> None:
@@ -132,7 +130,7 @@ class ParallelCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.state.error_message, "update-listener-error")
         self.assertEqual(_live_tool_tasks(), [])
 
-    async def test_清理阶段工具异常不能覆盖主要_listener_异常(self) -> None:
+    async def test_tool_end_listener异常不会触发虚假的兄弟取消清理(self) -> None:
         slow_started = asyncio.Event()
         cleanup_reached = asyncio.Event()
 
@@ -140,21 +138,21 @@ class ParallelCleanupTests(unittest.IsolatedAsyncioTestCase):
             await slow_started.wait()
             return AgentToolResult(content=[], details={})
 
-        async def bad_cleanup(_id, _args, _token, _update):
+        async def sibling(_id, _args, _token, _update):
             slow_started.set()
             try:
-                await asyncio.sleep(10)
+                await asyncio.sleep(0.01)
             except asyncio.CancelledError:
                 cleanup_reached.set()
-                raise RuntimeError("secondary-cleanup-error")
+                raise
             return AgentToolResult(content=[], details={})
 
         agent = Agent(
             model=self.model,
-            stream_fn=self.provider("fast", "bad-cleanup").stream,
+            stream_fn=self.provider("fast", "sibling").stream,
             tools=[
                 self.tool("fast", fast),
-                self.tool("bad-cleanup", bad_cleanup),
+                self.tool("sibling", sibling),
             ],
         )
         raised = False
@@ -166,10 +164,10 @@ class ParallelCleanupTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("primary-listener-error")
 
         agent.subscribe(listener)
-        await agent.prompt("保留主要异常")
+        await agent.prompt("Commit 后 Observer 失败")
 
-        self.assertTrue(cleanup_reached.is_set())
-        self.assertEqual(agent.state.error_message, "primary-listener-error")
+        self.assertFalse(cleanup_reached.is_set())
+        self.assertTrue(agent.listener_errors)
 
     async def test_用户取消后没有_tool_timer_waiter_update_task_残留(self) -> None:
         started = asyncio.Event()

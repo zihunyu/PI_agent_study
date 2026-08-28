@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from pi_agent_loop import (  # noqa: E402
     ApprovalResumeCoordinator,
     ApprovalService,
+    DurableActionEnvelope,
     DurableSessionRecovery,
     IdentityClaim,
     InMemoryOperationEventStore,
@@ -59,16 +60,6 @@ class ApprovalAwareRecoveryTests(unittest.IsolatedAsyncioTestCase):
             oid,
             {"message": {"role": "user", "content": [{"type": "text", "text": "退款"}]}},
         )
-        assistant = assistant_message(
-            model=self.model,
-            stop_reason="toolUse",
-            content=[{
-                "type": "toolCall",
-                "id": "refund-call",
-                "name": "refund",
-                "arguments": {"order_id": "1001"},
-            }],
-        )
         policy = ModelRequestPolicy(
             visible_tool_names=("refund",),
             tool_choice="required",
@@ -82,33 +73,25 @@ class ApprovalAwareRecoveryTests(unittest.IsolatedAsyncioTestCase):
             oid,
             {"policy": policy.to_dict()},
         )
-        await store.append(
-            "model_request_started",
-            sid,
-            oid,
-            {"requestId": "r1", "requestPolicy": policy.to_dict()},
-        )
-        await store.append(
-            "model_request_completed",
-            sid,
-            oid,
-            {"requestId": "r1", "message": assistant},
-        )
         operator, manager = await self.identities()
         approvals = ApprovalService(store)
         coordinator = ApprovalResumeCoordinator(store, approvals)
+        envelope = DurableActionEnvelope(
+            operation_id=oid,
+            tool_call_id="refund-call",
+            tool_name="refund",
+            arguments={"order_id": "1001"},
+            write_id="refund-write",
+        )
         pending = await coordinator.request(
             session_id=sid,
             operation_id=oid,
             requester=operator,
-            action={"tool": "refund", "arguments": {"order_id": "1001"}},
+            action=envelope.to_dict(),
             action_summary="退款订单 1001",
             required_role="approver",
-            resume_payload={
-                "toolCallId": "refund-call",
-                "toolName": "refund",
-                "arguments": {"order_id": "1001"},
-            },
+            resume_payload={},
+            idempotency_key="refund-write-key",
         )
         return store, approvals, pending, operator, manager
 
@@ -232,6 +215,17 @@ class ApprovalAwareRecoveryTests(unittest.IsolatedAsyncioTestCase):
             requires_approval=False,
             tool_call_id="refund-call",
         )
+        await store.append(
+            "tool_intent_recorded",
+            "session-1",
+            "operation-1",
+            {
+                "toolCallId": "refund-call",
+                "toolName": "refund",
+                "arguments": {"order_id": "1001"},
+                "replayPolicy": "never",
+            },
+        )
 
         async def uncertain(*_args):
             raise OutcomeUnknownToolError(
@@ -257,17 +251,6 @@ class ApprovalAwareRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_waiting_approval_禁止_tool_dispatch(self) -> None:
         store, _approvals, _pending, _operator, _manager = await self.approval_case()
-        await store.append(
-            "tool_intent_recorded",
-            "session-1",
-            "operation-1",
-            {
-                "toolCallId": "refund-call",
-                "toolName": "refund",
-                "arguments": {"order_id": "1001"},
-                "replayPolicy": "never",
-            },
-        )
         await store.append(
             "tool_dispatch_started",
             "session-1",

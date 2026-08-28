@@ -28,6 +28,7 @@ class ConfigGitIgnoreTests(unittest.TestCase):
         self.assertTrue(self.check_ignored("local-state.sqlite3"))
         self.assertTrue(self.check_ignored("local-state.sqlite3-wal"))
         self.assertTrue(self.check_ignored("local-state.sqlite3-shm"))
+        self.assertTrue(self.check_ignored("private/.agent-journal.key"))
 
     def test_example_配置允许提交(self) -> None:
         self.assertFalse(self.check_ignored("config/agent.toml.example"))

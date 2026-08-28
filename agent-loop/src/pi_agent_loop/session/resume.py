@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from ..model_policy import ModelRequestPolicy
+from ..durable_action import DurableActionEnvelope, DurableActionEnvelopeError
+from ..model_policy import (
+    ModelRequestPolicy,
+    ModelRequestPolicyError,
+    validate_recoverable_model_response,
+)
 from .operation_state import (
     OperationState,
     ToolInvocationState,
@@ -51,6 +58,23 @@ class OperationRecoveryPlanner:
         guarded_actions = self._approval_write_actions(operation)
         if guarded_actions:
             return OperationRecoveryPlan(operation, guarded_actions)
+        if (
+            operation.phase == "waiting_approval"
+            and not operation.approvals
+            and not operation.writes
+        ):
+            return OperationRecoveryPlan(
+                operation,
+                (
+                    RecoveryAction(
+                        kind="manual_intervention",
+                        reason=(
+                            "Operation 标记 waiting_approval 但缺少 Approval/Write "
+                            "持久事实，禁止恢复执行 Tool"
+                        ),
+                    ),
+                ),
+            )
 
         pending_requests = [
             request
@@ -93,6 +117,23 @@ class OperationRecoveryPlanner:
             ),
             None,
         )
+        if (
+            last_assistant is not None
+            and last_assistant.get("stopReason")
+            in {"error", "aborted", "length"}
+        ):
+            return OperationRecoveryPlan(
+                operation,
+                (
+                    RecoveryAction(
+                        kind="manual_intervention",
+                        reason=(
+                            "最后 Model Request 未成功结束："
+                            + str(last_assistant.get("stopReason"))
+                        ),
+                    ),
+                ),
+            )
         tool_results = {
             str(message.get("toolCallId"))
             for message in operation.messages
@@ -194,13 +235,66 @@ class OperationRecoveryPlanner:
                     )
                 )
             elif write.state == "waiting_approval":
-                actions.append(
-                    RecoveryAction(
-                        kind="wait_for_approval",
-                        reason="写操作仍在等待审批",
-                        **common,
-                    )
+                approval = (
+                    operation.approvals.get(write.approval_id)
+                    if write.approval_id is not None
+                    else None
                 )
+                if approval is None:
+                    actions.append(
+                        RecoveryAction(
+                            kind="manual_intervention",
+                            reason="Waiting Write 缺少关联 Approval",
+                            **common,
+                        )
+                    )
+                elif approval.state == "waiting":
+                    actions.append(
+                        RecoveryAction(
+                            kind="wait_for_approval",
+                            reason="写操作仍在等待审批",
+                            **common,
+                        )
+                    )
+                elif approval.state == "approved":
+                    actions.append(
+                        RecoveryAction(
+                            kind="consume_approval",
+                            reason="关联 Approval 已批准，等待可信 Consumer 消费",
+                            **common,
+                        )
+                    )
+                elif approval.state in {"consumed", "resume_started"}:
+                    actions.append(
+                        RecoveryAction(
+                            kind="resume_approved_write",
+                            reason="关联 Approval 已消费，可以恢复 Write Claim",
+                            **common,
+                        )
+                    )
+                elif approval.state in {
+                    "rejected",
+                    "expired",
+                    "resume_cancelled",
+                }:
+                    actions.append(
+                        RecoveryAction(
+                            kind="finalize_rejected_approval",
+                            reason=f"关联 Approval 状态为 {approval.state}",
+                            **common,
+                        )
+                    )
+                else:
+                    actions.append(
+                        RecoveryAction(
+                            kind="manual_intervention",
+                            reason=(
+                                "Waiting Write 的 Approval 状态无法自动恢复："
+                                + approval.state
+                            ),
+                            **common,
+                        )
+                    )
             elif write.state in {"prepared", "approved"}:
                 actions.append(
                     RecoveryAction(
@@ -220,11 +314,24 @@ class OperationRecoveryPlanner:
                 # 普通 WriteOperation Approval 已消费，无独立 Resume Workflow。
                 continue
             action = approval.action
+            try:
+                envelope = DurableActionEnvelope.from_dict(action)
+            except DurableActionEnvelopeError:
+                envelope = None
             common = {
                 "approval_id": approval.approval_id,
                 "tool_call_id": approval.tool_call_id,
-                "tool_name": str(action.get("tool", "")) or None,
-                "arguments": dict(action.get("arguments", {})),
+                "tool_name": (
+                    envelope.tool_name
+                    if envelope is not None
+                    else str(action.get("tool", "")) or None
+                ),
+                "arguments": (
+                    dict(envelope.arguments)
+                    if envelope is not None
+                    else dict(action.get("arguments", {}))
+                ),
+                "write_id": approval.write_id,
             }
             if approval.state == "waiting":
                 actions.append(
@@ -319,6 +426,10 @@ class RecoveryCallbacks:
     consume_approval: Callable[[RecoveryAction], Awaitable[Any]] | None = None
     resume_write: Callable[[RecoveryAction], Awaitable[Any]] | None = None
     reconcile_write: Callable[[RecoveryAction], Awaitable[Any]] | None = None
+    request_model_with_context: Callable[
+        [list[dict[str, Any]], ModelRequestPolicy, dict[str, str]],
+        Awaitable[dict[str, Any]],
+    ] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,12 +439,39 @@ class RecoveryExecutionResult:
     remaining_actions: tuple[RecoveryAction, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _RecoveryClaim:
+    resource_id: str
+    owner_token: str
+    lost: asyncio.Event
+
+
 class DurableSessionRecovery:
     """加载、规划并通过 Host 回调安全恢复一个 Operation。"""
 
-    def __init__(self, store: OperationEventStore) -> None:
+    def __init__(
+        self,
+        store: OperationEventStore,
+        *,
+        claim_lease_seconds: float = 300,
+        renew_interval: float | None = None,
+    ) -> None:
+        if claim_lease_seconds <= 0:
+            raise ValueError("claim_lease_seconds 必须大于 0")
+        resolved_renew_interval = (
+            renew_interval
+            if renew_interval is not None
+            else min(60.0, claim_lease_seconds / 3)
+        )
+        if (
+            resolved_renew_interval <= 0
+            or resolved_renew_interval >= claim_lease_seconds
+        ):
+            raise ValueError("renew_interval 必须大于 0 且小于 Lease 时长")
         self.store = store
         self.planner = OperationRecoveryPlanner()
+        self.claim_lease_seconds = claim_lease_seconds
+        self.renew_interval = resolved_renew_interval
 
     async def plan(
         self,
@@ -363,6 +501,7 @@ class DurableSessionRecovery:
             "operation_recovery",
             resource_id,
             owner_token,
+            lease_seconds=self.claim_lease_seconds,
         )
         if not acquired:
             plan = await self.plan(
@@ -374,14 +513,24 @@ class DurableSessionRecovery:
                 "recovery_claimed",
                 plan.actions,
             )
+        claim = _RecoveryClaim(resource_id, owner_token, asyncio.Event())
+        heartbeat = asyncio.create_task(
+            self._renew_claim(claim),
+            name=f"operation-recovery-heartbeat:{resource_id}",
+        )
         try:
             return await self._resume_claimed(
                 session_id=session_id,
                 operation_id=operation_id,
                 callbacks=callbacks,
                 max_cycles=max_cycles,
+                claim=claim,
+                recovery_run_id=str(uuid4()),
             )
         finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
             await self.store.release_claim(
                 "operation_recovery",
                 resource_id,
@@ -395,6 +544,8 @@ class DurableSessionRecovery:
         operation_id: str,
         callbacks: RecoveryCallbacks,
         max_cycles: int,
+        claim: _RecoveryClaim,
+        recovery_run_id: str,
     ) -> RecoveryExecutionResult:
         for _ in range(max_cycles):
             plan = await self.plan(
@@ -442,25 +593,56 @@ class DurableSessionRecovery:
 
             for action in plan.actions:
                 if action.kind in {"retry_model_request", "continue_model"}:
-                    await self._request_model(plan.operation, action, callbacks)
+                    await self._request_model(
+                        plan.operation,
+                        action,
+                        callbacks,
+                        claim,
+                        recovery_run_id,
+                    )
                 elif action.kind in {"execute_tool", "replay_safe_tool"}:
-                    await self._execute_tool(plan.operation, action, callbacks)
+                    await self._execute_tool(
+                        plan.operation,
+                        action,
+                        callbacks,
+                        claim,
+                    )
                 elif action.kind == "reconcile_tool":
-                    await self._reconcile_tool(plan.operation, action, callbacks)
+                    await self._reconcile_tool(
+                        plan.operation,
+                        action,
+                        callbacks,
+                        claim,
+                    )
                 elif action.kind == "materialize_tool_result":
-                    await self._materialize_result(plan.operation, action)
+                    await self._materialize_result(
+                        plan.operation,
+                        action,
+                        claim,
+                    )
                 elif action.kind == "consume_approval":
+                    await self._assert_claim(claim)
                     await callbacks.consume_approval(action)  # type: ignore[misc]
+                    await self._assert_claim(claim)
                 elif action.kind == "resume_approved_write":
+                    await self._assert_claim(claim)
                     await callbacks.resume_write(action)  # type: ignore[misc]
+                    await self._assert_claim(claim)
                 elif action.kind == "reconcile_write":
+                    await self._assert_claim(claim)
                     await callbacks.reconcile_write(action)  # type: ignore[misc]
+                    await self._assert_claim(claim)
                 elif action.kind == "finalize_rejected_approval":
-                    await self._finalize_rejected_approval(plan.operation, action)
+                    await self._finalize_rejected_approval(
+                        plan.operation,
+                        action,
+                        claim,
+                    )
                 elif action.kind == "finish_operation":
                     await self._finish_operation(
                         plan.operation,
                         "completed",
+                        claim,
                     )
                 else:
                     return RecoveryExecutionResult(
@@ -479,65 +661,104 @@ class DurableSessionRecovery:
         self,
         operation: OperationState,
         outcome: str,
+        claim: _RecoveryClaim,
     ) -> None:
         specs = [("operation_finished", {"outcome": outcome})]
-        for _ in range(20):
-            events = await self.store.load(
-                session_id=operation.session_id,
-                operation_id=operation.operation_id,
-            )
-            replay_operation_with_specs(events, specs)
-            try:
-                await self.store.append_batch(
-                    operation.session_id,
-                    operation.operation_id,
-                    specs,
-                    expected_last_sequence=operation_last_sequence(events),
-                )
-            except OperationStoreConflictError:
-                continue
-            return
-        raise RuntimeError("Operation Finished 并发冲突")
+        await self._commit_specs(operation, specs, claim)
 
     async def _request_model(
         self,
         operation: OperationState,
         action: RecoveryAction,
         callbacks: RecoveryCallbacks,
+        claim: _RecoveryClaim,
+        recovery_run_id: str,
     ) -> None:
-        if action.kind == "retry_model_request" and action.request_id is not None:
-            await self.store.append(
-                "model_request_failed",
-                operation.session_id,
-                operation.operation_id,
-                {
-                    "requestId": action.request_id,
-                    "errorCode": "process_interrupted",
-                    "recovery": True,
-                },
-            )
         if action.request_policy is None:
             raise RuntimeError("恢复模型请求缺少持久化策略")
         request_id = str(uuid4())
-        await self.store.append(
-            "model_request_started",
-            operation.session_id,
-            operation.operation_id,
-            {
+        specs: list[tuple[str, dict[str, Any]]] = []
+        if action.kind == "retry_model_request":
+            if action.request_id is None:
+                raise RuntimeError("恢复未完成模型请求时缺少 Request ID")
+            specs.append(
+                (
+                    "model_request_failed",
+                    {
+                        "requestId": action.request_id,
+                        "errorCode": "process_interrupted",
+                        "recovery": True,
+                    },
+                )
+            )
+        specs.append(
+            (
+                "model_request_started",
+                {
+                    "requestId": request_id,
+                    "requestPolicy": action.request_policy.to_dict(),
+                    "recovery": True,
+                },
+            )
+        )
+        started = await self._commit_specs(operation, specs, claim)
+        try:
+            identity = {
                 "requestId": request_id,
-                "requestPolicy": action.request_policy.to_dict(),
-                "recovery": True,
-            },
-        )
-        message = await callbacks.request_model(
-            list(operation.messages),
-            action.request_policy,
-        )
-        await self.store.append(
-            "model_request_completed",
-            operation.session_id,
-            operation.operation_id,
-            {"requestId": request_id, "message": message, "recovery": True},
+                "sessionId": operation.session_id,
+                "operationId": operation.operation_id,
+                "runId": recovery_run_id,
+                "source": "recovery",
+            }
+            if callbacks.request_model_with_context is not None:
+                message = await callbacks.request_model_with_context(
+                    list(started.messages),
+                    action.request_policy,
+                    identity,
+                )
+            else:
+                message = await callbacks.request_model(
+                    list(started.messages),
+                    action.request_policy,
+                )
+        except asyncio.CancelledError:
+            # Started 是合法恢复锚点；下一 Worker 会原子地将它标记为
+            # process_interrupted 并创建新的 Request，不能在取消清理中裸写。
+            raise
+        except Exception:
+            await self._fail_model_request_if_started(
+                operation,
+                request_id,
+                "recovery_model_error",
+                claim,
+            )
+            raise
+        try:
+            validate_recoverable_model_response(
+                message,
+                action.request_policy,
+            )
+        except ModelRequestPolicyError:
+            await self._fail_model_request_if_started(
+                operation,
+                request_id,
+                "invalid_recovery_model_response",
+                claim,
+            )
+            raise
+        await self._commit_specs(
+            operation,
+            [
+                (
+                    "model_request_completed",
+                    {
+                        "requestId": request_id,
+                        "message": message,
+                        "recovery": True,
+                    },
+                )
+            ],
+            claim,
         )
 
     async def _execute_tool(
@@ -545,32 +766,36 @@ class DurableSessionRecovery:
         operation: OperationState,
         action: RecoveryAction,
         callbacks: RecoveryCallbacks,
+        claim: _RecoveryClaim,
     ) -> None:
+        specs: list[tuple[str, dict[str, Any]]] = []
         if action.tool_call_id not in operation.tools:
-            await self.store.append(
-                "tool_intent_recorded",
-                operation.session_id,
-                operation.operation_id,
-                {
-                    "toolCallId": action.tool_call_id,
-                    "toolName": action.tool_name,
-                    "arguments": action.arguments,
-                    "replayPolicy": "never",
-                    "recovery": True,
-                },
+            specs.append(
+                (
+                    "tool_intent_recorded",
+                    {
+                        "toolCallId": action.tool_call_id,
+                        "toolName": action.tool_name,
+                        "arguments": action.arguments,
+                        "replayPolicy": "never",
+                        "recovery": True,
+                    },
+                )
             )
-        await self.store.append(
-            "tool_dispatch_started",
-            operation.session_id,
-            operation.operation_id,
-            {"toolCallId": action.tool_call_id, "recovery": True},
+        specs.append(
+            (
+                "tool_dispatch_started",
+                {"toolCallId": action.tool_call_id, "recovery": True},
+            )
         )
+        await self._commit_specs(operation, specs, claim)
         result_message = await callbacks.execute_tool(action)
         await self._store_tool_result(
             operation,
             action,
             result_message,
             event_type="tool_completed",
+            claim=claim,
         )
 
     async def _reconcile_tool(
@@ -578,35 +803,26 @@ class DurableSessionRecovery:
         operation: OperationState,
         action: RecoveryAction,
         callbacks: RecoveryCallbacks,
+        claim: _RecoveryClaim,
     ) -> None:
+        await self._assert_claim(claim)
         result_message = await callbacks.reconcile_tool(action)
         await self._store_tool_result(
             operation,
             action,
             result_message,
             event_type="tool_reconciled",
+            claim=claim,
         )
 
     async def _finalize_rejected_approval(
         self,
         operation: OperationState,
         action: RecoveryAction,
+        claim: _RecoveryClaim,
     ) -> None:
         if action.approval_id is None or action.tool_call_id is None or action.tool_name is None:
             raise RuntimeError("Rejected Approval 缺少 Tool Call 关联")
-        if action.tool_call_id not in operation.tools:
-            await self.store.append(
-                "tool_intent_recorded",
-                operation.session_id,
-                operation.operation_id,
-                {
-                    "toolCallId": action.tool_call_id,
-                    "toolName": action.tool_name,
-                    "arguments": action.arguments,
-                    "replayPolicy": "never",
-                    "recovery": True,
-                },
-            )
         result_message = {
             "role": "toolResult",
             "toolCallId": action.tool_call_id,
@@ -624,27 +840,118 @@ class DurableSessionRecovery:
             },
             "isError": True,
         }
-        await self._store_tool_result(
-            operation,
-            action,
-            result_message,
-            event_type="tool_completed",
-        )
-        await self.store.append(
-            "approval_resume_cancelled",
-            operation.session_id,
-            operation.operation_id,
-            {
-                "approvalId": action.approval_id,
-                "reason": "rejected_or_expired",
-                "recovery": True,
-            },
-        )
+        for _ in range(20):
+            await self._assert_claim(claim)
+            events = await self.store.load(
+                session_id=operation.session_id,
+                operation_id=operation.operation_id,
+            )
+            current = replay_operation(events)
+            specs: list[tuple[str, dict[str, Any]]] = []
+            invocation = current.tools.get(action.tool_call_id)
+            if invocation is None:
+                specs.append(
+                    (
+                        "tool_intent_recorded",
+                        {
+                            "toolCallId": action.tool_call_id,
+                            "toolName": action.tool_name,
+                            "arguments": action.arguments,
+                            "replayPolicy": "never",
+                            "recovery": True,
+                        },
+                    )
+                )
+            if invocation is None or invocation.phase != "completed":
+                specs.append(
+                    (
+                        "tool_completed",
+                        {
+                            "toolCallId": action.tool_call_id,
+                            "result": {
+                                "content": result_message["content"],
+                                "details": result_message["details"],
+                                "isError": True,
+                            },
+                            "recovery": True,
+                        },
+                    )
+                )
+            has_result_message = any(
+                message.get("role") == "toolResult"
+                and message.get("toolCallId") == action.tool_call_id
+                for message in current.messages
+            )
+            if not has_result_message:
+                specs.append(
+                    (
+                        "message_appended",
+                        {"message": result_message, "recovery": True},
+                    )
+                )
+            approval = current.approvals.get(action.approval_id)
+            if approval is None:
+                raise RuntimeError("Rejected Approval 已从 Operation 丢失")
+            if approval.state in {"rejected", "expired"}:
+                specs.append(
+                    (
+                        "approval_resume_cancelled",
+                        {
+                            "approvalId": action.approval_id,
+                            "reason": "rejected_or_expired",
+                            "recovery": True,
+                        },
+                    )
+                )
+            if action.write_id is not None:
+                write = current.writes.get(action.write_id)
+                if write is not None and write.state == "waiting_approval":
+                    specs.append(
+                        (
+                            "write_failed",
+                            {
+                                "writeId": action.write_id,
+                                "reason": "approval_not_granted",
+                                "result": {
+                                    "status": "rejected",
+                                    "approvalId": action.approval_id,
+                                },
+                                "recovery": True,
+                            },
+                        )
+                    )
+            policy = current.active_model_policy
+            if policy is not None and policy.continuation_policy is not None:
+                specs.append(
+                    (
+                        "model_policy_selected",
+                        {
+                            "policy": policy.continuation_policy.to_dict(),
+                            "recovery": True,
+                        },
+                    )
+                )
+            if not specs:
+                return
+            replay_operation_with_specs(events, specs)
+            await self._assert_claim(claim)
+            try:
+                await self.store.append_batch(
+                    operation.session_id,
+                    operation.operation_id,
+                    specs,
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+            except OperationStoreConflictError:
+                continue
+            return
+        raise RuntimeError("Rejected Approval 终态提交并发冲突")
 
     async def _materialize_result(
         self,
         operation: OperationState,
         action: RecoveryAction,
+        claim: _RecoveryClaim,
     ) -> None:
         result = action.stored_result or {}
         message = {
@@ -655,13 +962,15 @@ class DurableSessionRecovery:
             "details": result.get("details", {}),
             "isError": bool(result.get("isError")),
         }
-        await self.store.append(
-            "message_appended",
-            operation.session_id,
-            operation.operation_id,
-            {"message": message, "recovery": True},
+        specs: list[tuple[str, dict[str, Any]]] = [
+            ("message_appended", {"message": message, "recovery": True})
+        ]
+        specs.extend(self._continuation_policy_specs(operation))
+        await self._commit_specs(
+            operation,
+            specs,
+            claim,
         )
-        await self._persist_continuation_policy(operation)
 
     async def _store_tool_result(
         self,
@@ -670,36 +979,169 @@ class DurableSessionRecovery:
         result_message: dict[str, Any],
         *,
         event_type: str,
+        claim: _RecoveryClaim,
     ) -> None:
+        _validate_recovery_tool_result(action, result_message)
         result = {
             "content": result_message.get("content", []),
             "details": result_message.get("details", {}),
             "isError": bool(result_message.get("isError")),
         }
-        await self.store.append(
-            event_type,
-            operation.session_id,
-            operation.operation_id,
-            {"toolCallId": action.tool_call_id, "result": result, "recovery": True},
+        specs: list[tuple[str, dict[str, Any]]] = [
+            (
+                event_type,
+                {
+                    "toolCallId": action.tool_call_id,
+                    "result": result,
+                    "recovery": True,
+                },
+            ),
+            (
+                "message_appended",
+                {"message": result_message, "recovery": True},
+            ),
+        ]
+        specs.extend(self._continuation_policy_specs(operation))
+        await self._commit_specs(
+            operation,
+            specs,
+            claim,
         )
-        await self.store.append(
-            "message_appended",
-            operation.session_id,
-            operation.operation_id,
-            {"message": result_message, "recovery": True},
-        )
-        await self._persist_continuation_policy(operation)
 
-    async def _persist_continuation_policy(
-        self,
+    @staticmethod
+    def _continuation_policy_specs(
         operation: OperationState,
-    ) -> None:
+    ) -> list[tuple[str, dict[str, Any]]]:
         policy = operation.active_model_policy
         if policy is None or policy.continuation_policy is None:
-            return
-        await self.store.append(
-            "model_policy_selected",
-            operation.session_id,
-            operation.operation_id,
-            {"policy": policy.continuation_policy.to_dict(), "recovery": True},
+            return []
+        return [
+            (
+                "model_policy_selected",
+                {
+                    "policy": policy.continuation_policy.to_dict(),
+                    "recovery": True,
+                },
+            )
+        ]
+
+    async def _fail_model_request_if_started(
+        self,
+        operation: OperationState,
+        request_id: str,
+        error_code: str,
+        claim: _RecoveryClaim,
+    ) -> None:
+        events = await self.store.load(
+            session_id=operation.session_id,
+            operation_id=operation.operation_id,
         )
+        current = replay_operation(events)
+        request = current.model_requests.get(request_id)
+        if request is None:
+            raise RuntimeError("恢复 Model Request 已从 Operation 丢失")
+        if request.phase != "started":
+            return
+        await self._commit_specs(
+            operation,
+            [
+                (
+                    "model_request_failed",
+                    {
+                        "requestId": request_id,
+                        "errorCode": error_code,
+                        "recovery": True,
+                    },
+                )
+            ],
+            claim,
+        )
+
+    async def _commit_specs(
+        self,
+        operation: OperationState,
+        specs: list[tuple[str, dict[str, Any]]],
+        claim: _RecoveryClaim,
+    ) -> OperationState:
+        """在仍持有 Recovery Claim 时，以 Reducer + CAS 提交状态转换。"""
+
+        for _ in range(20):
+            await self._assert_claim(claim)
+            events = await self.store.load(
+                session_id=operation.session_id,
+                operation_id=operation.operation_id,
+            )
+            replay_operation_with_specs(events, specs)
+            # Load/预验证可能耗时；真正进入事务前再次续租并确认所有权。
+            await self._assert_claim(claim)
+            try:
+                appended = await self.store.append_batch(
+                    operation.session_id,
+                    operation.operation_id,
+                    specs,
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+            except OperationStoreConflictError:
+                continue
+            return replay_operation([*events, *appended])
+        raise RuntimeError("Operation Recovery 状态提交并发冲突")
+
+    async def _renew_claim(self, claim: _RecoveryClaim) -> None:
+        while True:
+            await asyncio.sleep(self.renew_interval)
+            try:
+                renewed = await self.store.try_acquire_claim(
+                    "operation_recovery",
+                    claim.resource_id,
+                    claim.owner_token,
+                    lease_seconds=self.claim_lease_seconds,
+                )
+            except Exception:
+                claim.lost.set()
+                return
+            if not renewed:
+                claim.lost.set()
+                return
+
+    async def _assert_claim(self, claim: _RecoveryClaim) -> None:
+        if claim.lost.is_set():
+            raise RuntimeError(
+                "Operation Recovery Lease 已丢失，禁止提交后续状态"
+            )
+        try:
+            held = await self.store.try_acquire_claim(
+                "operation_recovery",
+                claim.resource_id,
+                claim.owner_token,
+                lease_seconds=self.claim_lease_seconds,
+            )
+        except Exception as error:
+            claim.lost.set()
+            raise RuntimeError(
+                "Operation Recovery Lease 无法确认，禁止提交后续状态"
+            ) from error
+        if not held:
+            claim.lost.set()
+            raise RuntimeError(
+                "Operation Recovery Lease 已丢失，禁止提交后续状态"
+            )
+
+
+def _validate_recovery_tool_result(
+    action: RecoveryAction,
+    message: dict[str, Any],
+) -> None:
+    """Recovery Callback 只能闭合当前计划中的那个 Tool Call。"""
+
+    if not isinstance(message, dict) or message.get("role") != "toolResult":
+        raise RuntimeError("Recovery Tool Callback 必须返回 ToolResult Message")
+    if message.get("toolCallId") != action.tool_call_id:
+        raise RuntimeError("Recovery ToolResult 的 Tool Call ID 与计划不一致")
+    if message.get("toolName") != action.tool_name:
+        raise RuntimeError("Recovery ToolResult 的 Tool Name 与计划不一致")
+    if not isinstance(message.get("content"), list):
+        raise RuntimeError("Recovery ToolResult content 必须是数组")
+    if not isinstance(message.get("details", {}), dict):
+        raise RuntimeError("Recovery ToolResult details 必须是对象")
+    if type(message.get("isError")) is not bool:
+        raise RuntimeError("Recovery ToolResult isError 必须是布尔值")

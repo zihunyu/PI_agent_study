@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import random as random_module
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, cast
 from uuid import uuid4
 
@@ -22,6 +22,45 @@ from .circuit_breaker import CircuitBreaker, CircuitOpenError
 from .classifier import classify_model_error
 from .events import RetryEventStore
 from .types import ModelRetryPolicy
+
+
+_PRODUCER_TASK_ATTRIBUTE = "_pi_agent_loop_producer_task"
+
+
+def bind_stream_producer(stream: Any, task: asyncio.Task[None]) -> None:
+    """Bind a background producer to its public stream for structured teardown.
+
+    Retry/compaction adapters return an ``EventStream`` immediately and therefore
+    need a background task.  Keeping the task on the stream lets an enclosing
+    runtime cancel and drain the whole nested pipeline instead of abandoning an
+    inner producer when its consumer is cancelled.
+    """
+
+    setattr(stream, _PRODUCER_TASK_ATTRIBUTE, task)
+
+
+async def settle_stream_producer(stream: Any, *, cancel: bool) -> None:
+    """Cancel (when requested) and await a producer previously bound to a stream."""
+
+    task = getattr(stream, _PRODUCER_TASK_ATTRIBUTE, None)
+    if not isinstance(task, asyncio.Task) or task is asyncio.current_task():
+        return
+    if cancel and not task.done():
+        task.cancel("上层模型调用已结束")
+    await asyncio.gather(task, return_exceptions=True)
+
+
+class ProducerOwnedAssistantMessageEventStream(AssistantMessageEventStream):
+    """Assistant stream whose consumer owns cancellation of its producer."""
+
+    async def _iterate(self) -> AsyncIterator[dict]:
+        completed = False
+        try:
+            async for event in super()._iterate():
+                yield event
+            completed = True
+        finally:
+            await settle_stream_producer(self, cancel=not completed)
 
 
 class RetryingStreamFn:
@@ -52,8 +91,12 @@ class RetryingStreamFn:
     ) -> Any:
         if not self.policy.enabled:
             return self.stream_fn(model, context, options)
-        output = AssistantMessageEventStream()
-        asyncio.create_task(self._run(output, model, context, options))
+        output = ProducerOwnedAssistantMessageEventStream()
+        task = asyncio.create_task(
+            self._run(output, model, context, options),
+            name=f"pi-model-retry:{model.provider}:{model.id}",
+        )
+        bind_stream_producer(output, task)
         return output
 
     async def _run(
@@ -214,12 +257,17 @@ class RetryingStreamFn:
         if not hasattr(stream, "__aiter__") or not hasattr(stream, "result"):
             raise TypeError("RetryingStreamFn 收到不符合契约的事件流")
         events: list[dict[str, Any]] = []
-        async for event in stream:
-            events.append(event)
-        final = await stream.result()
-        if not events or events[-1].get("type") not in {"done", "error"}:
-            raise RuntimeError("模型 Attempt 没有产生终止事件")
-        return events, final
+        completed = False
+        try:
+            async for event in stream:
+                events.append(event)
+            final = await stream.result()
+            if not events or events[-1].get("type") not in {"done", "error"}:
+                raise RuntimeError("模型 Attempt 没有产生终止事件")
+            completed = True
+            return events, final
+        finally:
+            await settle_stream_producer(stream, cancel=not completed)
 
     async def _emit_retry_event(
         self,

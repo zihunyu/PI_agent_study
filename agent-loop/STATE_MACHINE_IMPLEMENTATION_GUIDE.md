@@ -400,7 +400,12 @@ approved
 - Operation Reducer 必须正式归约 Approval/Write Event；
 - Recovery Planner 必须先处理 waiting/approved/consumed/outcome_unknown，再处理普通 Tool Call；
 - Waiting Approval 时禁止 Tool Dispatch；
-- Never Tool 的布尔授权不能替代已消费 Approval 和匹配 Action Hash。
+- Never Tool 的布尔授权不能替代已消费 Approval 和匹配 Action Hash；
+- Assistant Tool Call 与 Approval/Write/Tool Intent 必须在同一初始事务中持久化；
+- Approval Action 必须是 `DurableActionEnvelope`，统一绑定 Operation、Tool Call、Tool、精确参数和 Write ID；
+- Resume Payload 必须携带完全相同的 Envelope，Reducer 和 Host 都要再次校验；
+- Approval Grant/Reject 必须通过完整 Operation Reducer，并在 Store Transaction 内检查 TTL；
+- waiting_approval 但没有 Approval/Write 事实属于损坏窗口，只能 Manual Intervention。
 
 ---
 
@@ -532,7 +537,9 @@ expected_tool_arguments
 continuation_policy
 ```
 
-Recovery 必须按 Request/Turn 恢复该快照；缺少快照时进入 Manual Intervention，禁止使用“全部工具 + auto”兜底。Required/Named Tool 完成后的 Continuation Policy 必须在原请求前确定并持久化。
+Recovery 必须按 Request/Turn 恢复该快照；缺少快照时保存为 `None`、清除旧 Active Policy 并进入 Manual Intervention，禁止继承上一请求或使用“全部工具 + auto”兜底。Required/Named Tool 完成后的 Continuation Policy 必须在原请求前确定并持久化。
+
+`stopReason=length` 是不完整响应，普通 Recovery 和 Approval Final Request 都不得把它标记为 Completed。Expected Arguments 必须在一个 Tool Call 中与 Router 快照完整相等，不能包含额外参数，也不能由多个调用拼凑。
 
 Approval 写操作完成后的说明性模型请求默认不暴露工具并使用 `tool_choice=none`。模型若仍返回 Tool Call，不得写 Completed；应结束 Model Request、标记 Operation Failed，并保持 Transcript 闭合。
 
@@ -572,6 +579,8 @@ JSONL 只允许单实例兼容使用。跨机器部署仍需要 PostgreSQL 等�
 
 Approval Consume、Write Approved、Tool Dispatch Started 和 Write Submitting 必须作为同一批事务事件提交。外部 HTTP/数据库副作用不能放在长 SQLite 事务中，应先提交 Claim，再调用外部系统，最后写 Succeeded/Failed/OutcomeUnknown。
 
+Write Recovery 必须联合读取 Write 与关联 Approval：Approved 应进入 Consume/Resume，不能继续显示 Waiting。Tool Intent 与 Write Prepare 同事务创建，Resume 只能复用。Reconciliation 使用 Lease Claim；`reconciling` 状态允许 Lease 获胜者重入，核对接口异常后写 `write_reconcile_failed` 回到 `outcome_unknown`。
+
 ---
 
 ## 17. Reducer 必须是纯函数
@@ -599,6 +608,8 @@ Reducer 不能：
 -执行随机逻辑。
 
 外部副作用由 Service/Tool 完成，成功后产生 Event。
+
+`tool_execution_end` 是副作用 Commit Boundary。Observer/Listener 在该边界失败时不能把已经完成的副作用改写成“未执行”；ToolResult Message 持久化必须能够补齐缺失的 Tool Result Event。外部 `prompt_task.cancel()` 产生的 `asyncio.CancelledError` 也必须先完成工具取消、Synthetic Result、Transcript Closure 和 Operation Cancelled，再向调用方传播。
 
 ---
 

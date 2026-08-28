@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -23,7 +23,9 @@ class ModelRequestPolicy:
     tool_choice: str | dict[str, Any] = "none"
     required_capabilities: tuple[str, ...] = ()
     allowed_tool_names: tuple[str, ...] = ()
-    expected_tool_arguments: dict[str, Any] = field(default_factory=dict)
+    # None 表示该请求没有声明参数约束；{} 表示明确要求唯一 Tool Call
+    # 的 arguments 必须是空对象。两者必须在持久化往返后保持区别。
+    expected_tool_arguments: dict[str, Any] | None = None
     continuation_policy: "ModelRequestPolicy | None" = None
     version: int = 1
 
@@ -52,7 +54,14 @@ class ModelRequestPolicy:
             raise ModelRequestPolicyError(
                 "tool_choice=required 时必须至少暴露一个工具"
             )
-        arguments = copy.deepcopy(dict(self.expected_tool_arguments))
+        if self.expected_tool_arguments is None:
+            arguments = None
+        elif not isinstance(self.expected_tool_arguments, dict):
+            raise ModelRequestPolicyError(
+                "expected_tool_arguments 必须是对象或 None"
+            )
+        else:
+            arguments = copy.deepcopy(self.expected_tool_arguments)
         continuation = self.continuation_policy
         if continuation is not None and not isinstance(
             continuation,
@@ -74,9 +83,7 @@ class ModelRequestPolicy:
             "toolChoice": copy.deepcopy(self.tool_choice),
             "requiredCapabilities": list(self.required_capabilities),
             "allowedToolNames": list(self.allowed_tool_names),
-            "expectedToolArguments": copy.deepcopy(
-                self.expected_tool_arguments
-            ),
+            "expectedToolArguments": copy.deepcopy(self.expected_tool_arguments),
             "continuationPolicy": (
                 self.continuation_policy.to_dict()
                 if self.continuation_policy is not None
@@ -104,7 +111,7 @@ class ModelRequestPolicy:
                 "allowedToolNames",
             ),
             expected_tool_arguments=copy.deepcopy(
-                value.get("expectedToolArguments", {})
+                value.get("expectedToolArguments")
             ),
             continuation_policy=(
                 cls.from_dict(value["continuationPolicy"])
@@ -151,21 +158,89 @@ def validate_model_response_policy(
     named = _named_tool(policy.tool_choice)
     if named is not None and named not in called_names:
         raise ModelRequestPolicyError(f"模型没有调用强制工具：{named}")
-    if policy.expected_tool_arguments:
-        mismatched = [
-            field
-            for field, expected in policy.expected_tool_arguments.items()
-            if not any(
-                isinstance(call.get("arguments"), dict)
-                and str(call["arguments"].get(field, "")) == str(expected)
-                for call in calls
-            )
-        ]
-        if mismatched:
+    if not tool_calls_match_expected_arguments(
+        calls,
+        policy.expected_tool_arguments,
+    ):
+        raise ModelRequestPolicyError(
+            "模型必须在单个 Tool Call 中使用与持久策略完全一致的参数，"
+            "禁止跨调用拼凑或添加额外参数"
+        )
+
+
+def validate_recoverable_model_response(
+    message: dict[str, Any],
+    policy: ModelRequestPolicy,
+) -> None:
+    """验证 Recovery Runtime/Callback 可以安全落盘的成功响应。"""
+
+    stop_reason = _model_stop_reason(message)
+    if stop_reason in {"error", "aborted"}:
+        raise ModelRequestPolicyError(
+            str(message.get("errorMessage", "恢复模型请求失败"))
+        )
+    if stop_reason == "length":
+        raise ModelRequestPolicyError(
+            "恢复模型响应达到长度上限，禁止完成 Operation"
+        )
+    if stop_reason not in {"stop", "toolUse"}:
+        raise ModelRequestPolicyError(
+            f"恢复模型响应终止原因无效：{stop_reason}"
+        )
+    calls = _tool_calls(message)
+    if stop_reason == "toolUse" and not calls:
+        raise ModelRequestPolicyError(
+            "模型响应声明 toolUse，但没有 Tool Call"
+        )
+    if stop_reason == "stop" and calls:
+        raise ModelRequestPolicyError(
+            "模型响应包含 Tool Call，但 stopReason 不是 toolUse"
+        )
+    validate_model_response_policy(message, policy)
+
+
+def validate_persisted_model_response(
+    message: dict[str, Any],
+    policy: ModelRequestPolicy | None,
+) -> None:
+    """重放 Model Request Completed 时按该 Request 的策略验证响应。
+
+    error/aborted 是 Recorder 会持久化的失败响应，因此允许重放，但禁止
+    其中携带可被 Recovery 误执行的 Tool Call。成功响应则必须拥有且满足
+    本次 Request 自身的 Policy；不能借用后续 active policy。
+    """
+
+    stop_reason = _model_stop_reason(message)
+    calls = _tool_calls(message)
+    if stop_reason in {"error", "aborted"}:
+        if calls:
             raise ModelRequestPolicyError(
-                "模型工具调用没有使用持久策略中的参数："
-                + "、".join(str(field) for field in mismatched)
+                "失败的模型响应禁止携带可执行 Tool Call"
             )
+        return
+    if policy is None:
+        raise ModelRequestPolicyError(
+            "Model Request Completed 缺少该 Request 的持久化策略"
+        )
+    validate_recoverable_model_response(message, policy)
+
+
+def tool_calls_match_expected_arguments(
+    calls: list[dict[str, Any]],
+    expected_arguments: dict[str, Any] | None,
+) -> bool:
+    """按严格 JSON 类型递归匹配唯一 Tool Call 的完整参数。"""
+
+    if expected_arguments is None:
+        return True
+    return (
+        len(calls) == 1
+        and isinstance(calls[0].get("arguments"), dict)
+        and _strict_json_equal(
+            expected_arguments,
+            calls[0]["arguments"],
+        )
+    )
 
 
 def capture_model_request_policy(
@@ -188,7 +263,7 @@ def capture_model_request_policy(
             stream_options.get("allowed_tool_names", ())
         ),
         expected_tool_arguments=copy.deepcopy(
-            stream_options.get("expected_tool_arguments", {})
+            stream_options.get("expected_tool_arguments")
         ),
         continuation_policy=(
             ModelRequestPolicy.from_dict(
@@ -241,3 +316,42 @@ def _named_tool(value: str | dict[str, Any]) -> str | None:
     if not isinstance(value, dict):
         return None
     return str(value["function"]["name"])
+
+
+def _model_stop_reason(message: dict[str, Any]) -> Any:
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        raise ModelRequestPolicyError("模型响应必须是 Assistant Message")
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise ModelRequestPolicyError("模型响应 content 必须是数组")
+    return message.get("stopReason")
+
+
+def _tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    content = message.get("content", [])
+    if not isinstance(content, list):
+        raise ModelRequestPolicyError("模型响应 content 必须是数组")
+    return [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "toolCall"
+    ]
+
+
+def _strict_json_equal(expected: Any, actual: Any) -> bool:
+    # Python 的 True == 1；Policy 边界不能采用这种宽松比较。
+    if type(expected) is not type(actual):
+        return False
+    if isinstance(expected, dict):
+        if expected.keys() != actual.keys():
+            return False
+        return all(
+            _strict_json_equal(value, actual[key])
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(expected) == len(actual) and all(
+            _strict_json_equal(left, right)
+            for left, right in zip(expected, actual)
+        )
+    return expected == actual

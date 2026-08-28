@@ -39,10 +39,10 @@ class RoutedAgent:
         self.runtime_tracker = runtime_tracker
         self.operation_recorder = operation_recorder
         self.suspend_on_approval = suspend_on_approval
-        if runtime_tracker is not None:
-            self.agent.subscribe(runtime_tracker.listener)
         if operation_recorder is not None:
             self.agent.subscribe(operation_recorder.listener)
+        if runtime_tracker is not None:
+            self.agent.subscribe(runtime_tracker.listener)
         self.guard = RequiredToolCallGuard(capabilities)
         self.agent.stream_fn = guard_stream_fn(self.agent.stream_fn, self.guard)
         self.last_decision: RequestDecision | None = None
@@ -60,7 +60,12 @@ class RoutedAgent:
             await self.runtime_tracker.start_run()
             await self.runtime_tracker.record_external("routing_started")
         if self.operation_recorder is not None:
-            await self.operation_recorder.start_operation()
+            # Router 在 Agent 生命周期之前创建 Operation；先完成同一份 Transcript
+            # 修复，再把 Provider 将看到的历史作为 Operation 初始 Context。
+            self.agent._repair_transcript_before_run()
+            await self.operation_recorder.start_operation(
+                initial_messages=list(self.agent.state.messages)
+            )
             await self.operation_recorder.record_external("routing_started")
         try:
             route_value = self.router.route(user_text)
@@ -150,9 +155,12 @@ class RoutedAgent:
         self.agent.stream_options["allowed_tool_names"] = list(
             decision.selected_tools
         )
-        self.agent.stream_options["expected_tool_arguments"] = dict(
-            decision.extracted_fields
-        )
+        if decision.status == "in_scope_tool_ready":
+            self.agent.stream_options["expected_tool_arguments"] = dict(
+                decision.extracted_fields
+            )
+        else:
+            self.agent.stream_options.pop("expected_tool_arguments", None)
         self.agent.stream_options["recovery_continuation_policy"] = (
             ModelRequestPolicy(
                 visible_tool_names=tuple(decision.selected_tools),
@@ -221,7 +229,7 @@ class RoutedAgent:
         )
         next_options["tool_choice"] = "auto"
         next_options["required_capabilities"] = []
-        next_options["expected_tool_arguments"] = {}
+        next_options.pop("expected_tool_arguments", None)
         next_options.pop("recovery_continuation_policy", None)
 
         return AgentLoopTurnUpdate(

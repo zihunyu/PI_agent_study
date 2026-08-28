@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import copy
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .types import AgentToolResult
 
 
 def now_ms() -> int:

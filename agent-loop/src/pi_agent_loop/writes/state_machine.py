@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
@@ -15,10 +17,11 @@ from ..approval.state_machine import (
     action_digest,
     build_approval_request_event,
 )
+from ..durable_action import strict_json_equal
 from ..retry import OutcomeUnknownToolError
 from ..security import VerifiedIdentity
 from ..session.operation_events import OperationEvent
-from ..session.operation_state import replay_operation_with_specs
+from ..session.operation_state import replay_operation, replay_operation_with_specs
 from ..session.operation_store import (
     OperationEventSpec,
     OperationEventStore,
@@ -63,9 +66,23 @@ class WriteOperationService:
         self,
         store: OperationEventStore,
         approvals: ApprovalService,
+        *,
+        reconcile_claim_lease_seconds: float = 300,
+        reconcile_claim_renew_interval_seconds: float | None = None,
     ) -> None:
+        if reconcile_claim_lease_seconds <= 0:
+            raise ValueError("Reconcile Claim Lease 必须大于 0")
+        renew_interval = (
+            reconcile_claim_renew_interval_seconds
+            if reconcile_claim_renew_interval_seconds is not None
+            else min(60.0, reconcile_claim_lease_seconds / 3)
+        )
+        if renew_interval <= 0 or renew_interval >= reconcile_claim_lease_seconds:
+            raise ValueError("Reconcile Claim 续租间隔必须小于 Lease")
         self.store = store
         self.approvals = approvals
+        self.reconcile_claim_lease_seconds = reconcile_claim_lease_seconds
+        self.reconcile_claim_renew_interval_seconds = renew_interval
 
     async def prepare(
         self,
@@ -80,6 +97,11 @@ class WriteOperationService:
         required_approval_role: str = "approver",
         tool_call_id: str | None = None,
     ) -> WriteOperation:
+        if requires_approval and not self.store.supports_atomic_transactions:
+            raise WriteOperationError(
+                "approval_atomic_store_required",
+                "需要 Approval 的 Write 必须使用原子事务 Store",
+            )
         key_hash = _hash_secret(idempotency_key)
         action = {"tool": tool_name, "arguments": arguments}
         digest = action_digest(action)
@@ -160,8 +182,17 @@ class WriteOperationService:
         actor: VerifiedIdentity,
         idempotency_key: str,
         handler: WriteHandler,
+        approval_resume_id: str | None = None,
     ) -> WriteOperation:
         record = await self.get(write_id)
+        if (
+            record.approval_id is not None
+            and not self.store.supports_atomic_transactions
+        ):
+            raise WriteOperationError(
+                "approval_atomic_store_required",
+                "Approval Consume 与 Write Claim 必须使用原子事务 Store",
+            )
         if record.idempotency_key_hash != _hash_secret(idempotency_key):
             raise WriteOperationError(
                 "idempotency_key_mismatch",
@@ -175,6 +206,14 @@ class WriteOperationService:
                 operation_id=record.operation_id,
             )
             current = _replay_write(events, write_id)
+            if (
+                approval_resume_id is not None
+                and current.approval_id != approval_resume_id
+            ):
+                raise WriteOperationError(
+                    "approval_resume_write_mismatch",
+                    "Approval Resume 与 Write 绑定不一致",
+                )
             if current.state == "succeeded":
                 return current
             specs: list[OperationEventSpec] = []
@@ -185,18 +224,18 @@ class WriteOperationService:
                         "写操作缺少 Approval ID",
                     )
                 approval = _replay_approval(events, current.approval_id)
-                if approval.state != "approved":
+                if approval.state not in {"approved", "consumed"}:
                     raise ApprovalError(
                         "approval_not_approved",
-                        "Approval 尚未批准或已消费",
+                        "Approval 尚未批准或状态不可执行",
                     )
                 if approval.action_hash != current.action_hash:
                     raise WriteOperationError(
                         "approval_action_mismatch",
                         "Approval 与 Write Action 不匹配",
                     )
-                specs.extend(
-                    [
+                if approval.state == "approved":
+                    specs.append(
                         (
                             "approval_consumed",
                             {
@@ -204,15 +243,29 @@ class WriteOperationService:
                                 "consumerId": actor.principal_id,
                                 "consumerVerificationId": actor.verification_id,
                             },
-                        ),
+                        )
+                    )
+                if approval_resume_id is not None and not _resume_started(
+                    events,
+                    approval_resume_id,
+                ):
+                    specs.append(
                         (
-                            "write_approved",
+                            "approval_resume_started",
                             {
-                                "writeId": write_id,
-                                "approvalId": current.approval_id,
+                                "approvalId": approval_resume_id,
+                                "consumerId": actor.principal_id,
                             },
-                        ),
-                    ]
+                        )
+                    )
+                specs.append(
+                    (
+                        "write_approved",
+                        {
+                            "writeId": write_id,
+                            "approvalId": current.approval_id,
+                        },
+                    )
                 )
             elif current.state != "approved":
                 raise WriteOperationError(
@@ -248,6 +301,24 @@ class WriteOperationService:
 
         try:
             result = await handler(claimed.arguments, idempotency_key, actor)
+            return await self._finish_transition(
+                claimed,
+                required_state="submitting",
+                event_type="write_succeeded",
+                data={"writeId": write_id, "result": result},
+            )
+        except asyncio.CancelledError:
+            # 取消可能发生在外部系统已接收请求之后，也可能落在本地成功事件
+            # 提交期间。先屏蔽取消读取真实终态；仅仍为 Submitting 时标记未知。
+            cleanup = asyncio.create_task(
+                self._mark_outcome_unknown_if_submitting(claimed),
+                name=f"write-cancel-cleanup:{write_id}",
+            )
+            try:
+                await asyncio.shield(cleanup)
+            except BaseException:
+                await asyncio.gather(cleanup, return_exceptions=True)
+            raise
         except OutcomeUnknownToolError as error:
             await self._finish_transition(
                 claimed,
@@ -268,11 +339,22 @@ class WriteOperationService:
                 data={"writeId": write_id, "error": str(error)},
             )
             raise
-        return await self._finish_transition(
-            claimed,
+
+    async def _mark_outcome_unknown_if_submitting(
+        self,
+        claimed: WriteOperation,
+    ) -> None:
+        current = await self.get(claimed.write_id)
+        if current.state != "submitting":
+            return
+        await self._finish_transition(
+            current,
             required_state="submitting",
-            event_type="write_succeeded",
-            data={"writeId": write_id, "result": result},
+            event_type="write_outcome_unknown",
+            data={
+                "writeId": current.write_id,
+                "reason": "execution_cancelled",
+            },
         )
 
     async def reconcile(
@@ -280,24 +362,128 @@ class WriteOperationService:
         write_id: str,
         handler: ReconcileHandler,
     ) -> WriteOperation:
-        record = await self.get(write_id)
-        claimed = await self._finish_transition(
-            record,
-            required_state="outcome_unknown",
-            event_type="write_reconciling",
-            data={"writeId": write_id},
+        owner_token = str(uuid4())
+        acquired = await self.store.try_acquire_claim(
+            "write_reconcile",
+            write_id,
+            owner_token,
+            lease_seconds=self.reconcile_claim_lease_seconds,
         )
-        result = await handler(claimed)
-        success = result.get("status") == "succeeded"
-        return await self._finish_transition(
-            claimed,
-            required_state="reconciling",
-            event_type="write_succeeded" if success else "write_failed",
-            data={"writeId": write_id, "result": result},
+        if not acquired:
+            raise WriteOperationError(
+                "write_reconcile_claimed",
+                "Write Reconciliation 已被另一个 Worker Claim",
+            )
+        claim_lost = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._renew_reconcile_claim(write_id, owner_token, claim_lost),
+            name=f"write-reconcile-heartbeat:{write_id}",
         )
+        try:
+            record = await self.get(write_id)
+            if record.state == "outcome_unknown":
+                claimed = await self._finish_transition(
+                    record,
+                    required_state="outcome_unknown",
+                    event_type="write_reconciling",
+                    data={"writeId": write_id},
+                )
+            elif record.state == "reconciling":
+                # 上一个 Worker 可能在核对调用中崩溃；Lease 获胜者可重入。
+                claimed = record
+            else:
+                raise WriteOperationError(
+                    "write_not_uncertain",
+                    "只有 outcome_unknown/reconciling 可以核对",
+                )
+            try:
+                result = await handler(claimed)
+            except Exception as error:
+                await self._assert_reconcile_claim(
+                    write_id,
+                    owner_token,
+                    claim_lost,
+                )
+                await self._finish_transition(
+                    claimed,
+                    required_state="reconciling",
+                    event_type="write_reconcile_failed",
+                    data={"writeId": write_id, "error": str(error)},
+                )
+                raise
+            await self._assert_reconcile_claim(
+                write_id,
+                owner_token,
+                claim_lost,
+            )
+            success = result.get("status") == "succeeded"
+            return await self._finish_transition(
+                claimed,
+                required_state="reconciling",
+                event_type="write_succeeded" if success else "write_failed",
+                data={"writeId": write_id, "result": result},
+            )
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+            await self.store.release_claim(
+                "write_reconcile",
+                write_id,
+                owner_token,
+            )
+
+    async def _renew_reconcile_claim(
+        self,
+        write_id: str,
+        owner_token: str,
+        claim_lost: asyncio.Event,
+    ) -> None:
+        while True:
+            await asyncio.sleep(self.reconcile_claim_renew_interval_seconds)
+            try:
+                renewed = await self.store.try_acquire_claim(
+                    "write_reconcile",
+                    write_id,
+                    owner_token,
+                    lease_seconds=self.reconcile_claim_lease_seconds,
+                )
+            except Exception:
+                claim_lost.set()
+                return
+            if not renewed:
+                claim_lost.set()
+                return
+
+    async def _assert_reconcile_claim(
+        self,
+        write_id: str,
+        owner_token: str,
+        claim_lost: asyncio.Event,
+    ) -> None:
+        if claim_lost.is_set() or not await self.store.try_acquire_claim(
+            "write_reconcile",
+            write_id,
+            owner_token,
+            lease_seconds=self.reconcile_claim_lease_seconds,
+        ):
+            claim_lost.set()
+            raise WriteOperationError(
+                "write_reconcile_claim_lost",
+                "Write Reconciliation Lease 已丢失，禁止提交结果",
+            )
 
     async def get(self, write_id: str) -> WriteOperation:
-        return _replay_write(await self.store.load(), write_id)
+        events = await self.store.load()
+        record = _replay_write(events, write_id)
+        operation_events = [
+            event
+            for event in events
+            if event.session_id == record.session_id
+            and event.operation_id == record.operation_id
+        ]
+        replay_operation(operation_events)
+        return record
 
     async def _find_by_idempotency(
         self,
@@ -310,7 +496,7 @@ class WriteOperationService:
             if event.type == "write_prepared"
             and event.data.get("idempotencyKeyHash") == key_hash
         ]
-        return _replay_write(events, write_ids[-1]) if write_ids else None
+        return await self.get(write_ids[-1]) if write_ids else None
 
     async def _finish_transition(
         self,
@@ -363,10 +549,15 @@ def _tool_dispatch_specs(
     intent_exists = any(
         event.type == "tool_intent_recorded"
         and event.data.get("toolCallId") == write.tool_call_id
+        and event.data.get("toolName") == write.tool_name
+        and strict_json_equal(event.data.get("arguments"), write.arguments)
         for event in events
     )
     if not intent_exists:
-        return []
+        raise WriteOperationError(
+            "tool_intent_missing",
+            "带 Tool Call ID 的 Write 缺少匹配 Tool Intent，禁止执行",
+        )
     dispatch_exists = any(
         event.type == "tool_dispatch_started"
         and event.data.get("toolCallId") == write.tool_call_id
@@ -380,6 +571,14 @@ def _tool_dispatch_specs(
             {"toolCallId": write.tool_call_id, "source": "write_claim"},
         )
     ]
+
+
+def _resume_started(events: list[OperationEvent], approval_id: str) -> bool:
+    return any(
+        event.type == "approval_resume_started"
+        and event.data.get("approvalId") == approval_id
+        for event in events
+    )
 
 
 def _same_idempotent_action(
@@ -465,7 +664,11 @@ def _replay_write(
                 result=dict(event.data.get("result", {})),
             )
         elif event.type == "write_failed":
-            if record.state not in {"submitting", "reconciling"}:
+            approval_denied = (
+                record.state == "waiting_approval"
+                and event.data.get("reason") == "approval_not_granted"
+            )
+            if record.state not in {"submitting", "reconciling"} and not approval_denied:
                 raise WriteOperationError(
                     "invalid_write_transition",
                     "当前状态不能失败",
@@ -489,6 +692,13 @@ def _replay_write(
                     "只有 Unknown 可以核对",
                 )
             record = replace(record, state="reconciling")
+        elif event.type == "write_reconcile_failed":
+            if record.state != "reconciling":
+                raise WriteOperationError(
+                    "invalid_write_transition",
+                    "只有 Reconciling 可以记录核对失败",
+                )
+            record = replace(record, state="outcome_unknown")
     if record is None:
         raise WriteOperationError(
             "write_not_found",
@@ -497,7 +707,11 @@ def _replay_write(
     return record
 
 
-def _hash_secret(value: str) -> str:
+def hash_idempotency_key(value: str) -> str:
     if not value:
         raise ValueError("Idempotency Key 不能为空")
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+# 内部兼容别名。
+_hash_secret = hash_idempotency_key

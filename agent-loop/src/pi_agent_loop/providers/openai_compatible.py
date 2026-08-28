@@ -39,9 +39,32 @@ class OpenAICompatibleProvider:
         profile: ProviderProfile,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        client: httpx.AsyncClient | None = None,
+        owns_client: bool | None = None,
+        limits: httpx.Limits | None = None,
     ) -> None:
+        if client is not None and transport is not None:
+            raise ValueError("client and transport cannot be supplied together")
+        if client is None and owns_client is False:
+            raise ValueError("an internally created client must be owned by the provider")
         self.profile = profile
-        self._transport = transport
+        self._client = client or httpx.AsyncClient(
+            transport=transport,
+            follow_redirects=False,
+            trust_env=False,
+            limits=limits or httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0,
+            ),
+        )
+        # Injected clients are caller-owned unless ownership is explicitly handed
+        # to the provider. Internally created clients are always provider-owned.
+        self._owns_client = client is None or bool(owns_client)
+        self._accepting = True
+        self._closed = False
+        self._active_tasks: set[asyncio.Task[None]] = set()
+        self._close_lock = asyncio.Lock()
         # call_count 是逻辑模型 Turn；attempt_count 包含内部 Retry Attempt。
         self.call_count = 0
         self.attempt_count = 0
@@ -49,6 +72,44 @@ class OpenAICompatibleProvider:
             self._stream_attempt,
             profile.retry_policy,
         )
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        """The shared connection-pooled client used by every retry attempt."""
+
+        return self._client
+
+    @property
+    def owns_client(self) -> bool:
+        return self._owns_client
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def aclose(self) -> None:
+        """Drain in-flight requests, then close the owned pooled client."""
+
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._accepting = False
+            active = tuple(self._active_tasks)
+            for task in active:
+                task.cancel("provider is closing")
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+            if self._owns_client:
+                await self._client.aclose()
+            self._closed = True
+
+    async def __aenter__(self) -> "OpenAICompatibleProvider":
+        if not self._accepting or self._closed:
+            raise RuntimeError("provider is closed")
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
+        await self.aclose()
 
     def stream(
         self,
@@ -58,6 +119,8 @@ class OpenAICompatibleProvider:
     ) -> AssistantMessageEventStream:
         """满足 Agent Loop 的 StreamFn 契约，并在后台执行 HTTP 请求。"""
 
+        if self._closed:
+            raise RuntimeError("provider is closed")
         self.call_count += 1
         return self._retrying_stream(model, context, options)
 
@@ -67,9 +130,22 @@ class OpenAICompatibleProvider:
         context: dict[str, Any],
         options: dict[str, Any],
     ) -> AssistantMessageEventStream:
+        if not self._accepting or self._closed:
+            raise RuntimeError("provider is closed")
         stream = AssistantMessageEventStream()
         self.attempt_count += 1
-        asyncio.create_task(self._run(stream, model, context, options))
+        task = asyncio.create_task(
+            self._run(stream, model, context, options),
+            name=f"pi-provider-call:{self.profile.name}:{model.id}",
+        )
+        self._active_tasks.add(task)
+
+        def settled(completed: asyncio.Task[None]) -> None:
+            self._active_tasks.discard(completed)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(settled)
         return stream
 
     async def _run(
@@ -154,45 +230,40 @@ class OpenAICompatibleProvider:
         }
 
         try:
-            async with httpx.AsyncClient(
-                transport=self._transport,
+            async with self._client.stream(
+                "POST",
+                self.profile.request_url,
+                headers=headers,
+                json=payload,
                 timeout=timeout,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                async with client.stream(
-                    "POST",
-                    self.profile.request_url,
-                    headers=headers,
-                    json=payload,
-                ) as response:
-                    self._raise_for_status(response.status_code, response.headers)
-                    content_type = response.headers.get("content-type", "")
-                    if content_type and "text/event-stream" not in content_type:
-                        raise ProviderProtocolError(
-                            "第三方 API 在 stream=true 时未返回 text/event-stream"
-                        )
+            ) as response:
+                self._raise_for_status(response.status_code, response.headers)
+                content_type = response.headers.get("content-type", "")
+                if content_type and "text/event-stream" not in content_type:
+                    raise ProviderProtocolError(
+                        "第三方 API 在 stream=true 时未返回 text/event-stream"
+                    )
 
-                    translator = OpenAIStreamTranslator(stream, model)
-                    translator.start()
-                    saw_done = False
-                    async for data in iter_sse_data(response.aiter_bytes()):
-                        if data.strip() == "[DONE]":
-                            saw_done = True
-                            translator.finish()
-                            break
-                        try:
-                            event = json.loads(data)
-                        except json.JSONDecodeError as error:
-                            raise ProviderProtocolError(
-                                "SSE data 不是合法 JSON"
-                            ) from error
-                        translator.feed(event)
-
-                    if not saw_done:
+                translator = OpenAIStreamTranslator(stream, model)
+                translator.start()
+                saw_done = False
+                async for data in iter_sse_data(response.aiter_bytes()):
+                    if data.strip() == "[DONE]":
+                        saw_done = True
+                        translator.finish()
+                        break
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError as error:
                         raise ProviderProtocolError(
-                            "SSE 连接在 data: [DONE] 之前结束"
-                        )
+                            "SSE data 不是合法 JSON"
+                        ) from error
+                    translator.feed(event)
+
+                if not saw_done:
+                    raise ProviderProtocolError(
+                        "SSE 连接在 data: [DONE] 之前结束"
+                    )
         except httpx.TimeoutException as error:
             raise ProviderTimeoutError("第三方模型 API 请求超时") from error
         except httpx.HTTPError as error:

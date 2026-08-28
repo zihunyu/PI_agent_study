@@ -66,3 +66,15 @@
 - Approval/Write 的读取、状态检查和 Event 追加必须使用 CAS/事务，禁止裸露的 read-check-append。
 - Approval Consume、Write Claim、Tool Dispatch Intent 必须在同一 Store Transaction 中提交。
 - 外部写操作不能包在长数据库事务中；必须先持久 Claim，再依赖 Idempotency Key 和 Reconciliation 完成。
+- Assistant Tool Call、DurableActionEnvelope、Approval Request/Registered、Write Prepared/Waiting 和 Tool Intent 必须在同一初始事务中落盘。
+- DurableActionEnvelope 必须统一绑定 operationId、toolCallId、toolName、exact arguments 和 writeId；Resume Payload 只能携带同一 Envelope。
+- waiting_approval 但缺少 Approval/Write 事实时必须 Manual Intervention，绝不能恢复 execute_tool。
+- Tool Intent 必须 get-or-create；Resume 不得无条件重复追加 Intent。
+- Write waiting_approval 的 Recovery 必须联合关联 Approval 状态，Approved 不得继续报告 Waiting。
+- Reconciliation 必须有 Lease Claim，并允许从 reconciling 崩溃状态重入；Handler 异常应回到 outcome_unknown。
+- model_request_started 缺少 requestPolicy 时必须保存 None 并清除 Active Policy，禁止继承上一请求。
+- Approval 转换必须使用完整 Operation Reducer 预验证；Grant/Reject 的 TTL 必须在 Store Transaction 内检查。
+- 外部 prompt Task 的 asyncio.CancelledError 必须完成 Transcript 和 Durable Operation 收尾后再传播。
+- tool_execution_end 是副作用 Commit Boundary；Listener 失败不得把已执行工具伪造为未执行，Tool Result Message 应修复缺失的 Tool Result Event。
+- Recovery Model 的 stopReason=length 不得完成 Operation。
+- Expected Arguments 必须由单个 Tool Call 完整精确匹配；禁止额外参数和跨 Tool Call 拼凑。

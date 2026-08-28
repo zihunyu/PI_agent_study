@@ -22,14 +22,12 @@ from pi_agent_loop import (  # noqa: E402
     JsonlOperationEventStore,
     Model,
     ModelRequestPolicy,
-    OperationState,
     OutcomeUnknownToolError,
     RecoveryCallbacks,
     RequestDecision,
     RoutedAgent,
     ScriptedProvider,
     StaticIdentityVerifier,
-    WriteOperationError,
     WriteOperationService,
     assistant_message,
     create_divide_tool,
@@ -196,6 +194,12 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
         async def plan_for(replay_policy: str):
             store = InMemoryOperationEventStore()
             await self.start_operation(store)
+            policy = ModelRequestPolicy(
+                visible_tool_names=("write-or-read",),
+                tool_choice="required",
+                allowed_tool_names=("write-or-read",),
+                expected_tool_arguments={"value": 1},
+            )
             assistant = assistant_message(
                 model=self.model,
                 stop_reason="toolUse",
@@ -210,7 +214,10 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
                 "model_request_started",
                 "session-1",
                 "operation-1",
-                {"requestId": "request-1"},
+                {
+                    "requestId": "request-1",
+                    "requestPolicy": policy.to_dict(),
+                },
             )
             await store.append(
                 "model_request_completed",

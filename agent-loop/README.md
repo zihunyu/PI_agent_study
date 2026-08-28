@@ -159,6 +159,7 @@ agent-loop/
 │  ├─ test_durable_agent_host.py     P1 Host/Runtime/Approval Resume 测试
 │  ├─ test_durable_session.py        Context/Approval/写操作/恢复测试
 │  ├─ test_sqlite_transactional_store.py SQLite/CAS/Claim 并发测试
+│  ├─ test_p0_durable_boundaries.py Action/Crash/Cancel P0 测试
 │  ├─ test_provider_serialize.py     OpenAI 请求序列化测试
 │  ├─ test_provider_sse.py           SSE 分片测试
 │  ├─ test_openai_compatible_provider.py  HTTP 与 Agent 集成测试
@@ -171,6 +172,7 @@ agent-loop/
    ├─ __init__.py                    公开导出
    ├─ cancellation.py                合作式取消令牌
    ├─ config.py                      TOML 配置加载
+   ├─ durable_action.py              统一 DurableActionEnvelope
    ├─ event_stream.py                异步事件流和最终结果
    ├─ messages.py                    消息构造与复制
    ├─ model_policy.py                Model Request/Continuation Policy
@@ -1238,12 +1240,13 @@ python -m unittest discover -s tests -v
 
 ### 17.7 Backpressure
 
-EventStream 和工具 update 应支持：
+EventStream 和工具 update 已支持：
 
 - 有界队列；
 - update 合并；
 - 慢消费者策略；
-- 最大内存限制。
+- 最大内存限制；
+- 终止事件优先投递。
 
 ### 17.8 Retry 与 Compaction
 
@@ -2922,8 +2925,8 @@ python -m unittest discover -s tests -v
 
 - Process Recovery 已实现 Chain 发现和 Handler 协调，但完整模型请求恢复仍依赖未来 Session Store；
 - Circuit 状态尚未跨进程持久化；
-- Sliding Window Compactor 不是生产摘要器；
-- TaskRetryExecutor 不是多 Intent PlanExecutor；
+- 兼容用 Sliding Window Compactor 仍保留；生产入口默认使用 Token-aware 结构化摘要器；
+- TaskRetryExecutor 仍只负责单任务重试；多 Intent 请求使用独立的 `HybridRequestPlanner` 和 `PlanExecutor`；
 - Outcome Reconciliation 需要真实业务提供查询 API；
 - 写工具默认不配置自动 Retry。
 
@@ -3196,17 +3199,17 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 178 tests
+Ran 227 tests
 OK
 ```
 
 ### 27.13 当前边界
 
-- DurableAgentHost 的 Runtime/Operation Event 默认共用 SQLite 事务数据库；
+- DurableAgentHost 的 Runtime/Operation/Retry Event 默认共用加密的 SQLite Session Journal；
 - JSONL Store 只保留给单实例示例和兼容入口；
 - 完整 Context 和恢复计划已实现，但真实 Provider/工具恢复要由 Host 注入 Callback；
 - DomainStateMachine 是基础框架，真实项目必须提供自己的状态表；
-- 多 Intent Plan/Task 状态机仍需后续开发；
+- 多 Intent Plan、依赖图、审批屏障、Task 状态机和结果合成器已经提供，真实项目仍需注册 Intent 策略与执行 Handler；
 - 分布式多写者需要数据库事务或单写者协议。
 
 ---
@@ -3424,7 +3427,7 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 178 tests
+Ran 189 tests
 OK
 ```
 
@@ -3796,6 +3799,8 @@ report = await host.recover_on_startup()
 
 ```text
 completed
+waiting_approval
+ready_to_resume
 manual_intervention
 failed
 ```
@@ -3804,23 +3809,34 @@ failed
 
 ### 32.5 Approval Resume
 
-Host 使用 Router 得到 `in_scope_approval_required` 时：
+Host 使用 Router 得到 `in_scope_approval_required` 时，在一个事务中持久化：
 
 ```text
-保持 Runtime Run 在 waiting_approval
-保持 Durable Operation 活动
-持久化 User Message
-持久化 Host 确认的 Assistant Tool Call
-创建绑定 Action Hash 的 Approval
-返回 approval_id
+User Message
+Host 确认的 Assistant Tool Call
+DurableActionEnvelope
+Approval Request + Resume Registered
+Write Prepared + Waiting Approval
+Tool Intent
 ```
 
-使用：
+Envelope 统一绑定：
+
+```text
+operationId
+toolCallId
+toolName
+exact arguments
+writeId
+```
+
+使用时必须在初始 Prompt 提供 Idempotency Key：
 
 ```python
 pending = await host.prompt(
     "取消订单 1001",
     requester=verified_operator,
+    idempotency_key="cancel-order-1001",
 )
 ```
 
@@ -3841,10 +3857,11 @@ final = await host.approve_and_resume(
 ```text
 验证 Approver Role
 → 禁止默认自审
+→ 校验 Action/Resume/Write Envelope
 → 消费 Approval 一次
-→ WriteOperation Prepare
+→ 复用已持久 Write/Tool Intent
+→ CAS Claim + Tool Dispatch
 → Idempotency 去重
-→ Tool Intent/Dispatch 持久化
 → 执行写 Handler
 → Tool Result 写入完整 Context
 → 正式 Model Runtime 生成最终回答
@@ -3917,11 +3934,11 @@ OK
 
 - StaticIdentityVerifier 仍只用于开发测试；
 - Approval UI/API 和通知尚未实现；
-- DurableAgentHost 默认使用 SQLite 单机事务 Store；
+- DurableAgentHost 默认使用加密、租户隔离的 SQLite Session Journal；
 - JSONL 只保留为 `store_backend="jsonl"` 单实例兼容模式；
 - 跨机器多 Worker 需要后续 PostgreSQL Store；
 - 真实业务 Tool/Identity/Reconciliation 需要后续 Adapter；
-- 多 Intent Plan/Task 属于 P3。
+- 多 Intent Plan/Task 执行框架已实现；跨机器 Worker Queue 和故障接管仍属于后续分布式能力。
 
 ---
 
@@ -4223,7 +4240,7 @@ python -m unittest discover -s tests -v
 覆盖 Waiting、Approved、Consumed、Rejected、OutcomeUnknown、Action Hash、Dispatch Invariant、Startup Report 和 Direct Recovery 防绕过。
 
 ```text
-Ran 178 tests
+Ran 189 tests
 OK
 ```
 
@@ -4321,7 +4338,7 @@ operation_finished(failed)
 `DurableAgentHost.create()` 默认：
 
 ```python
-store_backend="sqlite"
+store_backend="journal"
 ```
 
 状态文件：
@@ -4330,11 +4347,13 @@ store_backend="sqlite"
 <state_dir>/agent-state.sqlite3
 ```
 
-兼容旧 JSONL：
+兼容旧 JSONL（仅普通 Agent/只读或离线示例）：
 
 ```python
 store_backend="jsonl"
 ```
+
+`journal` 后端把 Runtime、Operation、Retry、Approval 和 Write 事实写进同一条加密时间线。旧 `sqlite` 和 `jsonl` 只作为兼容入口；JSONL 不保证崩溃时批次原子性，因此 DurableAgentHost 会拒绝在 JSONL Backend 上启动 Approval 写请求。
 
 ### 37.2 Store 类型
 
@@ -4422,6 +4441,220 @@ operation_recovery
 全部测试：
 
 ```text
-Ran 178 tests
+Ran 189 tests
 OK
+```
+
+---
+
+## 38. Durable P0 崩溃窗口统一修复
+
+### 38.1 初始安全事务
+
+Approval 写请求不再先写 Assistant Tool Call、后建 Approval。Host 会先生成：
+
+```python
+DurableActionEnvelope(
+    operation_id=...,
+    tool_call_id=...,
+    tool_name=...,
+    arguments=...,
+    write_id=...,
+)
+```
+
+然后把以下事实作为一个 `append_batch()` 事务提交：
+
+```text
+User Message
+Model Request Started/Completed
+Continuation Policy
+Approval Requested/Resume Registered
+Write Prepared/Waiting Approval
+Tool Intent Recorded
+```
+
+因此只能观察到“全部不存在”或“全部存在”。`waiting_approval` 却没有 Approval/Write 的旧损坏状态会进入 Manual Intervention，绝不执行 Tool。
+
+### 38.2 Envelope 端到端绑定
+
+同一个 Envelope 同时用于：
+
+```text
+Approval Action Hash
+Resume Payload
+Operation Reducer
+Write Action Hash
+Tool Intent
+Write Execute
+```
+
+Reducer 和 Host 都校验 Operation ID、Tool Call ID、Tool Name、精确 Arguments 和 Write ID。`read_order` Approval 不能再执行 `refund_order` Payload。
+
+### 38.3 Intent 与结果物化幂等
+
+Tool Intent 在初始事务中创建，Resume 只复用。Write 成功后的 `tool_completed + ToolResult Message` 使用 CAS 幂等物化：
+
+```text
+Intent 已存在 → 不重复写
+Tool Completed 已存在 → 不重复写
+ToolResult Message 已存在 → 不重复写
+```
+
+### 38.4 Cancellation 与 Commit Boundary
+
+外部：
+
+```python
+prompt_task.cancel()
+```
+
+现在会先：
+
+```text
+取消嵌套工具 Task
+补齐 Synthetic ToolResult
+闭合 Transcript
+写 Operation Cancelled
+```
+
+完成后才向调用方重新抛出 `CancelledError`。
+
+`tool_execution_end` 被定义为副作用 Commit Boundary。Listener 在该事件失败时只记录 `listener_errors`，不会取消已经提交的兄弟工具，也不会把真实成功伪造成“工具未执行”。Recorder 会在 ToolResult Message 阶段补齐缺失的 Tool Completed Event。
+
+### 38.5 Approval/Write 联合恢复
+
+`write.state=waiting_approval` 不再单独决定结果：
+
+```text
+Approval waiting  → wait_for_approval
+Approval approved → consume_approval / ready_to_resume
+Approval consumed → resume_approved_write
+Approval rejected/expired → finalize_rejected_approval
+Approval missing → manual_intervention
+```
+
+Startup Report 新增 `ready_to_resume`，已批准操作不会继续显示为等待经理审批。
+
+### 38.6 Reconciliation 可重入
+
+Reconciliation 使用 `write_reconcile` Lease Claim：
+
+```text
+outcome_unknown → reconciling → succeeded/failed
+Handler 异常 → write_reconcile_failed → outcome_unknown
+进程在 reconciling 崩溃 → Lease 获胜者可重入
+```
+
+### 38.7 Policy、Length 与精确参数
+
+```text
+model_request_started 缺 requestPolicy
+→ policy=None
+→ active policy 清空
+→ manual_intervention
+```
+
+不会继承旧的全部工具/Auto 策略。
+
+普通 Recovery 遇到 `stopReason=length` 会失败，不会完成 Operation。
+
+存在 Expected Arguments 时必须满足：
+
+```text
+恰好一个 Tool Call
+Arguments 与持久快照完整相等
+没有额外参数
+不能跨多个调用拼凑字段
+```
+
+### 38.8 Approval 完整事务校验
+
+Approval Request、Grant、Reject、Consume、Expire 都先通过完整 Operation Reducer。终态 Operation 不能继续追加 Approval Event。
+
+Grant/Reject 的 TTL 使用 Store `deadline_ms` 在 `BEGIN IMMEDIATE` 事务内最终检查，不能跨过过期时间后再批准。
+
+### 38.9 P0 测试
+
+新增 `tests/test_p0_durable_boundaries.py`，覆盖 11 类确定性场景：
+
+1. Approval 缺失窗口禁止 Execute Tool；
+2. Host 原子持久化 Envelope/Approval/Write/Intent；
+3. Resume Payload 篡改拒绝；
+4. 外部 Task Cancel 后 Transcript/Operation 闭合；
+5. Approved Write 不再规划 Waiting；
+6. Reconciliation 异常后可重试；
+7. 缺失 Request Policy 不继承旧策略；
+8. 终态 Approval 与事务 TTL；
+9. Listener 失败不伪造副作用结果；
+10. 普通 Recovery 拒绝 Length；
+11. Expected Arguments 单调用精确匹配。
+
+全部项目：
+
+```text
+Ran 227 tests
+OK
+```
+
+---
+
+## 39. P0 完成审计补强
+
+本轮在第 38 节基础上继续关闭了重入和绕过窗口：
+
+- Public `ApprovalResumeCoordinator` 必须在一个事务中创建 Assistant Call、Write、Approval、Resume 和 Tool Intent，并拒绝非原子 Store；
+- Operation Reducer 逐步校验 Approval、Write、Tool Call、Tool Intent 和唯一 ToolResult，不能靠伪造 Event 绕过；
+- Durable Action 与 Expected Arguments 按 JSON 类型递归精确比较，`true`、`1`、`1.0` 不再互相等价；
+- Approval Resume、Operation Recovery 和 Write Reconciliation 的长回调均持续续租，并在提交前再次确认 Claim；
+- Write Handler 被取消会进入 `outcome_unknown`，只能通过 Reconciliation 确认结果；
+- Approval 后最终 Model Request 被取消时复用同一个 Pending Request；若 Completed 已落盘则直接复用响应；
+- Recovery Tool Callback 必须返回当前计划的 Tool Call ID、Tool Name 和合法 ToolResult，不能替换目标调用；
+- 完整历史 Context、低层 Transcript Repair 和 Tool Commit Boundary 均同步到调用方与 Durable Journal。
+
+专项测试位于：
+
+```text
+tests/test_p0_approval_atomicity.py
+tests/test_p0_invariant_bindings.py
+tests/test_p0_recovery_policy.py
+tests/test_p0_session_recovery_lease.py
+tests/test_p0_transcript_boundaries.py
+```
+
+---
+
+## 40. 生产化 Harness 能力
+
+本轮把原先分散或仅用于教学的能力收敛到统一运行边界：
+
+- `SQLiteSessionEventJournal`：Runtime、Operation、Retry、Approval、Write 共用加密事件表，提供租户隔离、角色访问控制、脱敏读取、保留策略、导出、删除、审计、完整性校验、Snapshot 和版本迁移；
+- `ToolDispatchRuntime`：普通 Agent 与 Recovery 共用工具校验、Hook、Timeout、Retry、取消、读写资源锁、公平/优先级队列、租户限流、跨进程 Lease 和 Telemetry；
+- `ModelCallRuntime`：普通调用、Router 与 Recovery 共用 Provider、Retry、Circuit、Compaction、取消、Usage/Cost、Durable Event 和 Telemetry；
+- `DurableAgentHost`：保留 Facade，对象创建、资源生命周期、恢复和审批分别由 `harness/factory.py`、`resources.py`、`lifecycle.py`、`recovery.py`、`approval.py` 负责；
+- `TokenAwareStructuredCompactor`：按 Token 预算保留近期消息，把早期 Tool/Approval/业务事实生成可校验的结构化摘要，并记录 Replacement Event；
+- `RouterEvaluator`：提供 Intent 数据集、Status + Intent 联合混淆矩阵、精确到工具名的 Required Tool 漏检、置信度校准、恶意输入、真实 Hybrid Router Usage/Cost/延迟和不可用 NaN 绕过的版本回归门禁；
+- `HybridRequestPlanner` 与 `PlanExecutor`：提供 Plan 校验、依赖图、Task 状态机、审批屏障、并行执行、恢复策略和结果合成；`DurableAgentHost.plan()`、`execute_plan()`、`resume_plan()` 已把它们接到统一 Session Journal，Plan/Event 绑定 Session + Plan ID，追加使用 CAS，同 Plan 跨 Worker 执行使用可续租 Lease，重启后从事件流重放。
+
+生产边界也已补齐：
+
+- Journal 完整性清单同时覆盖 Event、Snapshot 和元数据；旧版无完整性清单的数据库默认拒绝打开，只能由受控迁移程序显式设置 `allow_legacy_integrity_bootstrap=True` 完成一次性升级；
+- SQLite 等同步持久化调用使用可排空的线程边界，调用方即使连续取消，Host 也会等待正在提交的事务结束，避免后台线程在资源关闭后继续写库；
+- `ModelCallRuntime` 和 `OpenAICompatibleProvider` 都会停止接收新请求、取消并排空在途请求，再由 Host 统一关闭共享 `httpx.AsyncClient` 连接池；
+- Host 可通过 `model_retry_policy` 和 `model_circuit_breaker` 为普通 Agent、Router 和 Recovery 配置同一套模型重试与熔断策略；
+- EventStream 使用条数和字节双重有界队列，更新事件可合并，终止事件受保护，慢消费者不会让内存无限增长；
+- Telemetry 提供脱敏的 Metrics、Trace、结构化日志和 Alert，覆盖模型/工具延迟、Token、费用、重试、熔断、审批等待、恢复、资源锁和队列压力。
+
+专项测试：
+
+```bat
+python -m unittest tests.test_unified_session_journal -v
+python -m unittest tests.test_tool_dispatch_runtime -v
+python -m unittest tests.test_p2_runtime_features -v
+python -m unittest tests.test_p2_host_integration -v
+python -m unittest tests.test_p2_context_compaction -v
+python -m unittest tests.test_p2_router_evaluation -v
+python -m unittest tests.test_p2_multi_intent_planning -v
+python -m unittest tests.test_p2_durable_planning -v
+python -m unittest tests.test_durable_to_thread -v
 ```

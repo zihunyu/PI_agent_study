@@ -11,9 +11,11 @@ from uuid import uuid4
 
 from ..security import VerifiedIdentity
 from ..session.operation_events import OperationEvent
+from ..session.operation_state import replay_operation, replay_operation_with_specs
 from ..session.operation_store import (
     OperationEventStore,
     OperationStoreConflictError,
+    OperationStoreDeadlineExceeded,
     operation_last_sequence,
 )
 
@@ -41,8 +43,14 @@ class ApprovalRecord:
 
 
 class ApprovalService:
-    def __init__(self, store: OperationEventStore) -> None:
+    def __init__(
+        self,
+        store: OperationEventStore,
+        *,
+        session_id: str | None = None,
+    ) -> None:
         self.store = store
+        self.session_id = session_id
 
     async def request(
         self,
@@ -55,6 +63,11 @@ class ApprovalService:
         required_role: str,
         ttl_seconds: float = 300,
     ) -> ApprovalRecord:
+        if self.session_id is not None and session_id != self.session_id:
+            raise ApprovalError(
+                "approval_session_out_of_scope",
+                "Approval 不属于当前 Session",
+            )
         approval_id, data = build_approval_request_event(
             requester=requester,
             action=action,
@@ -72,11 +85,13 @@ class ApprovalService:
                     "operation_not_found",
                     "Approval 必须属于已持久化的 Operation",
                 )
+            specs = [("approval_requested", data)]
+            replay_operation_with_specs(events, specs)
             try:
                 await self.store.append_batch(
                     session_id,
                     operation_id,
-                    [("approval_requested", data)],
+                    specs,
                     expected_last_sequence=operation_last_sequence(events),
                 )
                 return await self.get(approval_id)
@@ -113,6 +128,7 @@ class ApprovalService:
             required_state="waiting",
             invalid_code="approval_not_waiting",
             invalid_message="Approval 已不在等待状态",
+            deadline_ms=record.expires_at,
         )
 
     async def reject(
@@ -137,6 +153,7 @@ class ApprovalService:
             required_state="waiting",
             invalid_code="approval_not_waiting",
             invalid_message="Approval 已不在等待状态",
+            deadline_ms=record.expires_at,
         )
 
     async def consume(
@@ -166,8 +183,15 @@ class ApprovalService:
         )
 
     async def get(self, approval_id: str) -> ApprovalRecord:
-        events = await self.store.load()
+        events = await self.store.load(session_id=self.session_id)
         record = _replay_approval(events, approval_id)
+        operation_events = [
+            event
+            for event in events
+            if event.session_id == record.session_id
+            and event.operation_id == record.operation_id
+        ]
+        replay_operation(operation_events)
         if (
             record.state == "waiting"
             and record.expires_at <= int(time.time() * 1000)
@@ -186,16 +210,18 @@ class ApprovalService:
                 return current
             if current.expires_at > int(time.time() * 1000):
                 return current
+            specs = [
+                (
+                    "approval_expired",
+                    {"approvalId": current.approval_id},
+                )
+            ]
+            replay_operation_with_specs(events, specs)
             try:
                 await self.store.append_batch(
                     current.session_id,
                     current.operation_id,
-                    [
-                        (
-                            "approval_expired",
-                            {"approvalId": current.approval_id},
-                        )
-                    ],
+                    specs,
                     expected_last_sequence=operation_last_sequence(events),
                 )
             except OperationStoreConflictError:
@@ -218,6 +244,7 @@ class ApprovalService:
         required_state: str,
         invalid_code: str,
         invalid_message: str,
+        deadline_ms: int | None = None,
     ) -> ApprovalRecord:
         for _ in range(_MAX_CONFLICT_RETRIES):
             events = await self.store.load(
@@ -227,12 +254,21 @@ class ApprovalService:
             current = _replay_approval(events, record.approval_id)
             if current.state != required_state:
                 raise ApprovalError(invalid_code, invalid_message)
+            specs = [(event_type, data)]
+            replay_operation_with_specs(events, specs)
             try:
                 await self.store.append_batch(
                     current.session_id,
                     current.operation_id,
-                    [(event_type, data)],
+                    specs,
                     expected_last_sequence=operation_last_sequence(events),
+                    deadline_ms=deadline_ms,
+                )
+            except OperationStoreDeadlineExceeded:
+                await self._expire(current)
+                raise ApprovalError(
+                    "approval_expired",
+                    "Approval 已过期，不能继续状态转换",
                 )
             except OperationStoreConflictError:
                 continue

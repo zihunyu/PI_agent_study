@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..async_utils import durable_to_thread
+
 _TERMINAL_EVENTS = {
     "model_retry_finished",
     "tool_retry_finished",
@@ -53,7 +55,7 @@ class JsonlRetryEventStore:
         record.setdefault("timestamp", int(time.time() * 1000))
         encoded = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         async with self._lock:
-            await asyncio.to_thread(self._append_line, encoded)
+            await durable_to_thread(self._append_line, encoded)
 
     def _append_line(self, encoded: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

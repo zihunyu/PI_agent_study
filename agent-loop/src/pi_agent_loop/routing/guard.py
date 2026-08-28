@@ -9,6 +9,12 @@ from collections.abc import Awaitable
 from typing import Any, cast
 
 from ..event_stream import AssistantMessageEventStream
+from ..model_policy import tool_calls_match_expected_arguments
+from ..retry.model import (
+    ProducerOwnedAssistantMessageEventStream,
+    bind_stream_producer,
+    settle_stream_producer,
+)
 from ..types import Model, StreamFn
 from .capabilities import CapabilityRegistry
 from .types import ToolChoicePolicy, ToolGuardViolation
@@ -27,7 +33,7 @@ class RequiredToolCallGuard:
         policy: ToolChoicePolicy,
         required_capabilities: tuple[str, ...] = (),
         allowed_tool_names: tuple[str, ...] = (),
-        expected_arguments: dict[str, str] | None = None,
+        expected_arguments: dict[str, Any] | None = None,
     ) -> ToolGuardViolation | None:
         tool_blocks = [
             block
@@ -38,8 +44,6 @@ class RequiredToolCallGuard:
         called_set = set(called_tools)
         allowed_set = set(allowed_tool_names)
 
-        if policy.mode == "auto":
-            return None
         if policy.mode == "none":
             if called_tools:
                 return ToolGuardViolation(
@@ -48,7 +52,8 @@ class RequiredToolCallGuard:
                     required_capabilities=(),
                     called_tools=called_tools,
                 )
-            return None
+            if expected_arguments is None:
+                return None
 
         if allowed_set:
             unexpected = tuple(
@@ -84,26 +89,19 @@ class RequiredToolCallGuard:
                 missing_capabilities=required_capabilities,
             )
 
-        if expected_arguments:
-            mismatched = tuple(
-                field
-                for field, expected in expected_arguments.items()
-                if not any(
-                    isinstance(block.get("arguments"), dict)
-                    and str(block["arguments"].get(field, "")) == str(expected)
-                    for block in tool_blocks
-                )
+        if not tool_calls_match_expected_arguments(
+            tool_blocks,
+            expected_arguments,
+        ):
+            return ToolGuardViolation(
+                code="required_tool_arguments_mismatch",
+                message=(
+                    "模型必须在单个 Tool Call 中使用与 Router 确认值"
+                    "完全一致的参数，禁止额外参数或跨调用拼凑。"
+                ),
+                required_capabilities=required_capabilities,
+                called_tools=called_tools,
             )
-            if mismatched:
-                return ToolGuardViolation(
-                    code="required_tool_arguments_mismatch",
-                    message=(
-                        "模型工具调用没有使用 Router 已确认的业务参数："
-                        + "、".join(mismatched)
-                    ),
-                    required_capabilities=required_capabilities,
-                    called_tools=called_tools,
-                )
 
         provided = self.capabilities.capabilities_for_tools(called_set)
         missing = tuple(
@@ -137,8 +135,12 @@ def guard_stream_fn(
         context: dict[str, Any],
         options: dict[str, Any],
     ) -> AssistantMessageEventStream:
-        output = AssistantMessageEventStream()
-        asyncio.create_task(_pump(output, model, context, options))
+        output = ProducerOwnedAssistantMessageEventStream()
+        task = asyncio.create_task(
+            _pump(output, model, context, options),
+            name=f"pi-model-guard:{model.provider}:{model.id}",
+        )
+        bind_stream_producer(output, task)
         return output
 
     async def _pump(
@@ -147,6 +149,8 @@ def guard_stream_fn(
         context: dict[str, Any],
         options: dict[str, Any],
     ) -> None:
+        source: Any | None = None
+        completed = False
         try:
             source_value = stream_fn(model, context, options)
             source = (
@@ -158,7 +162,19 @@ def guard_stream_fn(
                 raise TypeError("被 Guard 包装的 stream_fn 返回值不符合事件流契约")
 
             policy = _policy_from_options(options.get("tool_choice", "auto"))
-            strict = policy.mode != "auto"
+            expected_arguments = _expected_arguments_from_options(options)
+            required_capabilities = tuple(
+                options.get("required_capabilities", ())
+            )
+            allowed_tool_names = tuple(
+                options.get("allowed_tool_names", ())
+            )
+            strict = (
+                policy.mode != "auto"
+                or expected_arguments is not None
+                or bool(required_capabilities)
+                or bool(allowed_tool_names)
+            )
             buffered: list[dict[str, Any]] = []
             terminal_seen = False
 
@@ -181,18 +197,9 @@ def guard_stream_fn(
                     violation = guard.validate(
                         event["message"],
                         policy=policy,
-                        required_capabilities=tuple(
-                            options.get("required_capabilities", ())
-                        ),
-                        allowed_tool_names=tuple(
-                            options.get("allowed_tool_names", ())
-                        ),
-                        expected_arguments={
-                            str(key): str(value)
-                            for key, value in dict(
-                                options.get("expected_tool_arguments", {})
-                            ).items()
-                        },
+                        required_capabilities=required_capabilities,
+                        allowed_tool_names=allowed_tool_names,
+                        expected_arguments=expected_arguments,
                     )
                     if violation is None:
                         for item in buffered:
@@ -205,8 +212,12 @@ def guard_stream_fn(
 
             if not terminal_seen:
                 raise RuntimeError("被 Guard 包装的 Provider 未产生终止事件")
+            completed = True
         except BaseException as error:
             output.fail(error)
+        finally:
+            if source is not None:
+                await settle_stream_producer(source, cancel=not completed)
 
     return guarded
 
@@ -223,6 +234,17 @@ def _policy_from_options(value: Any) -> ToolChoicePolicy:
             if isinstance(name, str) and name:
                 return ToolChoicePolicy("named", name)
     raise ValueError("Guard 收到无效 tool_choice")
+
+
+def _expected_arguments_from_options(
+    options: dict[str, Any],
+) -> dict[str, Any] | None:
+    value = options.get("expected_tool_arguments")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Guard 收到的 expected_tool_arguments 必须是对象")
+    return copy.deepcopy(value)
 
 
 def _violation_event(

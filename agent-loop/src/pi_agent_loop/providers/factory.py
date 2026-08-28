@@ -13,6 +13,9 @@ def create_provider(
     settings: ProviderSettings,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    client: httpx.AsyncClient | None = None,
+    owns_client: bool | None = None,
+    limits: httpx.Limits | None = None,
 ) -> tuple[Model, OpenAICompatibleProvider]:
     """创建当前 active profile 对应的模型和 Provider。"""
 
@@ -23,4 +26,10 @@ def create_provider(
         api=profile.protocol,
         name=profile.model,
     )
-    return model, OpenAICompatibleProvider(profile, transport=transport)
+    return model, OpenAICompatibleProvider(
+        profile,
+        transport=transport,
+        client=client,
+        owns_client=owns_client,
+        limits=limits,
+    )

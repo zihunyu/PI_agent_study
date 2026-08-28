@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sqlite3
 import time
@@ -10,11 +9,13 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from ..async_utils import durable_to_thread
 from ..runtime.events import RuntimeEvent
 from .operation_events import OperationEvent
 from .operation_store import (
     OperationEventSpec,
     OperationStoreConflictError,
+    _check_deadline,
     _check_expected,
     _validate_batch,
     _validate_claim,
@@ -122,6 +123,8 @@ class _SQLiteStoreBase:
 class SQLiteOperationEventStore(_SQLiteStoreBase):
     """带 CAS、批量事务、唯一约束和跨进程 Lease Claim 的 Store。"""
 
+    supports_atomic_transactions = True
+
     async def append(self, event_type, session_id, operation_id, data=None):
         return (
             await self.append_batch(
@@ -138,14 +141,16 @@ class SQLiteOperationEventStore(_SQLiteStoreBase):
         events: list[OperationEventSpec],
         *,
         expected_last_sequence: int | None = None,
+        deadline_ms: int | None = None,
     ) -> list[OperationEvent]:
         _validate_batch(events)
-        return await asyncio.to_thread(
+        return await durable_to_thread(
             self._append_batch_sync,
             session_id,
             operation_id,
             events,
             expected_last_sequence,
+            deadline_ms,
         )
 
     def _append_batch_sync(
@@ -154,6 +159,7 @@ class SQLiteOperationEventStore(_SQLiteStoreBase):
         operation_id: str,
         events: list[OperationEventSpec],
         expected_last_sequence: int | None,
+        deadline_ms: int | None,
     ) -> list[OperationEvent]:
         connection = self._connect()
         try:
@@ -167,6 +173,7 @@ class SQLiteOperationEventStore(_SQLiteStoreBase):
                 (session_id, operation_id),
             ).fetchone()
             _check_expected(int(row["value"]), expected_last_sequence)
+            _check_deadline(deadline_ms)
             appended: list[OperationEvent] = []
             for event_type, raw_data in events:
                 data = dict(raw_data)
@@ -221,7 +228,7 @@ class SQLiteOperationEventStore(_SQLiteStoreBase):
             connection.close()
 
     async def load(self, *, session_id=None, operation_id=None):
-        return await asyncio.to_thread(
+        return await durable_to_thread(
             self._load_sync,
             session_id,
             operation_id,
@@ -263,7 +270,7 @@ class SQLiteOperationEventStore(_SQLiteStoreBase):
         lease_seconds: float = 300,
     ) -> bool:
         _validate_claim(claim_type, resource_id, owner_token, lease_seconds)
-        return await asyncio.to_thread(
+        return await durable_to_thread(
             self._try_acquire_claim_sync,
             claim_type,
             resource_id,
@@ -324,7 +331,7 @@ class SQLiteOperationEventStore(_SQLiteStoreBase):
         resource_id: str,
         owner_token: str,
     ) -> None:
-        await asyncio.to_thread(
+        await durable_to_thread(
             self._release_claim_sync,
             claim_type,
             resource_id,
@@ -351,7 +358,7 @@ class SQLiteRuntimeEventStore(_SQLiteStoreBase):
     """与 Operation Event 共用同一 SQLite 文件的 Runtime Store。"""
 
     async def append(self, event: RuntimeEvent) -> None:
-        await asyncio.to_thread(self._append_sync, event)
+        await durable_to_thread(self._append_sync, event)
 
     def _append_sync(self, event: RuntimeEvent) -> None:
         connection = self._connect()
@@ -389,7 +396,7 @@ class SQLiteRuntimeEventStore(_SQLiteStoreBase):
             connection.close()
 
     async def load(self) -> list[RuntimeEvent]:
-        return await asyncio.to_thread(self._load_sync)
+        return await durable_to_thread(self._load_sync)
 
     def _load_sync(self) -> list[RuntimeEvent]:
         with closing(self._connect()) as connection:

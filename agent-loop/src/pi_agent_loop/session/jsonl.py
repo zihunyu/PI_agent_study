@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
+from ..async_utils import durable_to_thread
 from ..runtime.events import RuntimeEvent
 
 
@@ -21,7 +22,7 @@ class JsonlRuntimeEventStore:
             separators=(",", ":"),
         )
         async with self._lock:
-            await asyncio.to_thread(self._append_line, encoded)
+            await durable_to_thread(self._append_line, encoded)
 
     def _append_line(self, encoded: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -31,7 +32,7 @@ class JsonlRuntimeEventStore:
 
     async def load(self) -> list[RuntimeEvent]:
         async with self._lock:
-            return await asyncio.to_thread(self._load_sync)
+            return await durable_to_thread(self._load_sync)
 
     def _load_sync(self) -> list[RuntimeEvent]:
         if not self.path.exists():

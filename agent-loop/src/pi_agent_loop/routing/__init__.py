@@ -2,6 +2,21 @@
 
 from .capabilities import CapabilityMatch, CapabilityRegistry, ToolCapability
 from .errors import BusinessConfigError
+from .evaluation import (
+    ConfidenceCalibration,
+    ConfidenceSample,
+    LabelMetrics,
+    RouterCaseResult,
+    RouterEvaluationCase,
+    RouterEvaluationDataset,
+    RouterEvaluationError,
+    RouterEvaluationReport,
+    RouterEvaluator,
+    RouterObservation,
+    RouterRegressionReport,
+    calibrate_confidence_threshold,
+    compare_router_reports,
+)
 from .guard import RequiredToolCallGuard, guard_stream_fn
 from .hybrid_router import HybridModelRouter
 from .routed_agent import RoutedAgent
@@ -23,11 +38,22 @@ __all__ = [
     "BusinessConfigError",
     "CapabilityMatch",
     "CapabilityRegistry",
+    "ConfidenceCalibration",
+    "ConfidenceSample",
     "HybridModelRouter",
+    "LabelMetrics",
     "RequestDecision",
     "RequiredToolCallGuard",
     "RoutedAgent",
     "RoutedPromptResult",
+    "RouterCaseResult",
+    "RouterEvaluationCase",
+    "RouterEvaluationDataset",
+    "RouterEvaluationError",
+    "RouterEvaluationReport",
+    "RouterEvaluator",
+    "RouterObservation",
+    "RouterRegressionReport",
     "SimpleBusinessConfig",
     "SimpleDeniedRule",
     "SimpleIntent",
@@ -35,6 +61,8 @@ __all__ = [
     "ToolCapability",
     "ToolChoicePolicy",
     "ToolGuardViolation",
+    "calibrate_confidence_threshold",
+    "compare_router_reports",
     "guard_stream_fn",
     "load_simple_business_config",
 ]

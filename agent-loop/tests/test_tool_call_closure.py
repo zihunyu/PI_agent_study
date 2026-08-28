@@ -180,7 +180,7 @@ class ToolCallClosureTests(unittest.IsolatedAsyncioTestCase):
 
         async def slow(_id, _args, _token, _update):
             slow_started.set()
-            await asyncio.sleep(10)
+            await asyncio.sleep(0.01)
             return AgentToolResult(content=[], details={})
 
         agent = Agent(

@@ -111,7 +111,11 @@ async def approval_resume_demo() -> None:
     })
     operator = await verifier.verify(IdentityClaim("operator", "operator-secret"))
     approver = await verifier.verify(IdentityClaim("approver", "approver-secret"))
-    pending = await host.prompt("取消订单 1001", requester=operator)
+    pending = await host.prompt(
+        "取消订单 1001",
+        requester=operator,
+        idempotency_key="cancel-order-1001",
+    )
     print("等待状态：", host.runtime_tracker.state.phase)
     print("Approval ID：", pending.approval_id)
 

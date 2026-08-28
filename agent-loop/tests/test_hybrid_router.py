@@ -16,6 +16,9 @@ from pi_agent_loop import (  # noqa: E402
     HybridModelRouter,
     Model,
     RoutedAgent,
+    RouterEvaluationCase,
+    RouterEvaluationDataset,
+    RouterEvaluator,
     ScriptedProvider,
     assistant_message,
     load_simple_business_config,
@@ -36,6 +39,7 @@ class HybridRouterTests(unittest.IsolatedAsyncioTestCase):
         *,
         arguments: dict | None = None,
         confidence: float = 0.95,
+        usage: dict | None = None,
     ) -> dict:
         return assistant_message(
             model=self.model,
@@ -53,6 +57,7 @@ class HybridRouterTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }
             ],
+            usage=usage,
         )
 
     def capabilities(self, *, include_cancel: bool = False) -> CapabilityRegistry:
@@ -129,6 +134,50 @@ class HybridRouterTests(unittest.IsolatedAsyncioTestCase):
             provider.contexts[0]["tools"][0]["name"],
             "select_business_intent",
         )
+
+    async def test_router_evaluator读取真实hybrid调用的usage和cost(self) -> None:
+        usage = {
+            "input": 123,
+            "output": 45,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 168,
+            "cost": {"total": 0.42},
+        }
+        provider = ScriptedProvider(
+            [
+                self.classifier_response(
+                    "order.get_status",
+                    arguments={"order_id": "1001"},
+                    usage=usage,
+                )
+            ]
+        )
+        router = HybridModelRouter(
+            self.config,
+            self.capabilities(),
+            model=self.model,
+            stream_fn=provider.stream,
+        )
+        report = await RouterEvaluator(
+            router, model_version="hybrid-measured"
+        ).evaluate(
+            RouterEvaluationDataset(
+                "hybrid",
+                (
+                    RouterEvaluationCase(
+                        "read",
+                        "查询订单 1001",
+                        expected_intent="order.get_status",
+                        requires_tool=True,
+                        expected_tools=("get_order_status",),
+                    ),
+                ),
+            )
+        )
+        self.assertEqual(report.total_input_tokens, 123)
+        self.assertEqual(report.total_output_tokens, 45)
+        self.assertEqual(report.total_cost, 0.42)
 
     async def test_no_tool_intent_由模型识别但不要求业务工具(self) -> None:
         provider = ScriptedProvider(

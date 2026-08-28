@@ -13,17 +13,17 @@ from pi_agent_loop import (  # noqa: E402
     ApprovalService,
     DurableSessionRecovery,
     IdentityClaim,
-    JsonlOperationEventStore,
     Model,
     ModelRequestPolicy,
     RecoveryCallbacks,
+    SQLiteOperationEventStore,
     StaticIdentityVerifier,
     WriteOperationService,
     assistant_message,
 )
 
 
-async def approval_and_write_demo(store: JsonlOperationEventStore) -> None:
+async def approval_and_write_demo(store: SQLiteOperationEventStore) -> None:
     print("\n[可信身份 + Approval + 幂等写操作]")
     session_id = "durable-demo"
     operation_id = "write-operation"
@@ -91,7 +91,7 @@ async def approval_and_write_demo(store: JsonlOperationEventStore) -> None:
     print("真实 Handler 调用次数：", calls)
 
 
-async def crash_recovery_demo(store: JsonlOperationEventStore) -> None:
+async def crash_recovery_demo(store: SQLiteOperationEventStore) -> None:
     print("\n[完整 Context + Safe Tool Replay + 继续模型]")
     session_id = "durable-demo"
     operation_id = "recovery-operation"
@@ -204,10 +204,10 @@ async def crash_recovery_demo(store: JsonlOperationEventStore) -> None:
 
 
 async def main() -> None:
-    path = ROOT / "state" / "durable-session-demo.jsonl"
+    path = ROOT / "state" / "durable-session-demo.sqlite3"
     if path.exists():
         path.unlink()
-    store = JsonlOperationEventStore(path)
+    store = SQLiteOperationEventStore(path)
     await approval_and_write_demo(store)
     await crash_recovery_demo(store)
     print("\nOperation Journal：", path)

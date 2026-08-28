@@ -18,15 +18,15 @@ import asyncio
 import copy
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, cast
+from typing import Any, cast
 
-from .cancellation import CancellationToken
+from .cancellation import CancellationToken, OperationCancelledError
 from .loop import run_agent_loop, run_agent_loop_continue
 from .messages import empty_usage, now_ms, user_message
+from .tool_runtime import ToolDispatchRuntime
 from .transcript import repair_unresolved_tool_calls
 from .types import (
     AfterToolCallContext,
-    AfterToolCallResult,
     AgentContext,
     AgentEvent,
     AgentLoopConfig,
@@ -35,7 +35,6 @@ from .types import (
     AgentState,
     AgentTool,
     BeforeToolCallContext,
-    BeforeToolCallResult,
     Model,
     QueueMode,
     StreamFn,
@@ -61,6 +60,44 @@ def _default_convert_to_llm(messages: list[AgentMessage]) -> list[AgentMessage]:
         for message in messages
         if message.get("role") in {"user", "assistant", "toolResult"}
     ]
+
+
+def _materialize_staged_tool_results(
+    messages: list[AgentMessage],
+    staged: dict[str, AgentMessage],
+) -> list[AgentMessage]:
+    """把 Commit Boundary 已产生、但尚未 Message End 的真实结果放回原位。"""
+
+    if not staged:
+        return list(messages)
+    output: list[AgentMessage] = []
+    pending: dict[str, str] = {}
+
+    def close_pending() -> None:
+        for tool_call_id, tool_name in list(pending.items()):
+            message = staged.get(tool_call_id)
+            if (
+                message is not None
+                and str(message.get("toolName", "")) == tool_name
+            ):
+                output.append(copy.deepcopy(message))
+        pending.clear()
+
+    for original in messages:
+        message = copy.deepcopy(original)
+        role = message.get("role")
+        if role != "toolResult" and pending:
+            close_pending()
+        output.append(message)
+        if role == "assistant":
+            for block in message.get("content", []):
+                if isinstance(block, dict) and block.get("type") == "toolCall":
+                    pending[str(block.get("id", ""))] = str(block.get("name", ""))
+        elif role == "toolResult":
+            pending.pop(str(message.get("toolCallId", "")), None)
+    if pending:
+        close_pending()
+    return output
 
 
 class _PendingMessageQueue:
@@ -131,6 +168,8 @@ class Agent:
         max_turns: int | None = None,
         stream_options: dict[str, Any] | None = None,
         retry_event_sink: Callable[[AgentEvent], Any] | None = None,
+        tool_runtime: ToolDispatchRuntime | None = None,
+        tenant_id: str | None = None,
     ) -> None:
         if (
             default_tool_timeout_seconds is not None
@@ -169,10 +208,22 @@ class Agent:
         self.max_turns = max_turns
         self.stream_options = dict(stream_options or {})
         self.retry_event_sink = retry_event_sink
+        self.tenant_id = tenant_id
+        self.tool_runtime = tool_runtime or ToolDispatchRuntime(
+            self.state.tools,
+            before_tool_call=before_tool_call,
+            after_tool_call=after_tool_call,
+            retry_event_sink=retry_event_sink,
+            default_tool_timeout_seconds=default_tool_timeout_seconds,
+            max_parallel_tools=max_parallel_tools or 64,
+            default_tenant_id=tenant_id,
+        )
 
         self._steering_queue = _PendingMessageQueue(steering_mode)
         self._follow_up_queue = _PendingMessageQueue(follow_up_mode)
         self._listeners: list[Listener] = []
+        self.listener_errors: list[str] = []
+        self._staged_tool_results: dict[str, AgentMessage] = {}
         self._active_token: CancellationToken | None = None
         self._idle_event = asyncio.Event()
         self._idle_event.set()
@@ -396,6 +447,12 @@ class Agent:
                 return None
             return await _maybe_await(self.prepare_next_turn(context, token))
 
+        # 工具可以在运行时动态加入；每轮同步到普通/恢复共用的 Runtime。
+        self.tool_runtime.register_tools(self.state.tools)
+        self.tool_runtime.before_tool_call = self.before_tool_call
+        self.tool_runtime.after_tool_call = self.after_tool_call
+        self.tool_runtime.retry_event_sink = self.retry_event_sink
+        self.tool_runtime.default_tool_timeout_seconds = self.default_tool_timeout_seconds
         return AgentLoopConfig(
             model=self.state.model,
             thinking_level=self.state.thinking_level,
@@ -417,6 +474,8 @@ class Agent:
             max_turns=self.max_turns,
             stream_options=dict(self.stream_options),
             retry_event_sink=self.retry_event_sink,
+            tool_runtime=self.tool_runtime,
+            tenant_id=self.tenant_id,
         )
 
     async def _run_with_lifecycle(
@@ -432,15 +491,35 @@ class Agent:
         self.state.is_streaming = True
         self.state.streaming_message = None
         self.state.error_message = None
+        self._staged_tool_results = {}
 
         try:
             await executor(token)
+        except asyncio.CancelledError:
+            # 外部 prompt_task.cancel() 不会经过 Agent.abort()。必须先完成
+            # Transcript/Durable Operation 收尾，再把取消继续抛给调用方。
+            token.cancel("外部 Prompt Task 被取消")
+            cleanup = asyncio.create_task(
+                self._handle_run_failure(
+                    OperationCancelledError(token.reason),
+                    True,
+                ),
+                name="pi-agent-external-cancel-cleanup",
+            )
+            try:
+                await asyncio.shield(cleanup)
+            except BaseException:
+                # 外部取消是主要结果；清理失败不能替换 CancelledError。
+                if not cleanup.done():
+                    await asyncio.gather(cleanup, return_exceptions=True)
+            raise
         except Exception as error:
             await self._handle_run_failure(error, token.cancelled)
         finally:
             self.state.is_streaming = False
             self.state.streaming_message = None
             self.state.pending_tool_calls = set()
+            self._staged_tool_results = {}
             self._active_token = None
             self._idle_event.set()
 
@@ -448,20 +527,36 @@ class Agent:
         """补齐未闭合 Tool Call，再规范成失败生命周期事件。"""
 
         try:
-            repaired, inserted = repair_unresolved_tool_calls(
+            staged_ids = set(self._staged_tool_results)
+            materialized = _materialize_staged_tool_results(
                 self.state.messages,
+                self._staged_tool_results,
+            )
+            repaired, inserted = repair_unresolved_tool_calls(
+                materialized,
                 code="tool_not_executed_due_run_error",
                 text="工具调用因 Agent 运行异常而未执行。",
             )
             self.state.messages = repaired
-            for message in inserted:
+            notify_ids = staged_ids | {
+                str(message.get("toolCallId", "")) for message in inserted
+            }
+            notifications = [
+                message
+                for message in repaired
+                if message.get("role") == "toolResult"
+                and str(message.get("toolCallId", "")) in notify_ids
+            ]
+            for message in notifications:
                 await self._notify_repair_event(
                     {
                         "type": "transcript_repaired",
-                        "message": message,
+                        "message": copy.deepcopy(message),
+                        "contextMessages": copy.deepcopy(repaired),
                         "reason": "run_error",
                     }
                 )
+            self._staged_tool_results.clear()
         except Exception:
             # 原始运行错误优先；无法安全修复的历史由下一次运行前校验正式拒绝。
             pass
@@ -500,7 +595,14 @@ class Agent:
         """先更新 AgentState，再按订阅顺序等待 listener。"""
 
         event_type = event.get("type")
-        if event_type in {"message_start", "message_update"}:
+        if event_type == "agent_start":
+            event = dict(event)
+            event["contextMessages"] = copy.deepcopy(self.state.messages)
+        elif event_type == "transcript_repaired":
+            context_messages = event.get("contextMessages")
+            if isinstance(context_messages, list):
+                self.state.messages = copy.deepcopy(context_messages)
+        elif event_type in {"message_start", "message_update"}:
             self.state.streaming_message = event.get("message")
         elif event_type == "message_end":
             self.state.streaming_message = None
@@ -510,6 +612,11 @@ class Agent:
             pending.add(str(event.get("toolCallId", "")))
             self.state.pending_tool_calls = pending
         elif event_type == "tool_execution_end":
+            committed = event.get("toolResultMessage")
+            if isinstance(committed, dict):
+                tool_call_id = str(committed.get("toolCallId", ""))
+                if tool_call_id:
+                    self._staged_tool_results[tool_call_id] = copy.deepcopy(committed)
             pending = set(self.state.pending_tool_calls)
             pending.discard(str(event.get("toolCallId", "")))
             self.state.pending_tool_calls = pending
@@ -525,7 +632,33 @@ class Agent:
         token = self._active_token
         if token is None:
             raise RuntimeError("Agent listener 在 active run 之外被调用")
-        # listener 异常会向上传播，这与 Pi 的严格语义相近。生产宿主可以在
-        # listener 自己内部捕获，或者在这里加入统一 observer error policy。
+        # Tool 已产生结果后进入 Commit Boundary。此时 Observer 失败不能把
+        # 已发生的副作用改写成“工具未执行”，也不能取消同批兄弟工具。
+        deferred_cancel: asyncio.CancelledError | None = None
         for listener in list(self._listeners):
-            await _maybe_await(listener(event, token))
+            try:
+                await _maybe_await(listener(event, token))
+            except asyncio.CancelledError as error:
+                if event_type == "tool_execution_end":
+                    self.listener_errors.append(
+                        f"tool_execution_end listener cancelled: {error}"
+                    )
+                    deferred_cancel = deferred_cancel or error
+                    continue
+                raise
+            except Exception as error:
+                if event_type == "tool_execution_end":
+                    message = f"tool_execution_end listener failed: {error}"
+                    self.listener_errors.append(message)
+                    self.state.error_message = message
+                    continue
+                raise
+        if event_type == "message_end":
+            message = event.get("message", {})
+            if message.get("role") == "toolResult":
+                self._staged_tool_results.pop(
+                    str(message.get("toolCallId", "")),
+                    None,
+                )
+        if deferred_cancel is not None:
+            raise deferred_cancel

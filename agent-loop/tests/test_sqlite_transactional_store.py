@@ -14,6 +14,7 @@ from pi_agent_loop import (  # noqa: E402
     ApprovalError,
     ApprovalResumeCoordinator,
     ApprovalService,
+    DurableActionEnvelope,
     IdentityClaim,
     RuntimeEvent,
     SQLiteOperationEventStore,
@@ -23,6 +24,10 @@ from pi_agent_loop import (  # noqa: E402
     WriteOperationService,
     replay_operation,
 )
+
+
+async def _successful_write(_arguments, _key, _actor):
+    return {"status": "succeeded"}
 
 
 class SQLiteTransactionalStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -329,17 +334,22 @@ class SQLiteTransactionalStoreTests(unittest.IsolatedAsyncioTestCase):
             second_approvals = ApprovalService(second_store)
             first = ApprovalResumeCoordinator(first_store, first_approvals)
             second = ApprovalResumeCoordinator(second_store, second_approvals)
+            envelope = DurableActionEnvelope(
+                operation_id="operation-1",
+                tool_call_id="refund-call",
+                tool_name="refund_order",
+                arguments={"order_id": "1001"},
+                write_id="refund-write",
+            )
             pending = await first.request(
                 session_id="session-1",
                 operation_id="operation-1",
                 requester=operator,
-                action={
-                    "tool": "refund_order",
-                    "arguments": {"order_id": "1001"},
-                },
+                action=envelope.to_dict(),
                 action_summary="退款订单 1001",
                 required_role="approver",
-                resume_payload={"order_id": "1001"},
+                resume_payload={},
+                idempotency_key="coordinator-refund-key",
             )
             registered = [
                 event
@@ -364,11 +374,66 @@ class SQLiteTransactionalStoreTests(unittest.IsolatedAsyncioTestCase):
             release = asyncio.Event()
             calls = 0
 
-            async def resume(_payload):
+            async def resume(payload):
                 nonlocal calls
                 calls += 1
                 entered.set()
                 await release.wait()
+                restored = DurableActionEnvelope.from_dict(payload["envelope"])
+                write = await WriteOperationService(
+                    first_store,
+                    first_approvals,
+                ).execute(
+                    restored.write_id,
+                    actor=operator,
+                    idempotency_key="coordinator-refund-key",
+                    handler=_successful_write,
+                    approval_resume_id=pending.approval.approval_id,
+                )
+                operation = replay_operation(
+                    await first_store.load(operation_id="operation-1")
+                )
+                specs = []
+                if operation.tools[restored.tool_call_id].phase != "completed":
+                    specs.append(
+                        (
+                            "tool_completed",
+                            {
+                                "toolCallId": restored.tool_call_id,
+                                "result": {
+                                    "content": [],
+                                    "details": write.result or {},
+                                    "isError": False,
+                                },
+                            },
+                        )
+                    )
+                if not any(
+                    message.get("role") == "toolResult"
+                    and message.get("toolCallId") == restored.tool_call_id
+                    for message in operation.messages
+                ):
+                    specs.append(
+                        (
+                            "message_appended",
+                            {
+                                "message": {
+                                    "role": "toolResult",
+                                    "toolCallId": restored.tool_call_id,
+                                    "toolName": restored.tool_name,
+                                    "content": [],
+                                    "details": write.result or {},
+                                    "isError": False,
+                                }
+                            },
+                        )
+                    )
+                if specs:
+                    await first_store.append_batch(
+                        "session-1",
+                        "operation-1",
+                        specs,
+                    )
                 return {"status": "succeeded"}
 
             first_task = asyncio.create_task(

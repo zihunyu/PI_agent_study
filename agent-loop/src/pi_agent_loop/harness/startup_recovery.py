@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
+from ..runtime.telemetry import Telemetry
 from ..session.operation_state import replay_operation
 from ..session.operation_store import OperationEventStore
 from ..session.resume import DurableSessionRecovery, RecoveryCallbacks
@@ -13,6 +15,7 @@ from ..session.resume import DurableSessionRecovery, RecoveryCallbacks
 class StartupRecoveryReport:
     completed: tuple[str, ...]
     waiting_approval: tuple[str, ...]
+    ready_to_resume: tuple[str, ...]
     manual_intervention: tuple[str, ...]
     failed: tuple[str, ...]
 
@@ -22,13 +25,18 @@ class StartupRecoveryCoordinator:
         self,
         store: OperationEventStore,
         callbacks: RecoveryCallbacks,
+        *,
+        session_id: str | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self.store = store
         self.callbacks = callbacks
+        self.session_id = session_id
         self.recovery = DurableSessionRecovery(store)
+        self.telemetry = telemetry or Telemetry()
 
     async def recover_all(self) -> StartupRecoveryReport:
-        events = await self.store.load()
+        events = await self.store.load(session_id=self.session_id)
         grouped: dict[tuple[str, str], list] = {}
         for event in events:
             grouped.setdefault(
@@ -38,13 +46,19 @@ class StartupRecoveryCoordinator:
 
         completed: list[str] = []
         waiting_approval: list[str] = []
+        ready_to_resume: list[str] = []
         manual: list[str] = []
         failed: list[str] = []
         for (session_id, operation_id), operation_events in grouped.items():
+            started = time.monotonic()
             try:
                 state = replay_operation(operation_events)
             except Exception:
                 failed.append(operation_id)
+                self.telemetry.record_recovery(
+                    outcome="invalid_log",
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
                 continue
             if state.phase in {"completed", "failed", "cancelled"}:
                 continue
@@ -56,16 +70,21 @@ class StartupRecoveryCoordinator:
                 )
             except Exception:
                 failed.append(operation_id)
+                self.telemetry.record_recovery(
+                    outcome="failed",
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
                 continue
             if result.status == "completed":
                 completed.append(operation_id)
+            elif result.status == "waiting_approval":
+                waiting_approval.append(operation_id)
             elif result.status in {
-                "waiting_approval",
                 "approval_consumer_required",
                 "approved_write_runtime_required",
                 "recovery_claimed",
             }:
-                waiting_approval.append(operation_id)
+                ready_to_resume.append(operation_id)
             elif result.status in {
                 "manual_intervention",
                 "write_reconciliation_required",
@@ -73,9 +92,14 @@ class StartupRecoveryCoordinator:
                 manual.append(operation_id)
             else:
                 failed.append(operation_id)
+            self.telemetry.record_recovery(
+                outcome=result.status,
+                duration_ms=(time.monotonic() - started) * 1000,
+            )
         return StartupRecoveryReport(
             completed=tuple(completed),
             waiting_approval=tuple(waiting_approval),
+            ready_to_resume=tuple(ready_to_resume),
             manual_intervention=tuple(manual),
             failed=tuple(failed),
         )

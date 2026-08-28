@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
 from ..types import AgentTool
-from .operation_state import replay_operation_with_specs
+from .operation_state import replay_operation, replay_operation_with_specs
 from .operation_store import (
     OperationEventStore,
     OperationStoreConflictError,
@@ -24,6 +26,7 @@ class DurableOperationRecorder:
         session_id: str,
         tools: list[AgentTool],
         configuration: dict[str, Any] | None = None,
+        run_id_provider: Callable[[], str | None] | None = None,
     ) -> None:
         if not session_id:
             raise ValueError("session_id 不能为空")
@@ -31,27 +34,51 @@ class DurableOperationRecorder:
         self.session_id = session_id
         self.tools = {tool.name: tool for tool in tools}
         self.configuration = dict(configuration or {})
+        self.run_id_provider = run_id_provider
         self.operation_id: str | None = None
         self.last_operation_id: str | None = None
         self._active_request_id: str | None = None
         self._last_failure: str | None = None
 
-    async def start_operation(self) -> str:
+    async def start_operation(
+        self,
+        initial_messages: list[dict[str, Any]] | None = None,
+    ) -> str:
         if self.operation_id is not None:
             raise RuntimeError("已有活动 Durable Operation")
         self.operation_id = str(uuid4())
         self.last_operation_id = self.operation_id
         self._last_failure = None
-        await self._append(
-            "operation_started",
-            {
-                "configuration": self.configuration,
-                "tools": [
-                    {"name": tool.name, "replayPolicy": tool.replay_policy}
-                    for tool in self.tools.values()
-                ],
-            },
+        specs: list[tuple[str, dict[str, Any]]] = [
+            (
+                "operation_started",
+                {
+                    "configuration": self.configuration,
+                    "tools": [
+                        {"name": tool.name, "replayPolicy": tool.replay_policy}
+                        for tool in self.tools.values()
+                    ],
+                },
+            )
+        ]
+        specs.extend(
+            (
+                "message_appended",
+                {"message": copy.deepcopy(message), "initialContext": True},
+            )
+            for message in list(initial_messages or [])
         )
+        try:
+            await self.store.append_batch(
+                self.session_id,
+                self.operation_id,
+                specs,
+                expected_last_sequence=-1,
+            )
+        except BaseException:
+            self.operation_id = None
+            self.last_operation_id = None
+            raise
         return self.operation_id
 
     async def record_external(
@@ -89,18 +116,32 @@ class DurableOperationRecorder:
     async def listener(self, event: dict[str, Any], cancellation: Any) -> None:
         event_type = event.get("type")
         if event_type == "agent_start":
+            context_messages = event.get("contextMessages")
+            initial_messages = (
+                copy.deepcopy(context_messages)
+                if isinstance(context_messages, list)
+                else []
+            )
             if self.operation_id is None:
-                await self.start_operation()
+                await self.start_operation(initial_messages=initial_messages)
+            else:
+                await self._synchronize_context(initial_messages)
             return
         if self.operation_id is None:
             return
         if event_type == "transcript_repaired":
             message = event.get("message")
             if isinstance(message, dict):
-                await self._append(
-                    "message_appended",
-                    {"message": message, "syntheticRepair": True},
-                )
+                if message.get("role") == "toolResult":
+                    await self._record_tool_result_message(message)
+                else:
+                    await self._append(
+                        "message_appended",
+                        {"message": message, "syntheticRepair": True},
+                    )
+            context_messages = event.get("contextMessages")
+            if isinstance(context_messages, list):
+                await self._synchronize_context(context_messages)
             return
         if event_type == "model_policy_selected":
             policy = event.get("policy")
@@ -117,7 +158,22 @@ class DurableOperationRecorder:
             policy = event.get("requestPolicy")
             if not isinstance(policy, dict):
                 raise RuntimeError("Model Request Start 缺少策略快照")
-            self._active_request_id = str(uuid4())
+            supplied_request_id = event.get("requestId")
+            self._active_request_id = (
+                supplied_request_id
+                if isinstance(supplied_request_id, str) and supplied_request_id
+                else str(uuid4())
+            )
+            # Enrich the mutable lifecycle event before loop.py enters the
+            # ModelCallRuntime.  These values are trusted Host state rather
+            # than caller/model supplied metadata.
+            event["requestId"] = self._active_request_id
+            event["sessionId"] = self.session_id
+            event["operationId"] = self.operation_id
+            if self.run_id_provider is not None:
+                run_id = self.run_id_provider()
+                if isinstance(run_id, str) and run_id:
+                    event["runId"] = run_id
             await self._append(
                 "model_request_started",
                 {
@@ -158,7 +214,9 @@ class DurableOperationRecorder:
                     },
                 )
                 self._active_request_id = None
-            elif role in {"user", "toolResult"}:
+            elif role == "toolResult":
+                await self._record_tool_result_message(message)
+            elif role == "user":
                 await self._append("message_appended", {"message": message})
             return
         if event_type == "tool_execution_start":
@@ -184,6 +242,10 @@ class DurableOperationRecorder:
             )
             return
         if event_type == "tool_execution_end":
+            committed_message = event.get("toolResultMessage")
+            if isinstance(committed_message, dict):
+                await self._record_tool_result_message(committed_message)
+                return
             result = event.get("result", {})
             details = result.get("details", {}) if isinstance(result, dict) else {}
             outcome_unknown = (
@@ -214,6 +276,114 @@ class DurableOperationRecorder:
             else:
                 outcome = "completed"
             await self.finish_operation(outcome)
+
+    async def _synchronize_context(
+        self,
+        context_messages: list[dict[str, Any]],
+    ) -> None:
+        """确保 Operation 消息是 Agent/Provider Context 的无重复前缀。"""
+
+        if self.operation_id is None or not context_messages:
+            return
+        expected = copy.deepcopy(context_messages)
+        for _ in range(20):
+            events = await self.store.load(
+                session_id=self.session_id,
+                operation_id=self.operation_id,
+            )
+            operation = replay_operation(events)
+            existing = list(operation.messages)
+            if existing == expected:
+                return
+            if len(existing) > len(expected) and existing[: len(expected)] == expected:
+                return
+            if existing != expected[: len(existing)]:
+                raise RuntimeError(
+                    "Durable Operation Context 与 Agent Provider Context 不一致"
+                )
+            missing = expected[len(existing) :]
+            if not missing:
+                return
+            specs = [
+                (
+                    "message_appended",
+                    {"message": copy.deepcopy(message), "contextSync": True},
+                )
+                for message in missing
+            ]
+            replay_operation_with_specs(events, specs)
+            try:
+                await self.store.append_batch(
+                    self.session_id,
+                    self.operation_id,
+                    specs,
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+            except OperationStoreConflictError:
+                continue
+            return
+        raise RuntimeError("Durable Operation Context 同步并发冲突")
+
+    async def _record_tool_result_message(
+        self,
+        message: dict[str, Any],
+    ) -> None:
+        if self.operation_id is None:
+            raise RuntimeError("没有活动 Durable Operation")
+        tool_call_id = str(message.get("toolCallId", ""))
+        for _ in range(20):
+            events = await self.store.load(
+                session_id=self.session_id,
+                operation_id=self.operation_id,
+            )
+            operation = replay_operation(events)
+            if any(
+                item.get("role") == "toolResult"
+                and item.get("toolCallId") == tool_call_id
+                for item in operation.messages
+            ):
+                return
+            invocation = operation.tools.get(tool_call_id)
+            specs: list[tuple[str, dict[str, Any]]] = []
+            if invocation is not None and invocation.phase in {
+                "intent_recorded",
+                "dispatch_started",
+            }:
+                details = message.get("details", {})
+                outcome_unknown = (
+                    isinstance(details, dict)
+                    and details.get("code") == "outcome_unknown"
+                )
+                specs.append(
+                    (
+                        "tool_outcome_unknown"
+                        if outcome_unknown
+                        else "tool_completed",
+                        {
+                            "toolCallId": tool_call_id,
+                            "toolName": message.get("toolName"),
+                            "result": {
+                                "content": message.get("content", []),
+                                "details": details,
+                                "isError": bool(message.get("isError")),
+                            },
+                            "recoveredAtCommitBoundary": True,
+                        },
+                    )
+                )
+            specs.append(("message_appended", {"message": message}))
+            replay_operation_with_specs(events, specs)
+            try:
+                await self.store.append_batch(
+                    self.session_id,
+                    self.operation_id,
+                    specs,
+                    expected_last_sequence=operation_last_sequence(events),
+                )
+            except OperationStoreConflictError:
+                continue
+            return
+        raise RuntimeError("Tool Result Commit Boundary 并发冲突")
 
     async def _append(self, event_type: str, data: dict[str, Any]) -> None:
         if self.operation_id is None:

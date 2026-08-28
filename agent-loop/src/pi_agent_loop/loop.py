@@ -19,6 +19,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, cast
+from uuid import uuid4
 
 from .cancellation import (
     CancellationToken,
@@ -37,6 +38,7 @@ from .transcript import (
     sanitize_terminal_assistant_tool_calls,
     validate_closed_tool_call_transcript,
 )
+from .tool_runtime import ToolDispatchRuntime
 from .types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -50,7 +52,6 @@ from .types import (
     BeforeToolCallContext,
     BeforeToolCallResult,
     EventSink,
-    Model,
     StreamFn,
     TurnCompletedContext,
     UNSET,
@@ -98,6 +99,27 @@ async def _emit(sink: EventSink, event: AgentEvent) -> None:
     """发出事件，并等待可能存在的异步 listener。"""
 
     await _maybe_await(sink(event))
+
+
+async def _emit_transcript_repairs(
+    emit: EventSink,
+    repaired_messages: list[AgentMessage],
+    inserted: list[AgentMessage],
+    *,
+    reason: str,
+) -> None:
+    """公开低层自动修复，并携带修复后的完整 Context。"""
+
+    for message in inserted:
+        await _emit(
+            emit,
+            {
+                "type": "transcript_repaired",
+                "message": clone_message(message),
+                "contextMessages": copy.deepcopy(repaired_messages),
+                "reason": reason,
+            },
+        )
 
 
 async def _emit_model_policy_selected(
@@ -239,14 +261,28 @@ async def run_agent_loop(
     assistant、toolResult、steering 和 follow-up 消息。
     """
 
+    repaired_context_messages, inserted_repairs = repair_unresolved_tool_calls(
+        list(context.messages),
+        code="tool_result_missing_repaired",
+        text="此前工具调用没有结果，系统已补写错误结果以恢复协议完整性。",
+    )
+    # 公开函数接收的 Context 也必须反映真实发送给 Provider 的历史；否则调用者
+    # 把返回消息追加回原 Context 后仍会得到一份损坏的 Transcript。
+    context.messages = repaired_context_messages
     new_messages = list(prompts)
     current_context = AgentContext(
         system_prompt=context.system_prompt,
-        messages=[*context.messages, *prompts],
+        messages=[*repaired_context_messages, *prompts],
         tools=list(context.tools),
     )
 
     await _emit(emit, {"type": "agent_start"})
+    await _emit_transcript_repairs(
+        emit,
+        repaired_context_messages,
+        inserted_repairs,
+        reason="run_start",
+    )
     await _emit(emit, {"type": "turn_start"})
     await _emit_model_policy_selected(emit, current_context, config)
     for prompt in prompts:
@@ -274,14 +310,26 @@ async def run_agent_loop_continue(
     """运行 continuation；不会把旧 Context 消息放进返回值。"""
 
     _validate_continuation_context(context)
+    repaired_context_messages, inserted_repairs = repair_unresolved_tool_calls(
+        list(context.messages),
+        code="tool_result_missing_repaired",
+        text="此前工具调用没有结果，系统已补写错误结果以恢复协议完整性。",
+    )
+    context.messages = repaired_context_messages
     new_messages: list[AgentMessage] = []
     current_context = AgentContext(
         system_prompt=context.system_prompt,
-        messages=list(context.messages),
+        messages=list(repaired_context_messages),
         tools=list(context.tools),
     )
 
     await _emit(emit, {"type": "agent_start"})
+    await _emit_transcript_repairs(
+        emit,
+        repaired_context_messages,
+        inserted_repairs,
+        reason="continue_start",
+    )
     await _emit(emit, {"type": "turn_start"})
     await _emit_model_policy_selected(emit, current_context, config)
     await _run_loop(
@@ -531,12 +579,18 @@ async def _stream_assistant_response(
 ) -> AgentMessage:
     """请求并消费一次 assistant 流。"""
 
-    repaired_messages, _inserted = repair_unresolved_tool_calls(
+    repaired_messages, inserted_repairs = repair_unresolved_tool_calls(
         list(context.messages),
         code="tool_result_missing_repaired",
         text="此前工具调用没有结果，系统已补写错误结果以恢复协议完整性。",
     )
     context.messages = repaired_messages
+    await _emit_transcript_repairs(
+        emit,
+        repaired_messages,
+        inserted_repairs,
+        reason="model_request",
+    )
     messages = list(repaired_messages)
     if config.transform_context is not None:
         transformed = await _maybe_await(
@@ -569,16 +623,36 @@ async def _stream_assistant_response(
         }
     )
 
-    await _emit(
-        emit,
-        {
-            "type": "model_request_start",
-            "requestPolicy": capture_model_request_policy(
-                [tool.name for tool in context.tools],
-                config.stream_options,
-            ).to_dict(),
-        },
-    )
+    # The low-level loop owns the request identity.  Durable listeners enrich
+    # this same event with the active operation/run identity before the model
+    # boundary is entered, so the Operation projection and the unified model
+    # event log cannot accidentally allocate unrelated request IDs.
+    request_id = str(uuid4())
+    request_event: AgentEvent = {
+        "type": "model_request_start",
+        "requestId": request_id,
+        "requestPolicy": capture_model_request_policy(
+            [tool.name for tool in context.tools],
+            config.stream_options,
+        ).to_dict(),
+    }
+    await _emit(emit, request_event)
+    options["model_request_id"] = request_id
+    bound_metadata = {
+        name: request_event[name]
+        for name in ("sessionId", "operationId", "runId")
+        if isinstance(request_event.get(name), str) and request_event[name]
+    }
+    if bound_metadata:
+        configured_metadata = options.get("durable_metadata")
+        if configured_metadata is None:
+            configured_metadata = {}
+        if not isinstance(configured_metadata, dict):
+            raise TypeError("durable_metadata 必须是 dict")
+        options["durable_metadata"] = {
+            **configured_metadata,
+            **bound_metadata,
+        }
     response = await _maybe_await(stream_fn(config.model, llm_context, options))
     if not hasattr(response, "__aiter__") or not hasattr(response, "result"):
         raise TypeError("stream_fn 必须返回 AssistantMessageEventStream")
@@ -633,7 +707,12 @@ async def _stream_assistant_response(
                 )
             await _emit(
                 emit,
-                {"type": "message_end", "message": final_message},
+                {
+                    "type": "message_end",
+                    "message": final_message,
+                    "requestId": request_id,
+                    **bound_metadata,
+                },
             )
             return final_message
 
@@ -649,7 +728,15 @@ async def _stream_assistant_response(
             emit,
             {"type": "message_start", "message": clone_message(final_message)},
         )
-    await _emit(emit, {"type": "message_end", "message": final_message})
+    await _emit(
+        emit,
+        {
+            "type": "message_end",
+            "message": final_message,
+            "requestId": request_id,
+            **bound_metadata,
+        },
+    )
     return final_message
 
 
@@ -671,6 +758,7 @@ class _FinalizedToolCall:
     tool_call: dict
     result: AgentToolResult
     is_error: bool
+    result_message: AgentMessage | None = None
 
 
 @dataclass(slots=True)
@@ -815,23 +903,28 @@ async def _execute_tool_calls(
     emit: EventSink,
 ) -> _ExecutedToolBatch:
     tool_calls = _assistant_tool_calls(assistant_message)
-    if config.tool_execution == "sequential":
-        return await _execute_tools_sequential(
-            context,
-            assistant_message,
-            tool_calls,
-            config,
-            cancellation,
-            emit,
+    runtime = config.tool_runtime
+    if not isinstance(runtime, ToolDispatchRuntime):
+        runtime = ToolDispatchRuntime(
+            context.tools,
+            before_tool_call=config.before_tool_call,
+            after_tool_call=config.after_tool_call,
+            retry_event_sink=config.retry_event_sink,
+            default_tool_timeout_seconds=config.default_tool_timeout_seconds,
+            max_parallel_tools=config.max_parallel_tools or max(1, len(tool_calls)),
         )
-    return await _execute_tools_scheduled(
-        context,
-        assistant_message,
+    else:
+        runtime.register_tools(context.tools)
+    batch = await runtime.dispatch_many(
         tool_calls,
-        config,
-        cancellation,
-        emit,
+        context=context,
+        assistant_message=assistant_message,
+        cancellation=cancellation,
+        emit=emit,
+        execution=config.tool_execution,
+        tenant_id=config.tenant_id,
     )
+    return _ExecutedToolBatch(messages=batch.messages, terminate=batch.terminate)
 
 
 async def _execute_tools_sequential(
@@ -1528,6 +1621,9 @@ async def _emit_tool_start(tool_call: dict, emit: EventSink) -> None:
 
 
 async def _emit_tool_end(finalized: _FinalizedToolCall, emit: EventSink) -> None:
+    # ToolResult 在通知 Observer 前完成构造并随 Commit Boundary 一同发布。
+    # Agent/Recorder 因而能够在某个 Listener 取消当前 Task 时保留真实结果。
+    result_message = _create_tool_result_message(finalized)
     await _emit(
         emit,
         {
@@ -1536,11 +1632,14 @@ async def _emit_tool_end(finalized: _FinalizedToolCall, emit: EventSink) -> None
             "toolName": str(finalized.tool_call.get("name", "")),
             "result": _tool_result_payload(finalized.result),
             "isError": finalized.is_error,
+            "toolResultMessage": clone_message(result_message),
         },
     )
 
 
 def _create_tool_result_message(finalized: _FinalizedToolCall) -> AgentMessage:
+    if finalized.result_message is not None:
+        return finalized.result_message
     message: AgentMessage = {
         "role": "toolResult",
         "toolCallId": str(finalized.tool_call.get("id", "")),
@@ -1554,6 +1653,7 @@ def _create_tool_result_message(finalized: _FinalizedToolCall) -> AgentMessage:
         message["usage"] = copy.deepcopy(finalized.result.usage)
     if finalized.result.added_tool_names:
         message["addedToolNames"] = list(finalized.result.added_tool_names)
+    finalized.result_message = message
     return message
 
 
