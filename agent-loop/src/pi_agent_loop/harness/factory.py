@@ -28,10 +28,13 @@ from ..routing.hybrid_router import HybridModelRouter
 from ..routing.routed_agent import RoutedAgent
 from ..runtime import RuntimeStateTracker, Telemetry
 from ..session import (
+    ConversationSessionNotFoundError,
     DurableOperationRecorder,
     JournalKeyProvider,
     JournalPrincipal,
     RuntimeRecoveryManager,
+    SessionContextProjection,
+    WorkspaceSessionCatalog,
 )
 from ..tool_runtime import ResourceLockBackend, ToolDispatchRuntime
 from ..types import AgentTool, Model, StreamFn
@@ -43,6 +46,7 @@ from .model_runtime_adapter import RecoverableModelRuntime, TokenPricing
 from .plans import DurablePlanWorkflow
 from .recovery import build_recovery_callbacks
 from .resources import DurableHostResources
+from .session_runtime import SessionWriterLease, agent_configuration_hash
 from .startup_recovery import StartupRecoveryCoordinator
 from .tool_runtime_adapter import RecoverableToolRuntime
 
@@ -97,6 +101,14 @@ class DurableHostSettings:
     plan_approval_barrier: ApprovalBarrier | None = None
     max_parallel_plan_steps: int = 4
     plan_lease_seconds: float = 30
+    project_id: str | None = None
+    workspace_path: str | Path | None = None
+    session_title: str | None = None
+    agent_profile: str = "default"
+    resume_history: bool = True
+    managed_session: bool = False
+    exclusive_session: bool = False
+    session_writer_lease_seconds: float = 30
 
 
 class DurableHostFactory:
@@ -157,6 +169,34 @@ class DurableHostFactory:
         runtime_store = host.resources.runtime_store
         host.operation_store = host.resources.operation_store
         retry_store = host.resources.retry_store
+        host.project_id = settings.project_id
+        host.session_catalog = (
+            WorkspaceSessionCatalog(
+                host.resources.journal,
+                host.resources.journal_principal,
+            )
+            if host.resources.journal is not None
+            and host.resources.journal_principal is not None
+            else None
+        )
+        host.context_projection = SessionContextProjection(
+            host.operation_store,
+            catalog=host.session_catalog if settings.managed_session else None,
+        )
+        host.session_writer_lease = None
+        if settings.exclusive_session:
+            host.session_writer_lease = await SessionWriterLease.acquire(
+                host.operation_store,
+                settings.session_id,
+                lease_seconds=settings.session_writer_lease_seconds,
+            )
+            host.resources.own(host.session_writer_lease)
+
+        host.session_metadata = await self._prepare_session(host, settings)
+        initial_messages: list[dict[str, Any]] = []
+        if settings.resume_history:
+            context = await host.context_projection.project(settings.session_id)
+            initial_messages = context.copy_messages()
         host.plan_store = (
             SessionJournalPlanStore(
                 host.resources.journal,
@@ -246,7 +286,12 @@ class DurableHostFactory:
             retry_event_sink=retry_store.append,
             tool_runtime=host.tool_dispatch_runtime,
             tenant_id=settings.tenant_id,
+            messages=initial_messages,
         )
+        if host.session_writer_lease is not None:
+            host.session_writer_lease.set_loss_callback(
+                lambda: host.agent.abort("Session Writer Lease 已丢失")
+            )
 
         if settings.router is not None:
             if settings.capabilities is None:
@@ -321,8 +366,53 @@ class DurableHostFactory:
             if settings.auto_recover
             else None
         )
+        if settings.resume_history:
+            # Startup recovery can append a model/tool terminal fact.  Reload
+            # once more so the in-memory Agent starts from the recovered view.
+            context = await host.context_projection.project(settings.session_id)
+            host.agent.state.messages = context.copy_messages()
         host.lifecycle = DurableHostLifecycle(host.agent, host.resources)
         return host
+
+    async def _prepare_session(
+        self,
+        host: Any,
+        settings: DurableHostSettings,
+    ) -> Any | None:
+        if not settings.managed_session:
+            return None
+        if host.session_catalog is None:
+            raise ValueError("受管 Project/Session 只支持 journal Store Backend")
+        workspace_path = Path(settings.workspace_path or Path.cwd()).resolve(strict=True)
+        if not workspace_path.is_dir():
+            raise ValueError(f"workspace_path 不是目录：{workspace_path}")
+        digest = agent_configuration_hash(
+            model=settings.model,
+            system_prompt=settings.system_prompt,
+            tools=settings.tools,
+        )
+        try:
+            session = await host.session_catalog.get_session(settings.session_id)
+        except ConversationSessionNotFoundError:
+            session = await host.session_catalog.create_session(
+                project_id=settings.project_id,
+                title=settings.session_title or settings.session_id,
+                cwd=workspace_path,
+                session_id=settings.session_id,
+                agent_profile=settings.agent_profile,
+                configuration_hash=digest,
+            )
+        if session.status != "active":
+            raise ValueError(f"Session 当前不可打开：{session.status}")
+        session = await host.session_catalog.bind_session_configuration(
+            settings.session_id,
+            project_id=settings.project_id,
+            cwd=workspace_path,
+            agent_profile=settings.agent_profile,
+            configuration_hash=digest,
+        )
+        host.project_id = session.project_id
+        return session
 
     async def _recover_approvals(
         self,

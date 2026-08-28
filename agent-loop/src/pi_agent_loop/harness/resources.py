@@ -55,7 +55,7 @@ class DurableHostResources:
         journal: SQLiteSessionEventJournal | None = None
         principal: JournalPrincipal | None = None
         if store_backend == "journal":
-            provider = journal_key_provider or _local_journal_key_provider(root)
+            provider = journal_key_provider or local_journal_key_provider(root)
             principal = journal_principal or JournalPrincipal.system(tenant_id)
             journal = SQLiteSessionEventJournal(
                 root / "agent-state.sqlite3",
@@ -124,9 +124,11 @@ class DurableHostResources:
             raise BaseExceptionGroup("关闭 Durable Host 资源失败", errors)
 
 
-def _local_journal_key_provider(root: Path) -> StaticJournalKeyProvider:
+def local_journal_key_provider(root: str | Path) -> StaticJournalKeyProvider:
     """为单机默认模式保存独立数据密钥；生产应显式注入 KMS Provider。"""
 
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
     path = root / ".agent-journal.key"
     try:
         descriptor = os.open(
@@ -165,4 +167,4 @@ def _local_journal_key_provider(root: Path) -> StaticJournalKeyProvider:
     )
 
 
-__all__ = ["DurableHostResources"]
+__all__ = ["DurableHostResources", "local_journal_key_provider"]

@@ -1,5 +1,19 @@
 """Runtime Event 持久化、重放与崩溃恢复。"""
 
+from .catalog import (
+    ConversationSession,
+    ConversationSessionNotFoundError,
+    SessionConfigurationMismatchError,
+    WorkspaceCatalogError,
+    WorkspaceNotFoundError,
+    WorkspaceProject,
+    WorkspaceSessionCatalog,
+)
+from .context_projection import (
+    SessionContext,
+    SessionContextProjection,
+    SessionContextProjectionError,
+)
 from .jsonl import JsonlRuntimeEventStore
 from .journal import (
     EnvironmentJournalKeyProvider,
@@ -24,6 +38,11 @@ from .journal_adapters import (
     SessionJournalOperationEventStore,
     SessionJournalRetryEventStore,
     SessionJournalRuntimeEventStore,
+)
+from .legacy_import import (
+    LegacyConversationImportError,
+    LegacyConversationImportResult,
+    import_legacy_jsonl_conversation,
 )
 from .migrations import (
     EventMigrationRegistry,
@@ -64,6 +83,8 @@ from .store import InMemoryRuntimeEventStore, RuntimeEventStore
 __all__ = [
     "DurableOperationRecorder",
     "DurableSessionRecovery",
+    "ConversationSession",
+    "ConversationSessionNotFoundError",
     "InMemoryOperationEventStore",
     "InMemoryRuntimeEventStore",
     "ApprovalSnapshot",
@@ -81,6 +102,8 @@ __all__ = [
     "JournalRedactionPolicy",
     "JsonlOperationEventStore",
     "JsonlRuntimeEventStore",
+    "LegacyConversationImportError",
+    "LegacyConversationImportResult",
     "ModelRequestState",
     "OperationEvent",
     "OperationEventStore",
@@ -95,6 +118,10 @@ __all__ = [
     "RecoveryExecutionResult",
     "RuntimeEventStore",
     "RuntimeRecoveryManager",
+    "SessionConfigurationMismatchError",
+    "SessionContext",
+    "SessionContextProjection",
+    "SessionContextProjectionError",
     "SessionEvent",
     "SessionEventSpec",
     "SessionJournalError",
@@ -109,6 +136,11 @@ __all__ = [
     "StateMigrationRegistry",
     "StaticJournalKeyProvider",
     "WriteSnapshot",
+    "WorkspaceCatalogError",
+    "WorkspaceNotFoundError",
+    "WorkspaceProject",
+    "WorkspaceSessionCatalog",
+    "import_legacy_jsonl_conversation",
     "reduce_operation_event",
     "replay_operation",
     "replay_runtime_events",

@@ -12,7 +12,6 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from pi_agent_loop import (  # noqa: E402
     AgentTool,
-    AgentToolResult,
     CapabilityRegistry,
     DurableAgentHost,
     IdentityClaim,

@@ -22,20 +22,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from pi_agent_loop import (  # noqa: E402
-    Agent,
     CompactionRetryPolicy,
-    DurableOperationRecorder,
-    JsonlOperationEventStore,
-    JsonlRetryEventStore,
-    JsonlRuntimeEventStore,
+    ConversationSessionNotFoundError,
+    DurableAgentWorkspace,
+    LegacyConversationImportError,
     ProviderConfigError,
-    RuntimeRecoveryManager,
-    RuntimeStateTracker,
     ToolRegistry,
     create_add_tool,
     create_divide_tool,
     create_multiply_tool,
-    compact_on_context_overflow,
     create_provider,
     load_agent_limits,
     load_provider_settings,
@@ -54,11 +49,14 @@ MULTIPLY_TOOL_DELAY_SECONDS = 0.0
 DIVIDE_TOOL_DELAY_SECONDS = 0.0
 
 
-def parse_user_message() -> str:
-    """读取命令行后面的任意消息；没有参数时再使用交互输入。"""
-
+def parse_cli() -> tuple[str, str]:
     parser = argparse.ArgumentParser(
         description="通过真实 OpenAI-compatible 模型运行 Agent Loop",
+    )
+    parser.add_argument(
+        "--session-id",
+        default="basic-usage",
+        help="持久会话 ID；相同 ID 会自动恢复历史上下文",
     )
     parser.add_argument(
         "message",
@@ -66,9 +64,18 @@ def parse_user_message() -> str:
         help="要交给 Agent 的用户消息；含空格时建议使用引号",
     )
     arguments = parser.parse_args()
-    if arguments.message:
-        return " ".join(arguments.message).strip()
-    return input("请输入用户消息：").strip()
+    message = (
+        " ".join(arguments.message).strip()
+        if arguments.message
+        else input("请输入用户消息：").strip()
+    )
+    return message, arguments.session_id.strip()
+
+
+def parse_user_message() -> str:
+    """兼容旧测试和嵌入方式，只返回命令行中的用户消息。"""
+
+    return parse_cli()[0]
 
 
 def content_text(message: dict) -> str:
@@ -124,7 +131,7 @@ def model_call_explanations(messages: list[dict]) -> list[str]:
 
 
 async def main() -> None:
-    user_message = parse_user_message()
+    user_message, session_id = parse_cli()
     if not user_message:
         print("用户消息为空，程序结束。")
         return
@@ -151,36 +158,53 @@ async def main() -> None:
         create_divide_tool(delay_seconds=DIVIDE_TOOL_DELAY_SECONDS)
     )
 
-    retry_store = JsonlRetryEventStore(ROOT / "state" / "retry-events.jsonl")
-    runtime_store = JsonlRuntimeEventStore(ROOT / "state" / "runtime-events.jsonl")
-    operation_store = JsonlOperationEventStore(ROOT / "state" / "operation-events.jsonl")
-    operation_recorder = DurableOperationRecorder(
-        operation_store,
-        session_id="basic-usage",
-        tools=registry.all(),
-        configuration={"provider": model.provider, "model": model.id},
+    system_prompt = (
+        "你是一个中文助手。先理解用户的真实请求。只有在请求适合当前工具时"
+        "才调用工具；工具执行后必须读取 Tool Result 再回答。没有合适工具时，"
+        "使用模型自身能力回答，不得编造已经执行了外部操作。"
     )
-    await RuntimeRecoveryManager(runtime_store).recover()
-    runtime_tracker = await RuntimeStateTracker.create(runtime_store)
-    compacting_stream = compact_on_context_overflow(
-        provider.stream,
-        CompactionRetryPolicy(max_retries=1, keep_recent_messages=20),
+    workspace = DurableAgentWorkspace.open(ROOT / "state")
+    project = await workspace.ensure_project(
+        ROOT,
+        title="agent-loop",
+        project_id="agent-loop-example",
     )
-    agent = Agent(
+    try:
+        session = await workspace.catalog.get_session(session_id)
+    except ConversationSessionNotFoundError:
+        session = await workspace.create_session(
+            project.project_id,
+            title="基础真实模型会话",
+            session_id=session_id,
+        )
+    legacy_import_message: str | None = None
+    try:
+        legacy_import = await workspace.import_legacy_jsonl_session(
+            ROOT / "state" / "operation-events.jsonl",
+            session_id=session.session_id,
+        )
+        if legacy_import.imported:
+            legacy_import_message = (
+                f"已从旧 JSONL 安全导入 {legacy_import.message_count} 条历史消息。"
+            )
+    except LegacyConversationImportError as error:
+        legacy_import_message = f"旧 JSONL 未自动导入：{error}"
+    host = await workspace.open_session(
+        session.session_id,
         model=model,
-        stream_fn=compacting_stream,
-        system_prompt=(
-            "你是一个中文助手。先理解用户的真实请求。只有在请求适合当前工具时"
-            "才调用工具；工具执行后必须读取 Tool Result 再回答。没有合适工具时，"
-            "使用模型自身能力回答，不得编造已经执行了外部操作。"
-        ),
+        stream_fn=provider.stream,
+        system_prompt=system_prompt,
         tools=registry.all(),
-        tool_execution="parallel",
         max_tool_calls=limits.max_tool_calls,
         max_parallel_tools=limits.max_parallel_tools,
         max_turns=limits.max_turns,
-        retry_event_sink=retry_store.append,
+        compaction_policy=CompactionRetryPolicy(
+            max_retries=1,
+            keep_recent_messages=20,
+        ),
     )
+    agent = host.agent
+    initial_message_count = len(agent.state.messages)
 
     # 保留原来的 01、02、03……中文事件显示模式。message_update 是逐字流事件，
     # 数量可能非常多，所以继续只展示关键生命周期事件。
@@ -301,6 +325,11 @@ async def main() -> None:
     print("真实 OpenAI-compatible Agent 示例")
     print(f"Provider：{model.provider}")
     print(f"模型：{model.id}")
+    print(f"Project：{project.project_id}")
+    print(f"Session：{session.session_id}")
+    print(f"已恢复历史消息：{initial_message_count} 条")
+    if legacy_import_message is not None:
+        print(legacy_import_message)
     print(f"用户消息：{user_message}")
     print(
         "已注册工具：add（独立超时 2 秒）、"
@@ -326,11 +355,12 @@ async def main() -> None:
         print("安全警告：当前使用远程明文 HTTP，Bearer 和消息没有 TLS 保护。")
     print("=" * 68)
 
-    # 状态事实先写入 Runtime Event Store，再交给终端故事线。
-    agent.subscribe(runtime_tracker.listener)
-    agent.subscribe(operation_recorder.listener)
+    # Host 已经负责 Runtime/Operation 持久化；这里只追加终端故事线。
     agent.subscribe(print_event)
-    await agent.prompt(user_message)
+    try:
+        await host.prompt(user_message)
+    finally:
+        await host.close()
 
     final = agent.state.messages[-1]
     final_text = content_text(final)
@@ -341,16 +371,18 @@ async def main() -> None:
     print("最终回答：", final_text)
     print("模型调用次数：", provider.call_count)
     print(f"为什么调用 {provider.call_count} 次：")
-    explanations = model_call_explanations(agent.state.messages)
+    explanations = model_call_explanations(
+        agent.state.messages[initial_message_count:]
+    )
     if explanations:
         for explanation in explanations:
             print(explanation)
     else:
         print("  本次没有形成 assistant 消息。")
-    runtime_view = project_runtime_state(runtime_tracker.state)
+    runtime_view = project_runtime_state(host.runtime_tracker.state)
     print("运行状态：", runtime_view["phaseLabel"])
     print("Runtime Run ID：", runtime_view["runId"])
-    print("Durable Operation ID：", operation_recorder.last_operation_id)
+    print("Durable Operation ID：", host.operation_recorder.last_operation_id)
     print("=" * 68)
 
 

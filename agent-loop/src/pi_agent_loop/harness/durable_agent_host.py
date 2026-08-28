@@ -26,10 +26,13 @@ from ..routing.capabilities import CapabilityRegistry
 from ..routing.routed_agent import RoutedAgent
 from ..runtime import RuntimeStateTracker, Telemetry
 from ..session import (
+    ConversationSession,
     DurableOperationRecorder,
     JournalKeyProvider,
     JournalPrincipal,
     OperationEventStore,
+    SessionContextProjection,
+    WorkspaceSessionCatalog,
 )
 from ..security import VerifiedIdentity
 from ..tool_runtime import ResourceLockBackend, ToolDispatchRuntime
@@ -42,6 +45,7 @@ from .lifecycle import DurableHostLifecycle
 from .model_runtime_adapter import RecoverableModelRuntime, TokenPricing
 from .plans import DurablePlanWorkflow
 from .resources import DurableHostResources
+from .session_runtime import SessionWriterLease
 from .startup_recovery import StartupRecoveryCoordinator, StartupRecoveryReport
 from .tool_runtime_adapter import RecoverableToolRuntime
 
@@ -81,6 +85,11 @@ class DurableAgentHost:
         self.telemetry: Telemetry
         self.plan_store: SessionJournalPlanStore | None
         self.plan_workflow: DurablePlanWorkflow
+        self.project_id: str | None
+        self.session_metadata: ConversationSession | None
+        self.session_catalog: WorkspaceSessionCatalog | None
+        self.context_projection: SessionContextProjection
+        self.session_writer_lease: SessionWriterLease | None
 
     @classmethod
     async def create(
@@ -128,6 +137,14 @@ class DurableAgentHost:
         plan_approval_barrier: ApprovalBarrier | None = None,
         max_parallel_plan_steps: int = 4,
         plan_lease_seconds: float = 30,
+        project_id: str | None = None,
+        workspace_path: str | Path | None = None,
+        session_title: str | None = None,
+        agent_profile: str = "default",
+        resume_history: bool = True,
+        managed_session: bool = False,
+        exclusive_session: bool | None = None,
+        session_writer_lease_seconds: float = 30,
     ) -> "DurableAgentHost":
         settings = DurableHostSettings(
             session_id=session_id,
@@ -172,6 +189,18 @@ class DurableAgentHost:
             plan_approval_barrier=plan_approval_barrier,
             max_parallel_plan_steps=max_parallel_plan_steps,
             plan_lease_seconds=plan_lease_seconds,
+            project_id=project_id,
+            workspace_path=workspace_path,
+            session_title=session_title,
+            agent_profile=agent_profile,
+            resume_history=resume_history,
+            managed_session=managed_session or project_id is not None,
+            exclusive_session=(
+                managed_session or project_id is not None
+                if exclusive_session is None
+                else exclusive_session
+            ),
+            session_writer_lease_seconds=session_writer_lease_seconds,
         )
         return await DurableHostFactory().create(cls, settings)
 
@@ -213,13 +242,41 @@ class DurableAgentHost:
         idempotency_key: str | None = None,
     ) -> DurableHostPromptResult:
         return await self.lifecycle.run(
-            lambda: self._prompt_impl(
+            lambda: self._prompt_and_record_activity(
                 text,
                 requester=requester,
                 approval_role=approval_role,
                 idempotency_key=idempotency_key,
             )
         )
+
+    async def _prompt_and_record_activity(
+        self,
+        text: str,
+        *,
+        requester: VerifiedIdentity | None,
+        approval_role: str,
+        idempotency_key: str | None,
+    ) -> DurableHostPromptResult:
+        if self.session_writer_lease is not None:
+            self.session_writer_lease.assert_owned()
+        result = await self._prompt_impl(
+            text,
+            requester=requester,
+            approval_role=approval_role,
+            idempotency_key=idempotency_key,
+        )
+        if self.session_writer_lease is not None:
+            self.session_writer_lease.assert_owned()
+        if self.session_catalog is not None and self.session_metadata is not None:
+            context = await self.context_projection.project(self.session_id)
+            self.session_metadata = await self.session_catalog.record_activity(
+                self.session_id,
+                last_activity_sequence=(
+                    context.last_sequence if context.last_sequence >= 0 else None
+                ),
+            )
+        return result
 
     async def _prompt_impl(
         self,

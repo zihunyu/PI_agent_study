@@ -110,6 +110,59 @@ Pi 原项目采用 MIT License。本目录保留了原许可证文件；若继�
 
 因此测试不需要真实 API key，也不依赖在线大模型。
 
+### 1.8 Project 与持久会话
+
+`DurableAgentWorkspace` 提供类似 Coding Agent 产品的两层结构：
+
+```text
+Project（本地工作目录）
+  └─ Session（一个可持续打开的对话）
+       └─ Operation Events（模型、工具、审批和完整消息事实）
+```
+
+- 用同一个 `session_id` 重新打开时，会从加密 Journal 重建之前的完整对话；
+- Project/Session 列表由事件投影产生，支持重命名、归档、排序、移动和软删除；
+- `fork_session()` 在固定 Journal Sequence 处分叉，后续主线消息不会泄漏到分支；
+- 打开受管 Session 时会核对工作目录和 Agent 配置摘要，并持有可续租的单写者 Lease；
+- 项目与会话元数据不会混入模型 Prompt，但与对话事件一样受加密、校验和租户隔离保护。
+
+最小使用方式：
+
+```python
+workspace = DurableAgentWorkspace.open("state")
+project = await workspace.ensure_project(".", title="my-project")
+session = await workspace.create_session(project.project_id, title="订单调试")
+
+host = await workspace.open_session(
+    session.session_id,
+    model=model,
+    stream_fn=provider.stream,
+    system_prompt="你是一个中文助手",
+    tools=tools,
+)
+await host.prompt("第一个问题")
+await host.close()
+
+# 重新运行程序后，使用同一 session_id 即可继续对话。
+host = await workspace.open_session(
+    session.session_id,
+    model=model,
+    stream_fn=provider.stream,
+    system_prompt="你是一个中文助手",
+    tools=tools,
+)
+```
+
+`examples/basic_usage.py` 默认持续使用 `basic-usage` Session；可用
+`--session-id` 选择或新建另一个对话：
+
+```powershell
+python examples/basic_usage.py --session-id order-debug "我上个问题是什么"
+```
+
+首次使用新 Journal 时，该示例会把同 Session 的旧
+`state/operation-events.jsonl` 对话一次性合并导入；原 JSONL 保留为可恢复备份。
+
 ---
 
 ## 2. 目录结构
