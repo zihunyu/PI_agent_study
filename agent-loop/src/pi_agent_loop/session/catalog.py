@@ -19,11 +19,13 @@ from uuid import uuid4
 
 from .journal import (
     JournalConflictError,
+    JournalFencedClaimLostError,
     JournalPrincipal,
     SessionEvent,
     SessionEventSpec,
     SQLiteSessionEventJournal,
 )
+from .operation_store import ClaimLease
 
 _CATALOG_SESSION_ID = "__workspace_catalog__"
 _CATALOG_PROJECTION = "workspace_catalog"
@@ -137,6 +139,16 @@ def _reduce_catalog(state: dict[str, Any], event: SessionEvent) -> dict[str, Any
         session = _session_entry(output, payload["sessionId"])
         session["configurationHash"] = payload["configurationHash"]
         session["agentProfile"] = payload["agentProfile"]
+        session["updatedAt"] = payload["updatedAt"]
+    elif event.event_type == "session_configuration_migrated":
+        session = _session_entry(output, payload["sessionId"])
+        if session["configurationHash"] != payload["fromConfigurationHash"]:
+            raise WorkspaceCatalogError("Session 配置迁移的来源 Hash 与当前状态不一致")
+        if session["agentProfile"] != payload["agentProfile"]:
+            raise WorkspaceCatalogError("Session 配置迁移不能改变 Agent Profile")
+        if payload["configurationHash"] == payload["fromConfigurationHash"]:
+            raise WorkspaceCatalogError("Session 配置迁移前后 Hash 不能相同")
+        session["configurationHash"] = payload["configurationHash"]
         session["updatedAt"] = payload["updatedAt"]
     elif event.event_type == "session_activity_recorded":
         session = _session_entry(output, payload["sessionId"])
@@ -275,6 +287,8 @@ class WorkspaceSessionCatalog:
         configuration_hash: str | None = None,
         parent_session_id: str | None = None,
         fork_sequence: int | None = None,
+        fenced_claim: ClaimLease | None = None,
+        fenced_claim_lease_seconds: float = 300,
     ) -> ConversationSession:
         identifier = _identifier(session_id or f"session_{uuid4().hex}", "session_id")
         if identifier == _CATALOG_SESSION_ID:
@@ -332,7 +346,12 @@ class WorkspaceSessionCatalog:
                 },
             )
 
-        result = await self._mutate(build)
+        result = await self._mutate(
+            build,
+            fenced_claim=fenced_claim,
+            fenced_session_id=identifier,
+            fenced_claim_lease_seconds=fenced_claim_lease_seconds,
+        )
         return _session_from_entry(result["sessions"][identifier])
 
     async def fork_session(
@@ -438,7 +457,12 @@ class WorkspaceSessionCatalog:
         cwd: str | Path,
         agent_profile: str,
         configuration_hash: str,
+        allow_migration: bool = False,
+        fenced_claim: ClaimLease | None = None,
+        fenced_claim_lease_seconds: float = 300,
     ) -> ConversationSession:
+        if not isinstance(allow_migration, bool):
+            raise ValueError("allow_migration 必须是 bool")
         canonical_cwd = _canonical_directory(cwd)
         profile = _identifier(agent_profile, "agent_profile")
         digest = _optional_digest(configuration_hash)
@@ -464,24 +488,42 @@ class WorkspaceSessionCatalog:
                 current_digest = entry["configurationHash"]
                 if current_digest is not None:
                     if current_digest != digest:
-                        raise SessionConfigurationMismatchError(
-                            "Session 的模型、System Prompt 或 Tool 配置已经变化；"
-                            "请新建 Session 或显式迁移配置"
-                        )
-                    return _session_from_entry(entry)
-                event_type = "session_configuration_bound"
-                payload = {
-                    "sessionId": session_id,
-                    "configurationHash": digest,
-                    "agentProfile": profile,
-                    "updatedAt": now,
-                }
+                        if not allow_migration:
+                            raise SessionConfigurationMismatchError(
+                                "Session 的模型、System Prompt 或 Tool 配置已经变化；"
+                                "请新建 Session 或显式迁移配置"
+                            )
+                        event_type = "session_configuration_migrated"
+                        payload = {
+                            "sessionId": session_id,
+                            "fromConfigurationHash": current_digest,
+                            "configurationHash": digest,
+                            "agentProfile": profile,
+                            "updatedAt": now,
+                        }
+                    else:
+                        return _session_from_entry(entry)
+                else:
+                    event_type = "session_configuration_bound"
+                    payload = {
+                        "sessionId": session_id,
+                        "configurationHash": digest,
+                        "agentProfile": profile,
+                        "updatedAt": now,
+                    }
                 try:
                     appended = await self._append(
                         event_type,
                         payload,
                         expected_last_sequence=last_sequence,
+                        fenced_claim=fenced_claim,
+                        fenced_session_id=session_id,
+                        fenced_claim_lease_seconds=fenced_claim_lease_seconds,
                     )
+                except JournalFencedClaimLostError as error:
+                    raise WorkspaceCatalogError(
+                        "Session Writer Lease 已丢失，禁止修改配置"
+                    ) from error
                 except JournalConflictError:
                     continue
                 result = _reduce_catalog(state, appended)
@@ -494,6 +536,8 @@ class WorkspaceSessionCatalog:
         session_id: str,
         *,
         last_activity_sequence: int | None,
+        fenced_claim: ClaimLease | None = None,
+        fenced_claim_lease_seconds: float = 300,
     ) -> ConversationSession:
         if last_activity_sequence is not None and (
             isinstance(last_activity_sequence, bool)
@@ -511,7 +555,12 @@ class WorkspaceSessionCatalog:
                 "updatedAt": now,
             }
 
-        state = await self._mutate(build)
+        state = await self._mutate(
+            build,
+            fenced_claim=fenced_claim,
+            fenced_session_id=session_id,
+            fenced_claim_lease_seconds=fenced_claim_lease_seconds,
+        )
         return _session_from_entry(state["sessions"][session_id])
 
     async def move_session(
@@ -602,7 +651,14 @@ class WorkspaceSessionCatalog:
             raise WorkspaceCatalogError("Workspace Catalog Snapshot 结构无效")
         return replay.state, replay.last_sequence
 
-    async def _mutate(self, build: Any) -> dict[str, Any]:
+    async def _mutate(
+        self,
+        build: Any,
+        *,
+        fenced_claim: ClaimLease | None = None,
+        fenced_session_id: str | None = None,
+        fenced_claim_lease_seconds: float = 300,
+    ) -> dict[str, Any]:
         async with self._mutation_lock:
             for _ in range(_MAX_CONFLICT_RETRIES):
                 state, last_sequence = await self._load()
@@ -612,7 +668,14 @@ class WorkspaceSessionCatalog:
                         event_type,
                         payload,
                         expected_last_sequence=last_sequence,
+                        fenced_claim=fenced_claim,
+                        fenced_session_id=fenced_session_id,
+                        fenced_claim_lease_seconds=fenced_claim_lease_seconds,
                     )
+                except JournalFencedClaimLostError as error:
+                    raise WorkspaceCatalogError(
+                        "Session Writer Lease 已丢失，禁止修改 Session Catalog"
+                    ) from error
                 except JournalConflictError:
                     continue
                 result = _reduce_catalog(state, appended)
@@ -626,20 +689,37 @@ class WorkspaceSessionCatalog:
         payload: dict[str, Any],
         *,
         expected_last_sequence: int,
+        fenced_claim: ClaimLease | None = None,
+        fenced_session_id: str | None = None,
+        fenced_claim_lease_seconds: float = 300,
     ) -> SessionEvent:
-        events = await self.journal.append_events(
-            self.principal,
-            [
-                SessionEventSpec(
-                    journal_kind="audit",
-                    event_type=event_type,
-                    session_id=_CATALOG_SESSION_ID,
-                    payload=payload,
-                    state_version=_CATALOG_STATE_VERSION,
-                )
-            ],
-            expected_last_sequence=expected_last_sequence,
-        )
+        specs = [
+            SessionEventSpec(
+                journal_kind="audit",
+                event_type=event_type,
+                session_id=_CATALOG_SESSION_ID,
+                payload=payload,
+                state_version=_CATALOG_STATE_VERSION,
+            )
+        ]
+        if fenced_claim is None:
+            events = await self.journal.append_events(
+                self.principal,
+                specs,
+                expected_last_sequence=expected_last_sequence,
+            )
+        else:
+            _validate_session_writer_claim(
+                fenced_claim,
+                session_id=fenced_session_id,
+            )
+            events = await self.journal.append_events_if_fenced_claim(
+                self.principal,
+                specs,
+                fenced_claim,
+                renew_lease_seconds=fenced_claim_lease_seconds,
+                expected_last_sequence=expected_last_sequence,
+            )
         return events[0]
 
     async def _save_snapshot(self, state: dict[str, Any], sequence: int) -> None:
@@ -652,10 +732,25 @@ class WorkspaceSessionCatalog:
                 state=state,
                 state_version=_CATALOG_STATE_VERSION,
             )
-        except JournalConflictError:
+        except Exception:
             # Another writer may already have stored a newer projection.  The
             # event is authoritative and the next replay will include it.
             return
+
+
+def _validate_session_writer_claim(
+    lease: ClaimLease,
+    *,
+    session_id: str | None,
+) -> None:
+    if (
+        not session_id
+        or lease.claim_type != "conversation_session_writer"
+        or lease.resource_id != session_id
+    ):
+        raise JournalFencedClaimLostError(
+            "Session Writer Claim 与目标 Session 不匹配"
+        )
 
 
 def _project_entry(state: dict[str, Any], project_id: str | None) -> dict[str, Any]:

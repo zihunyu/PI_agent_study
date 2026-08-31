@@ -14,7 +14,14 @@ from uuid import uuid4
 
 from ..cancellation import CancellationToken
 from ..event_stream import AssistantMessageEventStream
-from ..messages import assistant_message, empty_usage
+from ..messages import assistant_message, empty_usage, public_error_message
+from ..model_attempts import (
+    ModelAttemptAdmissionScope,
+    ModelAttemptBudgetExceeded,
+    ModelAttemptIdentity,
+    current_model_attempt_admission_scope,
+    model_attempt_usage,
+)
 from ..model_policy import (
     ModelRequestPolicy,
     ModelRequestPolicyError,
@@ -24,6 +31,7 @@ from ..model_policy import (
 from ..retry.circuit_breaker import CircuitBreaker
 from ..retry.compaction import (
     CompactionRetryPolicy,
+    ContextReplacement,
     compact_on_context_overflow,
 )
 from ..retry.events import RetryEventStore
@@ -83,7 +91,10 @@ class ModelCallRuntime:
         circuit_breaker: CircuitBreaker | None = None,
         retry_event_store: RetryEventStore | None = None,
         compaction_policy: CompactionRetryPolicy | None = None,
-        compactor: Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]]
+        compactor: Callable[
+            [list[dict[str, Any]]],
+            Awaitable[list[dict[str, Any]] | ContextReplacement],
+        ]
         | None = None,
         retry_event_sink: ModelEventSink | None = None,
         durable_event_sink: ModelEventSink | None = None,
@@ -92,7 +103,22 @@ class ModelCallRuntime:
         max_buffer_size: int = 256,
         max_buffer_bytes: int = 4 * 1024 * 1024,
     ) -> None:
-        effective = stream_fn
+        self.upstream_stream_fn = stream_fn
+        # Admission wraps the raw Provider before Retry and Compaction. Thus
+        # every physical attempt crosses the same reserved retry-tree scope.
+        upstream_owner = getattr(stream_fn, "__self__", None)
+        self.upstream_provides_physical_attempt_admission = bool(
+            getattr(
+                upstream_owner,
+                "provides_physical_attempt_admission",
+                False,
+            )
+        )
+        effective: StreamFn = (
+            stream_fn
+            if self.upstream_provides_physical_attempt_admission
+            else self._admitted_upstream_stream
+        )
         if retry_policy is not None:
             effective = retry_model_stream(
                 effective,
@@ -113,7 +139,6 @@ class ModelCallRuntime:
         elif compactor is not None:
             raise ValueError("compactor requires compaction_policy")
 
-        self.upstream_stream_fn = stream_fn
         self.effective_stream_fn = effective
         self.retry_event_sink = retry_event_sink
         self.durable_event_sink = durable_event_sink
@@ -211,6 +236,108 @@ class ModelCallRuntime:
             # retry/compaction/provider producer must be cancelled and drained.
             await settle_stream_producer(stream, cancel=not completed)
 
+    def _admitted_upstream_stream(
+        self,
+        model: Model,
+        context: dict[str, Any],
+        options: dict[str, Any],
+    ) -> Any:
+        """Dispatch the raw Provider through the active physical-attempt scope."""
+
+        scope = current_model_attempt_admission_scope()
+        if scope is None:
+            # Preserve the generic StreamFn contract and its exact return value
+            # when no autonomous hard-budget scope is active.
+            return self.upstream_stream_fn(model, context, options)
+        output = ProducerOwnedAssistantMessageEventStream(
+            max_buffer_size=self.max_buffer_size,
+            max_buffer_bytes=self.max_buffer_bytes,
+        )
+        task = asyncio.create_task(
+            self._run_admitted_upstream(
+                output,
+                scope,
+                model,
+                copy.deepcopy(context),
+                dict(options),
+            ),
+            name=f"pi-model-attempt:{scope.run_id}:{scope.stage}",
+        )
+        bind_stream_producer(output, task)
+        return output
+
+    async def _run_admitted_upstream(
+        self,
+        output: AssistantMessageEventStream,
+        scope: ModelAttemptAdmissionScope,
+        model: Model,
+        context: dict[str, Any],
+        options: dict[str, Any],
+    ) -> None:
+        identity: ModelAttemptIdentity | None = None
+        upstream: Any = None
+        completed = False
+        settled = False
+        try:
+            try:
+                identity = await scope.begin_attempt()
+            except ModelAttemptBudgetExceeded as error:
+                _push_model_attempt_budget_error(output, model, scope, error)
+                return
+            value = self.upstream_stream_fn(model, context, options)
+            upstream = (
+                await cast(Awaitable[Any], value)
+                if inspect.isawaitable(value)
+                else value
+            )
+            if not hasattr(upstream, "__aiter__") or not hasattr(upstream, "result"):
+                raise TypeError("raw Provider returned an invalid StreamFn result")
+            terminal_event: dict[str, Any] | None = None
+            async for event in upstream:
+                if event.get("type") in {"done", "error"}:
+                    terminal_event = dict(event)
+                else:
+                    output.push(event)
+            final = _apply_pricing(
+                await upstream.result(),
+                self._pricing_for(model),
+            )
+            tokens, cost = model_attempt_usage(final)
+            try:
+                await scope.finish_attempt(identity, tokens=tokens, cost=cost)
+                settled = True
+            except ModelAttemptBudgetExceeded as error:
+                settled = True
+                _push_model_attempt_budget_error(output, model, scope, error)
+                completed = True
+                return
+            if terminal_event is None:
+                event_type = (
+                    "error"
+                    if final.get("stopReason") in {"error", "aborted"}
+                    else "done"
+                )
+                terminal_event = {
+                    "type": event_type,
+                    "reason": final.get("stopReason"),
+                }
+            if terminal_event.get("type") == "error":
+                terminal_event["error"] = final
+            else:
+                terminal_event["message"] = final
+            output.push(terminal_event)
+            completed = True
+        except BaseException as error:
+            if identity is not None and not settled:
+                try:
+                    await scope.finish_attempt(identity, usage_unknown=True)
+                except BaseException:
+                    pass
+            output.fail(error)
+        finally:
+            if upstream is not None:
+                await settle_stream_producer(upstream, cancel=not completed)
+
     async def _run(
         self,
         output: AssistantMessageEventStream,
@@ -247,6 +374,12 @@ class ModelCallRuntime:
         # observed sink. This keeps retry/circuit telemetry consistent even when
         # the provider owns its retry implementation.
         options["retry_event_sink"] = observed_retry_sink
+        # Internal Provider retry adapters use this trusted transform to price
+        # every failed/successful physical attempt before aggregating it.
+        options["_model_attempt_usage_transform"] = lambda message: _apply_pricing(
+            message,
+            self._pricing_for(model),
+        )
         token = options.get("cancellation_token")
         if token is not None and not isinstance(token, CancellationToken):
             token = None
@@ -483,7 +616,9 @@ class ModelCallRuntime:
             final = assistant_message(
                 model=model,
                 stop_reason="aborted",
-                error_message=token.reason,
+                error_message=(
+                    token.reason if token is not None else "模型请求已取消"
+                ),
             )
             return (
                 {"type": "error", "reason": "aborted", "error": final},
@@ -494,7 +629,7 @@ class ModelCallRuntime:
                 pump.cancel()
             if cancellation_waiter is not None and not cancellation_waiter.done():
                 cancellation_waiter.cancel()
-            waits = [pump]
+            waits: list[asyncio.Task[Any]] = [pump]
             if cancellation_waiter is not None:
                 waits.append(cancellation_waiter)
             await asyncio.gather(*waits, return_exceptions=True)
@@ -742,7 +877,8 @@ class RecoverableModelRuntime(ModelCallRuntime):
         retry_event_store: RetryEventStore | None = None,
         compaction_policy: CompactionRetryPolicy | None = None,
         compactor: Callable[
-            [list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]
+            [list[dict[str, Any]]],
+            Awaitable[list[dict[str, Any]] | ContextReplacement],
         ]
         | None = None,
         retry_event_sink: Any | None = None,
@@ -976,3 +1112,33 @@ def _apply_pricing(
     costs["total"] = sum(costs.values())
     usage["cost"] = costs
     return output
+
+
+def _push_model_attempt_budget_error(
+    output: AssistantMessageEventStream,
+    model: Model,
+    scope: ModelAttemptAdmissionScope,
+    error: BaseException,
+) -> None:
+    final = assistant_message(
+        model=model,
+        stop_reason="error",
+        error_message="Model Provider attempt was rejected by the hard budget",
+    )
+    final["providerError"] = {
+        "code": ModelAttemptBudgetExceeded.code,
+        "statusCode": None,
+        "retryAfterMs": None,
+        "retryable": False,
+    }
+    final["modelAttemptAdmission"] = {
+        "runId": scope.run_id,
+        "stage": scope.stage,
+        "reservationId": scope.reservation_id,
+        "reason": public_error_message(
+            error,
+            fallback="Model provider attempt was rejected by the hard budget",
+        ),
+        "errorType": type(error).__name__,
+    }
+    output.push({"type": "error", "reason": "error", "error": final})

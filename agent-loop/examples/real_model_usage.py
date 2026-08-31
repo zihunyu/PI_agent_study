@@ -58,6 +58,7 @@ async def main() -> None:
         session_id="real-model-usage",
         tools=create_calculator_tools(),
         configuration={"provider": model.provider, "model": model.id},
+        run_id_provider=lambda: runtime_tracker.state.run_id,
     )
     compacting_stream = compact_on_context_overflow(
         provider.stream,
@@ -76,6 +77,7 @@ async def main() -> None:
         max_parallel_tools=limits.max_parallel_tools,
         max_turns=limits.max_turns,
         retry_event_sink=retry_store.append,
+        durable_metadata_provider=operation_recorder.current_durable_metadata,
     )
 
     def print_stream(event, _cancellation) -> None:

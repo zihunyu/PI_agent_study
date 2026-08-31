@@ -10,7 +10,7 @@ from typing import Any, cast
 from ..cancellation import CancellationToken
 from ..session.resume import RecoveryAction
 from ..tool_runtime import ToolDispatchRuntime
-from ..types import AgentTool, Model
+from ..types import AgentTool, Model, ToolDispatchContext
 
 
 class RecoverableToolRuntime:
@@ -39,6 +39,8 @@ class RecoverableToolRuntime:
             retry_event_sink=retry_event_sink,
             default_tool_timeout_seconds=default_tool_timeout_seconds,
         )
+        for tool in tools:
+            self.runtime.assert_registered_tool(tool)
 
     async def execute(
         self,
@@ -49,8 +51,25 @@ class RecoverableToolRuntime:
         tool = self.tools.get(action.tool_name or "")
         if tool is None:
             raise KeyError(f"恢复工具不存在：{action.tool_name}")
+        contract = self.runtime.assert_registered_tool(tool)
+        if (
+            action.expected_replay_policy is not None
+            and action.expected_replay_policy != contract.replay_policy
+        ):
+            raise PermissionError(
+                f"工具 {tool.name} 当前 replay_policy 与持久恢复事实不一致"
+            )
         if action.kind == "replay_safe_tool" and tool.replay_policy != "safe":
             raise PermissionError(f"工具 {tool.name} 不允许 Safe Replay")
+        if action.kind == "replay_safe_tool":
+            if action.expected_replay_policy != "safe":
+                raise PermissionError("Safe Replay 缺少持久 safe replay 策略")
+            if action.expected_tool_contract_digest is None:
+                raise PermissionError("Safe Replay 缺少持久 Tool Security Contract")
+            if action.expected_tool_contract_digest != contract.digest:
+                raise PermissionError(
+                    f"工具 {tool.name} 的持久 Security Contract 已变化"
+                )
         if tool.replay_policy == "never":
             if self.authorize_never is None:
                 raise PermissionError(f"工具 {tool.name} 需要 Approval/Write Coordinator")
@@ -72,6 +91,10 @@ class RecoverableToolRuntime:
                 "arguments": copy.deepcopy(action.arguments),
             },
             cancellation=token,
+            dispatch_context=ToolDispatchContext(
+                fencing_token=action.fencing_token,
+                fencing_scope=action.fencing_scope,
+            ),
             emit_messages=True,
         )
         if outcome.result_message is None:

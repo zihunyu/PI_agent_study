@@ -31,6 +31,14 @@ async def _unused_tool(_action):
     raise AssertionError("本测试不应调用 Tool Callback")
 
 
+def _fenced_model(callback):
+    async def invoke(messages, policy, identity):
+        assert int(identity["fencingToken"]) > 0
+        return await callback(messages, policy)
+
+    return invoke
+
+
 class DurableSessionRecoveryLeaseTests(unittest.IsolatedAsyncioTestCase):
     async def _start_continuation(
         self,
@@ -78,6 +86,7 @@ class DurableSessionRecoveryLeaseTests(unittest.IsolatedAsyncioTestCase):
                 slow_model,
                 _unused_tool,
                 _unused_tool,
+                request_model_with_context=_fenced_model(slow_model),
             )
             first = DurableSessionRecovery(
                 first_store,
@@ -150,6 +159,9 @@ class DurableSessionRecoveryLeaseTests(unittest.IsolatedAsyncioTestCase):
                         cancelled_model,
                         _unused_tool,
                         _unused_tool,
+                        request_model_with_context=_fenced_model(
+                            cancelled_model
+                        ),
                     ),
                 )
             )
@@ -190,6 +202,7 @@ class DurableSessionRecoveryLeaseTests(unittest.IsolatedAsyncioTestCase):
                     recovered_model,
                     _unused_tool,
                     _unused_tool,
+                    request_model_with_context=_fenced_model(recovered_model),
                 ),
             )
 
@@ -270,6 +283,10 @@ class DurableSessionRecoveryLeaseTests(unittest.IsolatedAsyncioTestCase):
                     "toolName": "divide",
                     "arguments": {"a": 10, "b": 2},
                     "replayPolicy": "safe",
+                    # 本用例验证的是恢复回调不能替换 Tool Call ID。
+                    # Safe Replay 本身必须先具备持久化安全合同，否则新的
+                    # fail-closed 规则会直接转入人工介入，根本不会调用回调。
+                    "securityContractDigest": "a" * 64,
                 },
             )
             await store.append(

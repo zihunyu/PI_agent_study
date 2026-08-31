@@ -17,16 +17,27 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
 
 from .cancellation import CancellationToken, OperationCancelledError
 from .loop import run_agent_loop, run_agent_loop_continue
-from .messages import empty_usage, now_ms, user_message
+from .messages import (
+    DEFAULT_MESSAGE_INPUT_LIMITS,
+    MessageInputLimits,
+    empty_usage,
+    normalize_user_message,
+    now_ms,
+    public_error_message,
+    user_message,
+)
+from .safety import ContentSafetyPipeline
+from .security import VerifiedIdentity
 from .tool_runtime import ToolDispatchRuntime
 from .transcript import repair_unresolved_tool_calls
 from .types import (
     AfterToolCallContext,
+    AfterToolCallResult,
     AgentContext,
     AgentEvent,
     AgentLoopConfig,
@@ -34,13 +45,17 @@ from .types import (
     AgentMessage,
     AgentState,
     AgentTool,
+    AgentToolResult,
     BeforeToolCallContext,
     Model,
     QueueMode,
     StreamFn,
     ThinkingLevel,
+    ToolAuthorization,
+    ToolDispatchContext,
     ToolExecutionMode,
     TurnCompletedContext,
+    UNSET,
 )
 
 Listener = Callable[[AgentEvent, CancellationToken], Any]
@@ -60,6 +75,68 @@ def _default_convert_to_llm(messages: list[AgentMessage]) -> list[AgentMessage]:
         for message in messages
         if message.get("role") in {"user", "assistant", "toolResult"}
     ]
+
+
+def _apply_after_tool_override(
+    result: AgentToolResult,
+    is_error: bool,
+    override: Any,
+) -> tuple[AgentToolResult, bool]:
+    """Apply the public after-hook contract before content-safety inspection."""
+
+    if not isinstance(override, AfterToolCallResult):
+        return result, is_error
+    updated = AgentToolResult(
+        content=(
+            result.content
+            if override.content is UNSET
+            else list(override.content)
+        ),
+        details=(
+            result.details if override.details is UNSET else override.details
+        ),
+        usage=result.usage if override.usage is UNSET else override.usage,
+        added_tool_names=result.added_tool_names,
+        terminate=(
+            result.terminate
+            if override.terminate is UNSET
+            else override.terminate
+        ),
+    )
+    if override.is_error is not UNSET:
+        is_error = bool(override.is_error)
+    return updated, is_error
+
+
+def _validate_guarded_tool_output(value: Any) -> dict[str, Any]:
+    """Reject malformed policy rewrites before they re-enter the transcript."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError("内容安全策略返回了无效的工具输出")
+    required = {"content", "details", "usage", "terminate", "isError"}
+    if set(value) != required:
+        raise ValueError("内容安全工具输出字段不完整或包含未知字段")
+    content = value.get("content")
+    usage = value.get("usage")
+    terminate = value.get("terminate")
+    is_error = value.get("isError")
+    if not isinstance(content, list) or any(
+        not isinstance(block, dict) for block in content
+    ):
+        raise TypeError("内容安全工具输出 content 必须是对象列表")
+    if usage is not None and not isinstance(usage, dict):
+        raise TypeError("内容安全工具输出 usage 必须是对象或 None")
+    if terminate is not None and not isinstance(terminate, bool):
+        raise TypeError("内容安全工具输出 terminate 必须是布尔值或 None")
+    if not isinstance(is_error, bool):
+        raise TypeError("内容安全工具输出 isError 必须是布尔值")
+    return {
+        "content": copy.deepcopy(content),
+        "details": copy.deepcopy(value.get("details")),
+        "usage": copy.deepcopy(usage),
+        "terminate": terminate,
+        "isError": is_error,
+    }
 
 
 def _materialize_staged_tool_results(
@@ -170,6 +247,13 @@ class Agent:
         retry_event_sink: Callable[[AgentEvent], Any] | None = None,
         tool_runtime: ToolDispatchRuntime | None = None,
         tenant_id: str | None = None,
+        tool_identity: VerifiedIdentity | None = None,
+        tool_approval: Any = None,
+        tool_authorization: ToolAuthorization | None = None,
+        require_tool_identity: bool = False,
+        durable_metadata_provider: Callable[[], Any] | None = None,
+        message_input_limits: MessageInputLimits | None = None,
+        content_safety: ContentSafetyPipeline | None = None,
     ) -> None:
         if (
             default_tool_timeout_seconds is not None
@@ -209,6 +293,32 @@ class Agent:
         self.stream_options = dict(stream_options or {})
         self.retry_event_sink = retry_event_sink
         self.tenant_id = tenant_id
+        self.tool_dispatch_context = ToolDispatchContext(
+            identity=tool_identity,
+            approval=tool_approval,
+            tenant_id=tenant_id,
+        )
+        self.tool_authorization = tool_authorization
+        self.require_tool_identity = require_tool_identity
+        self.durable_metadata_provider = durable_metadata_provider
+        if message_input_limits is not None and not isinstance(
+            message_input_limits,
+            MessageInputLimits,
+        ):
+            raise TypeError(
+                "message_input_limits 必须是 MessageInputLimits 或 None"
+            )
+        self.message_input_limits = (
+            message_input_limits or DEFAULT_MESSAGE_INPUT_LIMITS
+        )
+        if content_safety is not None and not isinstance(
+            content_safety,
+            ContentSafetyPipeline,
+        ):
+            raise TypeError(
+                "content_safety 必须是 ContentSafetyPipeline 或 None"
+            )
+        self.content_safety = content_safety
         self.tool_runtime = tool_runtime or ToolDispatchRuntime(
             self.state.tools,
             before_tool_call=before_tool_call,
@@ -217,7 +327,14 @@ class Agent:
             default_tool_timeout_seconds=default_tool_timeout_seconds,
             max_parallel_tools=max_parallel_tools or 64,
             default_tenant_id=tenant_id,
+            authorization=tool_authorization,
+            require_identity=require_tool_identity,
         )
+        if tool_runtime is not None:
+            if tool_authorization is not None:
+                self.tool_runtime.authorization = tool_authorization
+            if require_tool_identity:
+                self.tool_runtime.require_identity = True
 
         self._steering_queue = _PendingMessageQueue(steering_mode)
         self._follow_up_queue = _PendingMessageQueue(follow_up_mode)
@@ -272,14 +389,18 @@ class Agent:
         """把消息排到当前 Turn 之后、下一模型请求之前。"""
 
         self._steering_queue.enqueue(
-            user_message(message) if isinstance(message, str) else message
+            user_message(message, limits=self.message_input_limits)
+            if isinstance(message, str)
+            else self._normalize_prompt_message(message)
         )
 
     def follow_up(self, message: AgentMessage | str) -> None:
         """把消息排到 Agent 原本准备结束的位置。"""
 
         self._follow_up_queue.enqueue(
-            user_message(message) if isinstance(message, str) else message
+            user_message(message, limits=self.message_input_limits)
+            if isinstance(message, str)
+            else self._normalize_prompt_message(message)
         )
 
     def clear_steering_queue(self) -> None:
@@ -321,6 +442,8 @@ class Agent:
         self,
         value: str | AgentMessage | list[AgentMessage],
         images: list[dict] | None = None,
+        *,
+        cancellation: CancellationToken | None = None,
     ) -> None:
         """提交一条或多条新消息，并等待本次低层运行结算。"""
 
@@ -329,12 +452,37 @@ class Agent:
                 "Agent 正在处理 prompt；请使用 steer/follow_up，或等待空闲"
             )
         if isinstance(value, str):
-            prompts = [user_message(value, images)]
+            prompts = [
+                user_message(
+                    value,
+                    images,
+                    limits=self.message_input_limits,
+                )
+            ]
         elif isinstance(value, list):
-            prompts = value
+            if images is not None:
+                raise ValueError("images 只能与字符串 prompt 一起使用")
+            prompts = [self._normalize_prompt_message(message) for message in value]
         else:
-            prompts = [value]
-        await self._run_prompt_messages(prompts)
+            if images is not None:
+                raise ValueError("images 只能与字符串 prompt 一起使用")
+            prompts = [self._normalize_prompt_message(value)]
+        if cancellation is not None:
+            cancellation.throw_if_cancelled()
+        await self._run_prompt_messages(
+            prompts,
+            cancellation=cancellation,
+        )
+
+    def _normalize_prompt_message(self, message: AgentMessage) -> AgentMessage:
+        if not isinstance(message, dict):
+            raise TypeError("prompt 消息必须是字典")
+        if message.get("role") != "user":
+            return message
+        return normalize_user_message(
+            message,
+            limits=self.message_input_limits,
+        )
 
     async def continue_run(self) -> None:
         """从当前 transcript 继续；名称避开 Python 关键字 ``continue``。"""
@@ -366,6 +514,7 @@ class Agent:
         messages: list[AgentMessage],
         *,
         skip_initial_steering_poll: bool = False,
+        cancellation: CancellationToken | None = None,
     ) -> None:
         self._repair_transcript_before_run()
 
@@ -382,7 +531,7 @@ class Agent:
                 self.stream_fn,
             )
 
-        await self._run_with_lifecycle(execute)
+        await self._run_with_lifecycle(execute, cancellation=cancellation)
 
     async def _run_continuation(self) -> None:
         self._repair_transcript_before_run()
@@ -409,11 +558,11 @@ class Agent:
         self.state.messages = repaired
 
     def _context_snapshot(self) -> AgentContext:
-        """复制顶层容器，隔离低层 Loop 对当前运行 Context 的修改。"""
+        """深拷贝运行 Context，隔离 Loop、Hook 与公开状态。"""
 
         return AgentContext(
             system_prompt=self.state.system_prompt,
-            messages=list(self.state.messages),
+            messages=copy.deepcopy(self.state.messages),
             tools=list(self.state.tools),
         )
 
@@ -447,10 +596,50 @@ class Agent:
                 return None
             return await _maybe_await(self.prepare_next_turn(context, token))
 
+        async def inspect_model_input(
+            messages: list[AgentMessage],
+            cancellation: CancellationToken,
+        ) -> list[AgentMessage]:
+            if self.content_safety is None:
+                return messages
+            inspected = await self.content_safety.inspect(
+                "model_input",
+                messages,
+                cancellation,
+                tenant_id=self.tenant_id,
+            )
+            if not isinstance(inspected, list) or any(
+                not isinstance(message, dict) for message in inspected
+            ):
+                raise TypeError(
+                    "内容安全策略返回了无效的模型输入消息"
+                )
+            return copy.deepcopy(inspected)
+
+        async def inspect_model_output(
+            message: AgentMessage,
+            cancellation: CancellationToken,
+        ) -> AgentMessage:
+            if self.content_safety is None:
+                return message
+            inspected = await self.content_safety.inspect(
+                "model_output",
+                message,
+                cancellation,
+                tenant_id=self.tenant_id,
+            )
+            if not isinstance(inspected, dict):
+                raise TypeError(
+                    "内容安全策略返回了无效的模型输出消息"
+                )
+            return copy.deepcopy(inspected)
+
+        guarded_after_tool_call = self._guarded_after_tool_call()
+
         # 工具可以在运行时动态加入；每轮同步到普通/恢复共用的 Runtime。
         self.tool_runtime.register_tools(self.state.tools)
         self.tool_runtime.before_tool_call = self.before_tool_call
-        self.tool_runtime.after_tool_call = self.after_tool_call
+        self.tool_runtime.after_tool_call = guarded_after_tool_call
         self.tool_runtime.retry_event_sink = self.retry_event_sink
         self.tool_runtime.default_tool_timeout_seconds = self.default_tool_timeout_seconds
         return AgentLoopConfig(
@@ -460,7 +649,7 @@ class Agent:
             transform_context=self.transform_context,
             get_api_key=self.get_api_key,
             before_tool_call=self.before_tool_call,
-            after_tool_call=self.after_tool_call,
+            after_tool_call=guarded_after_tool_call,
             should_stop_after_turn=should_stop
             if self.should_stop_after_turn is not None
             else None,
@@ -476,16 +665,127 @@ class Agent:
             retry_event_sink=self.retry_event_sink,
             tool_runtime=self.tool_runtime,
             tenant_id=self.tenant_id,
+            tool_dispatch_context=self.tool_dispatch_context,
+            durable_metadata_provider=self.durable_metadata_provider,
+            inspect_model_input=(
+                inspect_model_input if self.content_safety is not None else None
+            ),
+            inspect_model_output=(
+                inspect_model_output if self.content_safety is not None else None
+            ),
         )
+
+    def _guarded_after_tool_call(
+        self,
+    ) -> Callable[[AfterToolCallContext, CancellationToken], Any] | None:
+        """Expose only inspected Tool output to hooks and the transcript."""
+
+        pipeline = self.content_safety
+        if pipeline is None:
+            return self.after_tool_call
+
+        async def inspect_output(
+            result: AgentToolResult,
+            is_error: bool,
+            cancellation: CancellationToken,
+            *,
+            tool_name: str | None,
+            tool_call_id: str,
+        ) -> dict[str, Any]:
+            inspected = await pipeline.inspect(
+                "tool_output",
+                {
+                    "content": copy.deepcopy(result.content),
+                    "details": copy.deepcopy(result.details),
+                    "usage": copy.deepcopy(result.usage),
+                    "terminate": result.terminate,
+                    "isError": is_error,
+                },
+                cancellation,
+                tenant_id=self.tenant_id,
+                tool_name=tool_name,
+                metadata=(
+                    {"toolCallId": tool_call_id} if tool_call_id else None
+                ),
+            )
+            return _validate_guarded_tool_output(inspected)
+
+        async def guarded(
+            context: AfterToolCallContext,
+            cancellation: CancellationToken,
+        ) -> AfterToolCallResult:
+            original_result = copy.deepcopy(context.result)
+            original_is_error = context.is_error
+            tool_name = str(context.tool_call.get("name", "")) or None
+            tool_call_id = str(context.tool_call.get("id", ""))
+            safe = await inspect_output(
+                original_result,
+                original_is_error,
+                cancellation,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            )
+            if self.after_tool_call is not None:
+                # The caller hook is an observer/rewriter, not a trusted bypass:
+                # it receives the inspected snapshot and any override is applied
+                # to the original result, then inspected again before release.
+                safe_context = AfterToolCallContext(
+                    assistant_message=context.assistant_message,
+                    tool_call=context.tool_call,
+                    args=context.args,
+                    result=AgentToolResult(
+                        content=safe["content"],
+                        details=safe["details"],
+                        usage=safe["usage"],
+                        added_tool_names=copy.deepcopy(
+                            original_result.added_tool_names
+                        ),
+                        terminate=safe["terminate"],
+                    ),
+                    is_error=safe["isError"],
+                    context=context.context,
+                )
+                override = await _maybe_await(
+                    self.after_tool_call(safe_context, cancellation)
+                )
+                if isinstance(override, AfterToolCallResult):
+                    overridden_result, overridden_is_error = (
+                        _apply_after_tool_override(
+                            original_result,
+                            original_is_error,
+                            override,
+                        )
+                    )
+                    safe = await inspect_output(
+                        overridden_result,
+                        overridden_is_error,
+                        cancellation,
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                    )
+            return AfterToolCallResult(
+                content=safe["content"],
+                details=safe["details"],
+                usage=safe["usage"],
+                terminate=safe["terminate"],
+                is_error=safe["isError"],
+            )
+
+        return guarded
 
     async def _run_with_lifecycle(
         self,
         executor: Callable[[CancellationToken], Awaitable[None]],
+        *,
+        cancellation: CancellationToken | None = None,
     ) -> None:
         if self._active_token is not None:
             raise RuntimeError("Agent 已经在运行")
 
-        token = CancellationToken()
+        token = cancellation or CancellationToken()
+        # 外部预取消必须在发出 agent_start、持久化 Operation 或调用 Provider
+        # 之前失败；同一 token 随后会继续传给模型、Hook 和工具 Runtime。
+        token.throw_if_cancelled()
         self._active_token = token
         self._idle_event.clear()
         self.state.is_streaming = True
@@ -569,7 +869,10 @@ class Agent:
             "model": self.state.model.id,
             "usage": empty_usage(),
             "stopReason": "aborted" if aborted else "error",
-            "errorMessage": str(error),
+            "errorMessage": public_error_message(
+                error,
+                fallback="Agent 运行失败",
+            ),
             "timestamp": now_ms(),
         }
         await self._process_event({"type": "message_start", "message": failure})
@@ -587,7 +890,7 @@ class Agent:
             return
         for listener in list(self._listeners):
             try:
-                await _maybe_await(listener(event, token))
+                await _maybe_await(listener(copy.deepcopy(event), token))
             except Exception:
                 continue
 
@@ -603,10 +906,13 @@ class Agent:
             if isinstance(context_messages, list):
                 self.state.messages = copy.deepcopy(context_messages)
         elif event_type in {"message_start", "message_update"}:
-            self.state.streaming_message = event.get("message")
+            message = event.get("message")
+            self.state.streaming_message = (
+                copy.deepcopy(message) if isinstance(message, dict) else None
+            )
         elif event_type == "message_end":
             self.state.streaming_message = None
-            self.state.messages.append(event["message"])
+            self.state.messages.append(copy.deepcopy(event["message"]))
         elif event_type == "tool_execution_start":
             pending = set(self.state.pending_tool_calls)
             pending.add(str(event.get("toolCallId", "")))
@@ -636,19 +942,38 @@ class Agent:
         # 已发生的副作用改写成“工具未执行”，也不能取消同批兄弟工具。
         deferred_cancel: asyncio.CancelledError | None = None
         for listener in list(self._listeners):
+            # Listener 是观察边界：每个订阅者得到独立快照，不能通过修改
+            # Message/Tool Call 反向篡改 AgentState 或低层 Loop 的执行输入。
+            listener_event = copy.deepcopy(event)
             try:
-                await _maybe_await(listener(event, token))
+                # Listener 永远只是 Observer。即使它修改自己的事件副本，也
+                # 不允许任何字段（包括审计关联 ID）回写 Agent/Loop。
+                await _maybe_await(listener(listener_event, token))
             except asyncio.CancelledError as error:
                 if event_type == "tool_execution_end":
                     self.listener_errors.append(
-                        f"tool_execution_end listener cancelled: {error}"
+                        f"[{type(error).__name__}] "
+                        + public_error_message(
+                            error,
+                            fallback=(
+                                "tool_execution_end listener failed/cancelled"
+                            ),
+                        )
                     )
                     deferred_cancel = deferred_cancel or error
                     continue
                 raise
             except Exception as error:
                 if event_type == "tool_execution_end":
-                    message = f"tool_execution_end listener failed: {error}"
+                    message = (
+                        f"[{type(error).__name__}] "
+                        + public_error_message(
+                            error,
+                            fallback=(
+                                "tool_execution_end listener failed/cancelled"
+                            ),
+                        )
+                    )
                     self.listener_errors.append(message)
                     self.state.error_message = message
                     continue

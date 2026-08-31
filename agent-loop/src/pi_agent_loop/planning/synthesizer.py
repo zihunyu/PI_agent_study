@@ -21,6 +21,7 @@ class ResultSynthesizer:
         ordered_results: list[tuple[str, object]] = []
         failures: list[tuple[str, str]] = []
         manual: list[str] = []
+        not_applicable: list[tuple[str, str]] = []
         for step_id in dependency_graph.topological_order:
             step_state = state.steps[step_id]
             if step_state.status == "succeeded":
@@ -29,10 +30,15 @@ class ResultSynthesizer:
                 failures.append((step_id, step_state.error or step_state.status))
             elif step_state.status == "manual_intervention":
                 manual.append(step_id)
+            elif step_state.status == "not_applicable":
+                not_applicable.append(
+                    (step_id, step_state.error or "condition_not_met")
+                )
         return SynthesizedPlanResult(
             plan_id=plan.plan_id,
             status=state.phase,
             ordered_results=tuple(ordered_results),
             failures=tuple(failures),
             manual_intervention=tuple(manual),
+            not_applicable=tuple(not_applicable),
         )

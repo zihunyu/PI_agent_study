@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, cast
 
 RuntimeEventType: TypeAlias = Literal[
     "run_started",
@@ -35,6 +35,38 @@ RuntimeEventType: TypeAlias = Literal[
     "reconciliation_finished",
     "budget_exceeded",
 ]
+
+_RUNTIME_EVENT_TYPES = frozenset(
+    {
+        "run_started",
+        "run_finished",
+        "run_interrupted",
+        "routing_started",
+        "routing_finished",
+        "turn_started",
+        "turn_finished",
+        "model_request_started",
+        "model_response_finished",
+        "model_retry_scheduled",
+        "model_retry_attempt_started",
+        "model_retry_finished",
+        "context_compaction_started",
+        "context_compaction_finished",
+        "tool_started",
+        "tool_dispatch_started",
+        "tool_retry_scheduled",
+        "tool_retry_attempt_started",
+        "tool_retry_finished",
+        "tool_finished",
+        "approval_required",
+        "approval_granted",
+        "approval_rejected",
+        "outcome_unknown",
+        "reconciliation_started",
+        "reconciliation_finished",
+        "budget_exceeded",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,12 +105,18 @@ class RuntimeEvent:
         sequence = value.get("sequence")
         timestamp = value.get("timestamp")
         data = value.get("data", {})
-        if not isinstance(event_type, str):
+        if not isinstance(event_type, str) or event_type not in _RUNTIME_EVENT_TYPES:
             raise ValueError("Runtime Event type 无效")
         if not isinstance(run_id, str):
             raise ValueError("Runtime Event runId 无效")
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            raise ValueError("Runtime Event sequence 无效")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+            raise ValueError("Runtime Event timestamp 无效")
+        if not isinstance(data, dict):
+            raise ValueError("Runtime Event data 无效")
         return cls(
-            type=event_type,  # type: ignore[arg-type]
+            type=cast(RuntimeEventType, event_type),
             run_id=run_id,
             sequence=sequence,
             timestamp=timestamp,

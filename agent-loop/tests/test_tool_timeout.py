@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -54,6 +55,7 @@ class ToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
             description="快速完成",
             execute=execute,
             timeout_seconds=0.1,
+            replay_policy="safe",
         )
         provider = self.provider_for_calls(
             [
@@ -88,6 +90,7 @@ class ToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
             description="故意超过时间",
             execute=execute,
             timeout_seconds=0.02,
+            replay_policy="safe",
         )
         provider = self.provider_for_calls(
             [
@@ -130,6 +133,7 @@ class ToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
             description="会超时",
             execute=slow_execute,
             timeout_seconds=0.02,
+            replay_policy="safe",
         )
         fast_tool = AgentTool(
             name="fast",
@@ -137,6 +141,7 @@ class ToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
             description="会成功",
             execute=fast_execute,
             timeout_seconds=0.1,
+            replay_policy="safe",
         )
         provider = self.provider_for_calls(
             [
@@ -176,9 +181,11 @@ class ToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[1]["content"][0]["text"], "fast-ok")
 
     async def test_除法工具使用自己的独立_timeout(self) -> None:
-        tool = create_divide_tool(delay_seconds=0.05)
+        tool = replace(
+            create_divide_tool(delay_seconds=0.05),
+            timeout_seconds=0.01,
+        )
         # 保留真实工具 execute，只把测试中的限制缩短，避免等待 3 秒。
-        tool.timeout_seconds = 0.01
         provider = self.provider_for_calls(
             [
                 {
@@ -212,6 +219,7 @@ class ToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
             label="默认超时工具",
             description="使用 Agent 默认值",
             execute=execute,
+            replay_policy="safe",
         )
         provider = self.provider_for_calls(
             [
@@ -264,6 +272,7 @@ class ToolTimeoutTests(unittest.IsolatedAsyncioTestCase):
             description="等待用户取消",
             execute=execute,
             timeout_seconds=5,
+            replay_policy="safe",
         )
         provider = self.provider_for_calls(
             [

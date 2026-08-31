@@ -234,6 +234,7 @@ from pi_agent_loop import (
 ```python
 machine = DomainStateMachine(
     initial_state="pending_payment",
+    approval_receipt_verifier=approval_adapter.verify_receipt,
     transitions=[
         DomainTransition(
             event_type="payment_succeeded",
@@ -271,9 +272,12 @@ next_state = machine.apply(
 - Entity ID；
 - allowed from state；
 - trusted source；
-- Approval；
+- 已消费且可验证的 `ApprovalReceipt`（Action Hash、审批人、过期时间和一次性 receipt id）；
 - expected_version；
 -重复转换定义。
+
+`approval_receipt_verifier` 属于纯 Reducer 边界，不得执行网络或数据库 I/O。调用层应先在
+事务 Store 中验证并消费 Approval，再传入签名或不可变验证快照供该 verifier 本地校验。
 
 ---
 
@@ -433,11 +437,22 @@ outcome_unknown
 规则：
 
 - Idempotency Key 原文不持久化，只保存 Hash；
+- Idempotency Hash 必须绑定 Session、可信 Principal 和 Tool，禁止跨作用域命中其他 Write；
 -同 Key + 同 Action 返回原 Write；
 -同 Key + 不同 Action 拒绝；
 - succeeded 后重复请求不再次执行；
 - outcome_unknown 不自动重放；
 -核对成功后才产生业务成功 Event。
+- Reconciliation 只有明确 `succeeded`/`failed` 才能进入终态；`pending`、
+  `unknown`、`not_found` 和无法识别的状态必须保持 `outcome_unknown`。
+- Plan 中的写 Step 必须通过 Approval 和完整 `WriteOperationService` 状态机执行，
+  不能调用裸 Step Callback；Action Hash、Approval Receipt、Idempotency、Write Claim
+  和 Reconciliation 均与普通写 Tool 使用同一条边界。
+- 外部 Handler 可能已成功、但 `write_succeeded` 落盘失败时，状态只能保持
+  `submitting` 或进入 `outcome_unknown`。不得追加 `write_failed`，也不得在核对前重放。
+- 写 Handler 进入派发后抛出的普通异常默认进入 `outcome_unknown`。只有 Adapter
+  显式抛出公共 `DefinitelyNotCommittedToolError`，并能证明外部副作用尚未提交时，
+  才允许追加 `write_failed`；Timeout、断连和响应解析失败不属于确定未提交。
 
 ---
 
@@ -489,6 +504,15 @@ Dispatch 后无 Result + safe
 Dispatch 后无 Result + never
 → 必须 Reconcile
 ```
+
+Replay Policy 是单调安全属性。Tool Registry、可信 Intent Policy、Workflow 和 Plan
+Step 的声明取最严格值；只要任一来源为 `never`，Router、Planner、调用参数和恢复代码
+都不能把最终策略改成 `safe`。配置无法证明一致时必须 fail-closed。
+
+Tool 注册边界必须同时封存不可变安全合同和当前 Handler 身份。同名不同实例不得覆盖；
+Prepared Call 必须绑定 Runtime、注册代次和合同摘要。Operation Event 中持久化的
+`securityContractDigest` 是 `safe` 重放的必要条件：摘要缺失、与当前部署不一致，或
+Tool 在注册后被修改时，只能人工介入，不能执行旧 Handler 或新 Handler。
 
 ---
 
@@ -581,6 +605,11 @@ Approval Consume、Write Approved、Tool Dispatch Started 和 Write Submitting �
 
 Write Recovery 必须联合读取 Write 与关联 Approval：Approved 应进入 Consume/Resume，不能继续显示 Waiting。Tool Intent 与 Write Prepare 同事务创建，Resume 只能复用。Reconciliation 使用 Lease Claim；`reconciling` 状态允许 Lease 获胜者重入，核对接口异常后写 `write_reconcile_failed` 回到 `outcome_unknown`。
 
+Workflow Lease、Run Controller Lease 和 Resource Lock Lease 必须使用各自精确的
+`resource_id + owner + generation`。状态写入使用 fenced CAS；外部 Handler 同时接收
+对应的 `fencing_scope + fencing_token`，由业务数据库/API 原子拒绝旧 generation。
+只做 Heartbeat 或调用前检查会留下 TOCTOU 窗口，不能视为完成 Fencing。
+
 ---
 
 ## 17. Reducer 必须是纯函数
@@ -655,6 +684,58 @@ release_claim(...)
 ```
 
 状态转换必须先纯函数预验证，再通过 CAS 提交；冲突后重新读取状态，不能继续使用旧快照。
+
+### 18.1 Plan、Run 与 Conversation 的原子启动
+
+Autonomous 初始启动必须在同一个 Journal 事务中写入：
+
+```text
+Plan initialized
++ Autonomous Run initial-plan-bound
++ Conversation Operation/Link
++ Run dispatchable
+```
+
+该批次必须对涉及的每个 Stream 使用精确 expected-sequence CAS；任何冲突都全部回滚。
+Correction Plan 的初始化和 Run 注册也属于同一事务。Worker 只能执行已经
+`linked + dispatchable` 的 Plan，不能抢跑 prepared/孤立 Plan。自定义 Store 如果
+不能提供等价的原子多 Stream 能力，受管模式必须拒绝执行，不能退化为多个普通 Append。
+当前内置 Host 具体要求三者共享同一 Session Journal，并使用
+`SessionJournalPlanStore`；普通自定义 `DurablePlanStore` 的
+`atomic_fenced_append=True` 不足以证明该能力。受管 Host 会在装配 Autonomous Runner
+时直接拒绝不兼容 Store；绕开 Host 直接组合组件时，也必须在 Bootstrap/派发前
+fail-closed。同一 Run 的并发 Begin 使用稳定 Conversation Operation 身份；
+只有一个原子批次能通过 CAS，冲突方重载并核对 Request/Plan 身份，不得创建第二个
+Operation 或残留孤立 Stream。
+
+### 18.2 Durable Completion Outbox
+
+Plan 首次进入 `waiting_approval` 或终态时，状态事件与 `completion_pending` 必须同
+事务追加。Outbox Envelope 固定绑定 `delivery_id`、generation、目标阶段、Plan 状态
+版本和摘要。Consumer 使用 fenced Claim 处理；`completion_ack` 必须 CAS 匹配同一
+Envelope，旧代 Ack 不得清除状态变化后产生的新 Pending。内置 Projector 会先持久化
+`waiting_approval` 通知或 Conversation 投影再 Ack；自定义 Handler 必须自行遵守此
+顺序，通用 Worker 只检查它接收 Envelope，不能验证业务投影已经落盘。
+
+该合同是 **at-least-once 投递**。如果 Consumer 完成投影后在 Ack 前崩溃，同一个
+`delivery_id` 会再次送达。内置 Waiting Projection 按 `delivery_id` 去重，内置 Final
+Projection 按稳定 `run_id + final` 身份和 CAS 去重。自定义 Completion Handler 必须
+接收 Envelope，并把 `delivery_id` 作为下游幂等键。不能把任意不支持幂等的外部
+副作用描述成“恰好一次”。
+
+### 18.3 Autonomous 持久硬预算
+
+Run Event 必须累计 Plan Step、实际 Step Attempt、实际 Tool Call、Model Call、Token、
+Cost 和墙钟 Duration。Planner、Validator、Replanner、Synthesizer 的模型消耗同样计入。
+Plan Step 数在 Plan 绑定时持久预扣；Step/Tool 离散尝试在实际派发前按一次精确预扣，
+不做事后 Settle；Duration 使用持久墙钟 Deadline。Model/Token/Cost 才通过可信
+`plan_usage_meter` 执行 `reserve → dispatch → settle`。`model_calls` 统计失败重试在内
+的物理 Provider Attempt，Token/Cost 累计整个 Retry Tree。Dispatch 后崩溃且无法证明未
+执行时保守保留 Reservation；重启、Lease 接管和 Correction Plan 不重置预算。任一硬
+上限不足时，必须在模型调用或 Tool 副作用之前终止。配置 Model/Token/Cost 而缺少
+Meter 时必须 fail-closed；Meter 必须控制每次真实 Provider Dispatch。Attempt Scope
+能阻止后续超额重试并核对累计用量，但第一个调用的单次 Token/Cost 上界仍必须由受信
+Meter/Provider 参数前置限制。
 
 ---
 

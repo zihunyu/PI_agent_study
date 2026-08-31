@@ -46,6 +46,7 @@ class _QueuedEvent(Generic[TEvent]):
     value: TEvent
     size: int
     coalesce_key: object | None = None
+    droppable: bool = True
 
 
 def _estimate_size(value: object) -> int:
@@ -76,6 +77,25 @@ def _default_event_key(event: Any) -> object | None:
     if event_type == "tool_execution_update":
         return (event_type, event.get("toolCallId"))
     return None
+
+
+def _default_event_droppable(event: Any) -> bool:
+    """Only high-frequency progress snapshots may be evicted.
+
+    Lifecycle, Tool commit-boundary and terminal events are structural facts and
+    must either be delivered or make the stream fail explicitly; they are never
+    silently replaced by a newer UI update.
+    """
+
+    if not isinstance(event, dict):
+        return False
+    return event.get("type") in {
+        "text_delta",
+        "thinking_delta",
+        "toolcall_delta",
+        "message_update",
+        "tool_execution_update",
+    }
 
 
 def _is_async_callable(callback: Callable[..., Any]) -> bool:
@@ -123,6 +143,7 @@ class EventStream(Generic[TEvent, TResult]):
         slow_consumer_policy: SlowConsumerPolicy = "drop_oldest",
         coalesce_key: Callable[[TEvent], object | None] | None = None,
         merge_updates: Callable[[TEvent, TEvent], TEvent] | None = None,
+        is_droppable: Callable[[TEvent], bool] | None = None,
         on_backpressure: Callable[[dict[str, Any]], Any] | None = None,
         on_queue_change: Callable[[EventStreamStats], Any] | None = None,
     ) -> None:
@@ -141,8 +162,11 @@ class EventStream(Generic[TEvent, TResult]):
         if slow_consumer_policy not in {"drop_oldest", "error"}:
             raise ValueError("slow_consumer_policy must be drop_oldest or error")
 
+        # The extra slot belongs exclusively to the wake-up marker. It is not
+        # counted as buffered event capacity, so error/close never has to evict
+        # an already accepted structural event merely to wake the iterator.
         self._queue: asyncio.Queue[_QueuedEvent[TEvent] | object] = asyncio.Queue(
-            maxsize=max_buffer_size
+            maxsize=max_buffer_size + 1
         )
         self._is_complete = is_complete
         self._extract_result = extract_result
@@ -151,6 +175,7 @@ class EventStream(Generic[TEvent, TResult]):
         self._slow_consumer_policy = slow_consumer_policy
         self._coalesce_key = coalesce_key
         self._merge_updates = merge_updates or (lambda _old, new: new)
+        self._is_droppable = is_droppable or _default_event_droppable
         self._on_backpressure = on_backpressure
         self._on_queue_change = on_queue_change
         self._pending_by_key: dict[object, _QueuedEvent[TEvent]] = {}
@@ -186,12 +211,12 @@ class EventStream(Generic[TEvent, TResult]):
             return
         try:
             self._push_open(event)
-        except BaseException as error:
+        except BaseException as caught:
             # Event classification and coalescing are extension points. A bad
             # provider event or user callback must fail-close both consumers;
             # otherwise async iteration/result() can wait forever.
             if not self._done:
-                self._terminate_with_error(error)
+                self._terminate_with_error(caught)
             raise
 
     def _push_open(self, event: TEvent) -> None:
@@ -200,22 +225,23 @@ class EventStream(Generic[TEvent, TResult]):
         if terminal:
             try:
                 terminal_result = self._extract_result(event)
-            except BaseException as error:
+            except BaseException as caught:
                 # 即使 Provider 给出畸形终止事件，也必须唤醒 iterator/result；
                 # 不能先置 done 再因 extractor 异常留下永久等待者。
-                self._terminate_with_error(error)
+                self._terminate_with_error(caught)
                 raise
 
         key = self._coalesce_key(event) if self._coalesce_key is not None else None
         size = _estimate_size(event)
+        droppable = bool(self._is_droppable(event)) and not terminal
         existing = self._pending_by_key.get(key) if key is not None else None
-        pressure = self._would_overflow(size, slots=2 if terminal else 1)
+        pressure = self._would_overflow(size, terminal=terminal)
         # Clearing older events cannot make an individually oversized event fit.
         if size > self._max_buffer_bytes:
             error = EventStreamBackpressureError(
                 "event exceeds the stream byte limit"
             )
-            if terminal or self._slow_consumer_policy == "error":
+            if terminal or not droppable or self._slow_consumer_policy == "error":
                 self._terminate_with_error(error)
                 raise error
             self._dropped_events += 1
@@ -258,13 +284,24 @@ class EventStream(Generic[TEvent, TResult]):
                 )
                 self._terminate_with_error(error)
                 raise error
-            self._make_room(size, slots=2 if terminal else 1)
+            made_room = self._make_room(size, terminal=terminal)
+            if not made_room:
+                if droppable and not terminal:
+                    self._dropped_events += 1
+                    self._notify_backpressure("incoming_update_dropped")
+                    self._notify_queue_change()
+                    return
+                error = EventStreamBackpressureError(
+                    "structural event buffer is full; no progress update can be evicted"
+                )
+                self._terminate_with_error(error)
+                raise error
 
         if terminal:
             self._done = True
             if not self._result.done():
                 self._result.set_result(cast(TResult, terminal_result))
-        queued = _QueuedEvent(event, size, key)
+        queued = _QueuedEvent(event, size, key, droppable)
         self._queue.put_nowait(queued)
         self._queued_event_count += 1
         self._queued_bytes += size
@@ -273,7 +310,6 @@ class EventStream(Generic[TEvent, TResult]):
         self._update_high_watermarks()
         self._notify_queue_change()
         if terminal:
-            # _make_room reserved a second slot for the wake-up marker.
             self._queue.put_nowait(_END)
             self._close_backpressure_notifications()
 
@@ -285,7 +321,6 @@ class EventStream(Generic[TEvent, TResult]):
         self._done = True
         if not self._result.done():
             self._result.set_result(cast(TResult, result))
-        self._make_room(0, slots=1)
         self._queue.put_nowait(_END)
         self._notify_queue_change()
         self._close_backpressure_notifications()
@@ -330,40 +365,71 @@ class EventStream(Generic[TEvent, TResult]):
         if not self._result.done():
             self._result.set_exception(error)
             self._result.add_done_callback(lambda future: future.exception())
-        self._make_room(0, slots=1)
         self._queue.put_nowait(_END)
         self._notify_backpressure("error")
         self._notify_queue_change()
         self._close_backpressure_notifications()
 
-    def _would_overflow(self, incoming_size: int, *, slots: int) -> bool:
+    def _would_overflow(self, incoming_size: int, *, terminal: bool) -> bool:
+        # Terminal events get priority by evicting only droppable progress
+        # updates. If the buffer contains structural facts exclusively, the
+        # stream fails explicitly instead of silently deleting one of them.
+        event_limit = self._max_buffer_size
         return (
-            self._queue.qsize() + slots > self._max_buffer_size
+            self._queued_event_count + 1 > event_limit
             or self._queued_bytes + incoming_size > self._max_buffer_bytes
         )
 
-    def _make_room(self, incoming_size: int, *, slots: int) -> None:
-        while self._would_overflow(incoming_size, slots=slots) and not self._queue.empty():
+    def _make_room(self, incoming_size: int, *, terminal: bool) -> bool:
+        while self._would_overflow(incoming_size, terminal=terminal):
             if not self._drop_oldest():
-                return
+                return False
+        return True
 
     def _trim_bytes(self, *, protected: _QueuedEvent[TEvent]) -> None:
         # If the single protected update is oversized, retain it as the newest
         # authoritative snapshot instead of emptying the stream.
         while self._queued_bytes > self._max_buffer_bytes and self._queued_event_count > 1:
             if not self._drop_oldest(protected=protected):
-                return
+                break
+        if self._queued_bytes > self._max_buffer_bytes and protected.droppable:
+            self._remove_queued(protected)
 
     def _drop_oldest(self, *, protected: _QueuedEvent[TEvent] | None = None) -> bool:
-        attempts = self._queue.qsize()
-        for _ in range(attempts):
-            item = self._queue.get_nowait()
+        # asyncio.Queue does not support indexed removal. Drain and restore in
+        # exactly the same order so protecting a commit event never reorders it.
+        items: list[_QueuedEvent[TEvent] | object] = []
+        while not self._queue.empty():
+            items.append(self._queue.get_nowait())
+        candidate: _QueuedEvent[TEvent] | None = None
+        for item in items:
             if item is _END or item is protected:
-                self._queue.put_nowait(item)
                 continue
-            self._discard(cast(_QueuedEvent[TEvent], item))
-            return True
-        return False
+            queued = cast(_QueuedEvent[TEvent], item)
+            if queued.droppable:
+                candidate = queued
+                break
+        for item in items:
+            if item is not candidate:
+                self._queue.put_nowait(item)
+        if candidate is None:
+            return False
+        self._discard(candidate)
+        return True
+
+    def _remove_queued(self, target: _QueuedEvent[TEvent]) -> None:
+        items: list[_QueuedEvent[TEvent] | object] = []
+        removed = False
+        while not self._queue.empty():
+            item = self._queue.get_nowait()
+            if item is target and not removed:
+                removed = True
+                continue
+            items.append(item)
+        for item in items:
+            self._queue.put_nowait(item)
+        if removed:
+            self._discard(target)
 
     def _discard(self, queued: _QueuedEvent[TEvent]) -> None:
         self._queued_event_count = max(0, self._queued_event_count - 1)
@@ -511,6 +577,7 @@ class AssistantMessageEventStream(EventStream[dict, dict]):
             slow_consumer_policy=slow_consumer_policy,
             coalesce_key=_default_event_key,
             merge_updates=_merge_updates,
+            is_droppable=_default_event_droppable,
             on_backpressure=on_backpressure,
             on_queue_change=on_queue_change,
         )
@@ -536,6 +603,7 @@ class AgentEventStream(EventStream[dict, list[dict]]):
             slow_consumer_policy=slow_consumer_policy,
             coalesce_key=_default_event_key,
             merge_updates=_merge_updates,
+            is_droppable=_default_event_droppable,
             on_backpressure=on_backpressure,
             on_queue_change=on_queue_change,
         )

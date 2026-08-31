@@ -18,9 +18,11 @@ from pi_agent_loop.runtime.telemetry import InMemoryTelemetryExporter, Telemetry
 from pi_agent_loop.session.resume import RecoveryAction
 from pi_agent_loop.tool_runtime import (
     ResourceLeaseLostError,
+    ResourceLockBackendCapabilities,
     SQLiteResourceLockBackend,
     ToolDispatchRuntime,
 )
+from pi_agent_loop.tool_contract import ToolSecurityContract
 from pi_agent_loop.types import AgentContext, AgentTool, AgentToolResult, Model
 
 
@@ -278,11 +280,61 @@ class ToolDispatchRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 tool_call_id="call-1",
                 tool_name="read",
                 arguments={},
+                expected_replay_policy="safe",
+                expected_tool_contract_digest=(
+                    ToolSecurityContract.capture(tool).digest
+                ),
             )
         )
         self.assertEqual(calls, ["call-1"])
         self.assertFalse(result["isError"])
         self.assertEqual(shared.scheduler.stats.completed, 1)
+
+    async def test_recovery把fencing_token传入可信tool_context(self) -> None:
+        observed: list[tuple[int | None, str | None]] = []
+
+        async def execute_with_context(
+            _call_id,
+            _args,
+            context,
+            _token,
+            _update,
+        ):
+            observed.append(
+                (context.fencing_token, context.fencing_scope)
+            )
+            return AgentToolResult(content=[])
+
+        tool = AgentTool(
+            name="fenced_read",
+            label="fenced_read",
+            description="fenced_read",
+            execute=None,
+            execute_with_context=execute_with_context,
+            replay_policy="safe",
+        )
+        recovery = RecoverableToolRuntime(
+            model=Model(id="m", provider="test"),
+            tools=[tool],
+        )
+
+        result = await recovery.execute(
+            RecoveryAction(
+                kind="replay_safe_tool",
+                tool_call_id="call-fenced",
+                tool_name=tool.name,
+                arguments={},
+                expected_replay_policy="safe",
+                expected_tool_contract_digest=(
+                    ToolSecurityContract.capture(tool).digest
+                ),
+                fencing_token=17,
+                fencing_scope="operation-recovery-scope",
+            )
+        )
+
+        self.assertFalse(result["isError"])
+        self.assertEqual(observed, [(17, "operation-recovery-scope")])
 
     async def test_priority在同一屏障内先执行高优先级(self) -> None:
         order: list[str] = []
@@ -725,6 +777,112 @@ class ToolDispatchRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(outcome.result.details["code"], "resource_lock_timeout")
             release.set()
             await task
+
+    async def test_sqlite资源锁向下游传递稳定scope和单调generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fenced-locks.sqlite3"
+            observed: list[tuple[int | None, str | None]] = []
+
+            async def execute_with_context(
+                _id,
+                _args,
+                context,
+                _token,
+                _update,
+            ):
+                observed.append(
+                    (
+                        context.resource_fencing_token,
+                        context.resource_fencing_scope,
+                    )
+                )
+                return AgentToolResult(content=[])
+
+            tool = AgentTool(
+                name="fenced-write",
+                label="fenced-write",
+                description="fenced-write",
+                execute=None,
+                execute_with_context=execute_with_context,
+                execution_mode="resource_locked",
+                resolve_resource_keys=lambda _args: "order:9",
+                replay_policy="never",
+                supports_resource_fencing=True,
+            )
+            first = ToolDispatchRuntime(
+                [tool],
+                distributed_lock_backend=SQLiteResourceLockBackend(path),
+            )
+            second = ToolDispatchRuntime(
+                [tool],
+                distributed_lock_backend=SQLiteResourceLockBackend(path),
+            )
+
+            self.assertFalse(
+                (await first.dispatch(tool_call("first", tool.name))).is_error
+            )
+            self.assertFalse(
+                (await second.dispatch(tool_call("second", tool.name))).is_error
+            )
+            self.assertEqual(len(observed), 2)
+            first_token, first_scope = observed[0]
+            second_token, second_scope = observed[1]
+            self.assertIsInstance(first_token, int)
+            self.assertIsInstance(second_token, int)
+            assert first_token is not None and second_token is not None
+            self.assertGreater(second_token, first_token)
+            self.assertEqual(first_scope, second_scope)
+
+    async def test_锁后端虚报fencing能力时在callback前fail_closed(self) -> None:
+        class LyingBackend:
+            capabilities = ResourceLockBackendCapabilities(
+                backend_name="lying-lock",
+                supports_cross_process=True,
+                supports_multi_host=True,
+                atomic_multi_resource_acquire=True,
+                supports_lease_renewal=True,
+                supports_fencing_tokens=True,
+            )
+
+            async def acquire(self, *_args, **_kwargs):
+                return True
+
+            async def renew(self, *_args, **_kwargs):
+                return True
+
+            async def release(self, *_args, **_kwargs):
+                return None
+
+        calls = 0
+
+        async def execute_with_context(
+            _id,
+            _args,
+            _context,
+            _token,
+            _update,
+        ):
+            nonlocal calls
+            calls += 1
+            return AgentToolResult(content=[])
+
+        tool = AgentTool(
+            name="fenced-write",
+            label="fenced-write",
+            description="fenced-write",
+            execute=None,
+            execute_with_context=execute_with_context,
+            execution_mode="resource_locked",
+            resolve_resource_keys=lambda _args: "order:9",
+            supports_resource_fencing=True,
+        )
+        outcome = await ToolDispatchRuntime(
+            [tool],
+            distributed_lock_backend=LyingBackend(),
+        ).dispatch(tool_call("lying", tool.name))
+
+        self.assertTrue(outcome.is_error)
+        self.assertEqual(calls, 0)
 
     async def test_sqlite锁获取线程被取消后不会遗留孤儿lease(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

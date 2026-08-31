@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..session.replay import replay_runtime_events
+from ..session.operation_store import ClaimLease
 from ..session.store import RuntimeEventStore
 from .events import RuntimeEvent, RuntimeEventType
 from .reducer import reduce_runtime_state
@@ -16,16 +17,46 @@ from .states import RunState
 class RuntimeStateTracker:
     """可直接作为 `Agent.subscribe()` 的异步 Listener。"""
 
-    def __init__(self, store: RuntimeEventStore, state: RunState) -> None:
+    def __init__(
+        self,
+        store: RuntimeEventStore,
+        state: RunState,
+        *,
+        fenced_claim: ClaimLease | None = None,
+        fenced_claim_lease_seconds: float = 300,
+    ) -> None:
+        if fenced_claim_lease_seconds <= 0:
+            raise ValueError("Runtime Tracker Claim Lease 必须大于 0")
+        if fenced_claim is not None and not getattr(
+            store,
+            "supports_fenced_runtime_append",
+            False,
+        ):
+            raise RuntimeError(
+                "Runtime Tracker Store 不支持原子 Fenced Append"
+            )
         self.store = store
         self.state = state
+        self.fenced_claim = fenced_claim
+        self.fenced_claim_lease_seconds = fenced_claim_lease_seconds
         self._lock = asyncio.Lock()
         self._active_model_identity: dict[str, Any] = {}
 
     @classmethod
-    async def create(cls, store: RuntimeEventStore) -> "RuntimeStateTracker":
+    async def create(
+        cls,
+        store: RuntimeEventStore,
+        *,
+        fenced_claim: ClaimLease | None = None,
+        fenced_claim_lease_seconds: float = 300,
+    ) -> "RuntimeStateTracker":
         state = replay_runtime_events(await store.load())
-        return cls(store, state)
+        return cls(
+            store,
+            state,
+            fenced_claim=fenced_claim,
+            fenced_claim_lease_seconds=fenced_claim_lease_seconds,
+        )
 
     async def start_run(self) -> RunState:
         """在 Router 等 Agent Loop 外层工作开始前显式打开一个 Run。"""
@@ -36,23 +67,19 @@ class RuntimeStateTracker:
 
     async def listener(self, event: dict[str, Any], cancellation: Any) -> None:
         async with self._lock:
-            if event.get("type") == "model_request_start":
-                # The Operation recorder and model boundary consume the same
-                # mutable lifecycle event after this listener runs.
-                if self.state.run_id is not None and not self.state.terminal:
-                    event["runId"] = self.state.run_id
+            observed = dict(event)
             converted = self._convert_agent_event(
-                event,
+                observed,
                 cancelled=bool(getattr(cancellation, "cancelled", False)),
             )
             for event_type, data in converted:
                 await self._append(event_type, data)
-            if event.get("type") == "model_request_start":
-                self._active_model_identity = _model_identity_data(event)
+            if observed.get("type") == "model_request_start":
+                self._active_model_identity = _model_identity_data(observed)
             elif (
-                event.get("type") == "message_end"
-                and isinstance(event.get("message"), dict)
-                and event["message"].get("role") == "assistant"
+                observed.get("type") == "message_end"
+                and isinstance(observed.get("message"), dict)
+                and observed["message"].get("role") == "assistant"
             ):
                 self._active_model_identity = {}
 
@@ -85,7 +112,18 @@ class RuntimeStateTracker:
             data=data,
         )
         next_state = reduce_runtime_state(self.state, runtime_event)
-        await self.store.append(runtime_event)
+        if self.fenced_claim is None:
+            await self.store.append_cas(
+                runtime_event,
+                expected_last_sequence=self.state.sequence,
+            )
+        else:
+            await self.store.append_cas_if_fenced_claim(
+                runtime_event,
+                self.fenced_claim,
+                renew_lease_seconds=self.fenced_claim_lease_seconds,
+                expected_last_sequence=self.state.sequence,
+            )
         self.state = next_state
 
     def _convert_agent_event(

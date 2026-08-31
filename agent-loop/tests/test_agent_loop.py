@@ -138,9 +138,17 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
+        fast_finished = asyncio.Event()
+
         def make_tool(name: str, delay: float) -> AgentTool:
             async def execute(_id, _arguments, _token, _on_update):
-                await asyncio.sleep(delay)
+                if name == "slow":
+                    # 用同步点而非脆弱的 sleep 差值证明并发；Windows/重载 CI
+                    # 可能一次唤醒两个已到期 Timer，导致按创建顺序完成。
+                    await asyncio.wait_for(fast_finished.wait(), timeout=1)
+                else:
+                    await asyncio.sleep(delay)
+                    fast_finished.set()
                 return AgentToolResult(
                     content=[{"type": "text", "text": name}], details={}
                 )
@@ -221,6 +229,8 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         await agent.prompt("执行危险工具")
 
         self.assertFalse(executed)
+        self.assertEqual(provider.call_count, 1)
+        self.assertIn("长度上限", agent.state.error_message or "")
         result = next(
             message
             for message in agent.state.messages
@@ -228,6 +238,10 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result["isError"])
         self.assertIn("参数可能被截断", result["content"][0]["text"])
+        self.assertEqual(
+            result["details"]["code"],
+            "model_output_truncated",
+        )
 
     async def test_follow_up_只在原响应结束后处理(self) -> None:
         provider = ScriptedProvider(

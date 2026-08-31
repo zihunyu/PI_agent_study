@@ -105,20 +105,33 @@ class P0ApprovalAtomicityTests(unittest.IsolatedAsyncioTestCase):
         *,
         idempotency_key="refund-key",
         before_execute=None,
+        fenced_claim=None,
     ):
         envelope = DurableActionEnvelope.from_dict(payload["envelope"])
         if before_execute is not None:
             await before_execute()
 
-        async def handler(_arguments, _key, _actor):
+        async def context_handler(context):
+            self.assertEqual(
+                context.fencing_token,
+                fenced_claim.fencing_token if fenced_claim is not None else None,
+            )
+            self.assertEqual(
+                context.fencing_scope,
+                fenced_claim.resource_id if fenced_claim is not None else None,
+            )
             return {"status": "succeeded"}
 
         write = await WriteOperationService(store, approvals).execute(
             envelope.write_id,
             actor=operator,
             idempotency_key=idempotency_key,
-            handler=handler,
+            context_handler=context_handler,
             approval_resume_id=pending.approval.approval_id,
+            fencing_token=(
+                fenced_claim.fencing_token if fenced_claim is not None else None
+            ),
+            fenced_claim=fenced_claim,
         )
         operation = replay_operation(
             await store.load(operation_id=envelope.operation_id)
@@ -159,11 +172,21 @@ class P0ApprovalAtomicityTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         if specs:
-            await store.append_batch(
-                "session-1",
-                envelope.operation_id,
-                specs,
-            )
+            if fenced_claim is None:
+                await store.append_batch(
+                    "session-1",
+                    envelope.operation_id,
+                    specs,
+                )
+            else:
+                await store.append_batch_if_fenced_claim(
+                    "session-1",
+                    envelope.operation_id,
+                    specs,
+                    fenced_claim,
+                    expected_claim_entity_id=pending.approval.approval_id,
+                    renew_lease_seconds=0.5,
+                )
         return {"status": "resumed"}
 
     async def make_host(self, directory):
@@ -361,7 +384,8 @@ class P0ApprovalAtomicityTests(unittest.IsolatedAsyncioTestCase):
                 idempotency_key="refund-host-key",
             )
 
-            async def handler(_arguments, _key, _actor):
+            async def handler(_arguments, _key, _actor, *, fenced_claim):
+                self.assertIsNotNone(fenced_claim)
                 return {"status": "succeeded"}
 
             await host.approve_and_resume(
@@ -450,14 +474,17 @@ class P0ApprovalAtomicityTests(unittest.IsolatedAsyncioTestCase):
             first = ApprovalResumeCoordinator(
                 first_store,
                 first_approvals,
-                claim_lease_seconds=0.12,
-                claim_renew_interval_seconds=0.03,
+                # Windows CI 在整套测试高负载时可能超过 100ms 才重新调度
+                # heartbeat。过期 Lease 现在严格禁止复活，因此这里使用仍然
+                # 很短、但足以区分调度抖动与真实心跳丢失的测试窗口。
+                claim_lease_seconds=0.5,
+                claim_renew_interval_seconds=0.05,
             )
             second = ApprovalResumeCoordinator(
                 second_store,
                 second_approvals,
-                claim_lease_seconds=0.12,
-                claim_renew_interval_seconds=0.03,
+                claim_lease_seconds=0.5,
+                claim_renew_interval_seconds=0.05,
             )
             pending, _envelope = await self.request_plan(first, operator)
             entered = asyncio.Event()
@@ -470,7 +497,7 @@ class P0ApprovalAtomicityTests(unittest.IsolatedAsyncioTestCase):
                 entered.set()
                 await release.wait()
 
-            async def resume(payload):
+            async def resume(payload, *, fenced_claim):
                 return await self.execute_and_materialize(
                     first_store,
                     first_approvals,
@@ -478,6 +505,7 @@ class P0ApprovalAtomicityTests(unittest.IsolatedAsyncioTestCase):
                     operator,
                     payload,
                     before_execute=before_execute,
+                    fenced_claim=fenced_claim,
                 )
 
             first_task = asyncio.create_task(
@@ -488,8 +516,8 @@ class P0ApprovalAtomicityTests(unittest.IsolatedAsyncioTestCase):
                     resume=resume,
                 )
             )
-            await entered.wait()
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            await asyncio.sleep(0.65)
             with self.assertRaises(ApprovalResumeError) as caught:
                 await second.approve_and_resume(
                     pending.approval.approval_id,
@@ -562,8 +590,9 @@ class P0ApprovalAtomicityTests(unittest.IsolatedAsyncioTestCase):
             )
             calls = 0
 
-            async def handler(_arguments, _key, _actor):
+            async def handler(_arguments, _key, _actor, *, fenced_claim):
                 nonlocal calls
+                self.assertIsNotNone(fenced_claim)
                 calls += 1
                 return {"status": "succeeded"}
 

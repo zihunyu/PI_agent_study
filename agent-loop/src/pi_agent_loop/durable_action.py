@@ -21,6 +21,9 @@ class DurableActionEnvelope:
     tool_name: str
     arguments: dict[str, Any]
     write_id: str
+    entity_id: str | None = None
+    expected_entity_version: int | None = None
+    business_preconditions: dict[str, Any] | None = None
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -40,6 +43,37 @@ class DurableActionEnvelope:
             raise DurableActionEnvelopeError("arguments 必须是对象")
         _validate_json_value(self.arguments, "arguments")
         object.__setattr__(self, "arguments", copy.deepcopy(self.arguments))
+        if self.entity_id is not None and (
+            not isinstance(self.entity_id, str) or not self.entity_id.strip()
+        ):
+            raise DurableActionEnvelopeError("entity_id 必须是非空字符串或 None")
+        if self.expected_entity_version is not None:
+            if (
+                isinstance(self.expected_entity_version, bool)
+                or not isinstance(self.expected_entity_version, int)
+                or self.expected_entity_version < 0
+            ):
+                raise DurableActionEnvelopeError(
+                    "expected_entity_version 必须是非负整数或 None"
+                )
+            if self.entity_id is None:
+                raise DurableActionEnvelopeError(
+                    "设置 expected_entity_version 时必须同时提供 entity_id"
+                )
+        if self.business_preconditions is not None:
+            if not isinstance(self.business_preconditions, dict):
+                raise DurableActionEnvelopeError(
+                    "business_preconditions 必须是对象或 None"
+                )
+            _validate_json_value(
+                self.business_preconditions,
+                "business_preconditions",
+            )
+            object.__setattr__(
+                self,
+                "business_preconditions",
+                copy.deepcopy(self.business_preconditions),
+            )
 
     def __eq__(self, other: object) -> bool:
         """按 JSON 类型严格比较，避免 Python 将 ``True`` 当成 ``1``。"""
@@ -50,7 +84,7 @@ class DurableActionEnvelope:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "version": self.version,
             "operationId": self.operation_id,
             "toolCallId": self.tool_call_id,
@@ -58,6 +92,15 @@ class DurableActionEnvelope:
             "arguments": copy.deepcopy(self.arguments),
             "writeId": self.write_id,
         }
+        if self.entity_id is not None:
+            value["entityId"] = self.entity_id
+        if self.expected_entity_version is not None:
+            value["expectedEntityVersion"] = self.expected_entity_version
+        if self.business_preconditions is not None:
+            value["businessPreconditions"] = copy.deepcopy(
+                self.business_preconditions
+            )
+        return value
 
     @classmethod
     def from_dict(cls, value: Any) -> "DurableActionEnvelope":
@@ -69,6 +112,11 @@ class DurableActionEnvelope:
         arguments = value.get("arguments")
         if not isinstance(arguments, dict):
             raise DurableActionEnvelopeError("Envelope arguments 必须是对象")
+        preconditions = value.get("businessPreconditions")
+        if preconditions is not None and not isinstance(preconditions, dict):
+            raise DurableActionEnvelopeError(
+                "Envelope businessPreconditions 必须是对象"
+            )
         return cls(
             version=version,
             operation_id=_text(value, "operationId"),
@@ -76,6 +124,12 @@ class DurableActionEnvelope:
             tool_name=_text(value, "toolName"),
             arguments=arguments,
             write_id=_text(value, "writeId"),
+            entity_id=_optional_text(value, "entityId"),
+            expected_entity_version=_optional_version(
+                value,
+                "expectedEntityVersion",
+            ),
+            business_preconditions=preconditions,
         )
 
     @property
@@ -90,13 +144,32 @@ class DurableActionEnvelope:
         tool_name: str,
         arguments: dict[str, Any],
         write_id: str,
+        entity_id: str | None = None,
+        expected_entity_version: int | None = None,
+        business_preconditions: dict[str, Any] | None = None,
+        validate_business_binding: bool = False,
     ) -> None:
+        if not isinstance(validate_business_binding, bool):
+            raise DurableActionEnvelopeError(
+                "validate_business_binding 必须是布尔值"
+            )
         actual = DurableActionEnvelope(
             operation_id=operation_id,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             arguments=arguments,
             write_id=write_id,
+            entity_id=(entity_id if validate_business_binding else self.entity_id),
+            expected_entity_version=(
+                expected_entity_version
+                if validate_business_binding
+                else self.expected_entity_version
+            ),
+            business_preconditions=(
+                business_preconditions
+                if validate_business_binding
+                else self.business_preconditions
+            ),
         )
         if not strict_json_equal(actual.to_dict(), self.to_dict()):
             raise DurableActionEnvelopeError(
@@ -161,4 +234,22 @@ def _text(value: dict[str, Any], key: str) -> str:
     item = value.get(key)
     if not isinstance(item, str) or not item:
         raise DurableActionEnvelopeError(f"Envelope 缺少 {key}")
+    return item
+
+
+def _optional_text(value: dict[str, Any], key: str) -> str | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    if not isinstance(item, str) or not item:
+        raise DurableActionEnvelopeError(f"Envelope {key} 必须是非空字符串")
+    return item
+
+
+def _optional_version(value: dict[str, Any], key: str) -> int | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+        raise DurableActionEnvelopeError(f"Envelope {key} 必须是非负整数")
     return item

@@ -41,6 +41,32 @@ class SSEDecoderTests(unittest.TestCase):
         self.assertEqual(decoder.feed(b"data: final"), [])
         self.assertEqual(decoder.finalize(), ["final"])
 
+    def test_单个大chunk内大量短事件线性处理且保持顺序(self) -> None:
+        decoder = SSEDecoder(
+            max_line_bytes=64,
+            max_event_bytes=64,
+            max_total_bytes=2 * 1024 * 1024,
+            max_events=10_000,
+        )
+        raw = b"".join(
+            f"data: event-{index}\n\n".encode() for index in range(10_000)
+        )
+
+        events = decoder.feed(raw)
+        events.extend(decoder.finalize())
+
+        self.assertEqual(len(events), 10_000)
+        self.assertEqual(events[0], "event-0")
+        self.assertEqual(events[-1], "event-9999")
+        self.assertEqual(len(decoder._buffer), 0)
+
+    def test_大chunk末尾cr跨chunk时只压缩已处理前缀(self) -> None:
+        decoder = SSEDecoder()
+
+        self.assertEqual(decoder.feed(b"data: first\n\ndata: second\r"), ["first"])
+        self.assertEqual(decoder.feed(b"\n\r\n"), ["second"])
+        self.assertEqual(decoder.finalize(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

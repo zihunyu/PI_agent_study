@@ -39,6 +39,7 @@ from pi_agent_loop import (  # noqa: E402
     create_divide_tool,
     replay_operation,
 )
+from pi_agent_loop.tool_contract import ToolSecurityContract  # noqa: E402
 
 
 async def _async_result(value):
@@ -189,9 +190,10 @@ class DurableAgentHostTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_recoverable_tool_runtime_复用参数校验_timeout_retry管线(self) -> None:
+        tool = create_divide_tool()
         runtime = RecoverableToolRuntime(
             model=self.model,
-            tools=[create_divide_tool()],
+            tools=[tool],
         )
         result = await runtime.execute(
             RecoveryAction(
@@ -199,6 +201,10 @@ class DurableAgentHostTests(unittest.IsolatedAsyncioTestCase):
                 tool_call_id="divide-recovery",
                 tool_name="divide",
                 arguments={"a": 10, "b": 2},
+                expected_replay_policy="safe",
+                expected_tool_contract_digest=(
+                    ToolSecurityContract.capture(tool).digest
+                ),
             )
         )
         self.assertFalse(result["isError"])
@@ -579,8 +585,9 @@ class DurableAgentHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(host.runtime_tracker.state.phase, "waiting_approval")
             calls = 0
 
-            async def handler(arguments, _key, actor):
+            async def handler(arguments, _key, actor, *, fenced_claim):
                 nonlocal calls
+                self.assertIsNotNone(fenced_claim)
                 calls += 1
                 return {
                     "status": "cancelled",
@@ -717,8 +724,9 @@ class DurableAgentHostTests(unittest.IsolatedAsyncioTestCase):
             )
             write_calls = 0
 
-            async def handler(arguments, _key, _actor):
+            async def handler(arguments, _key, _actor, *, fenced_claim):
                 nonlocal write_calls
+                self.assertIsNotNone(fenced_claim)
                 write_calls += 1
                 return {
                     "status": "cancelled",
@@ -779,8 +787,16 @@ class DurableAgentHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final["content"][0]["text"], "订单已取消")
             self.assertEqual(write_calls, 1)
             self.assertEqual(provider_calls, 2)
-            self.assertEqual(len(final_starts), 1)
+            self.assertEqual(len(final_starts), 2)
             self.assertEqual(final_starts[0].data["requestId"], request_id)
+            self.assertNotEqual(
+                final_starts[1].data["requestId"],
+                request_id,
+            )
+            self.assertEqual(
+                operation.model_requests[request_id].phase,
+                "failed",
+            )
             self.assertFalse(
                 any(
                     request.phase == "started"
@@ -921,8 +937,9 @@ class DurableAgentHostTests(unittest.IsolatedAsyncioTestCase):
             )
             write_calls = 0
 
-            async def handler(arguments, _key, _actor):
+            async def handler(arguments, _key, _actor, *, fenced_claim):
                 nonlocal write_calls
+                self.assertIsNotNone(fenced_claim)
                 write_calls += 1
                 return {"status": "refunded", "orderId": arguments["order_id"]}
 

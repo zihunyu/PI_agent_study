@@ -1,6 +1,11 @@
 """业务路由、Capability 匹配和强制工具策略。"""
 
 from .capabilities import CapabilityMatch, CapabilityRegistry, ToolCapability
+from .clarification import (
+    ClarificationState,
+    ClarificationStateStore,
+    InMemoryClarificationStateStore,
+)
 from .errors import BusinessConfigError
 from .evaluation import (
     ConfidenceCalibration,
@@ -18,7 +23,7 @@ from .evaluation import (
     compare_router_reports,
 )
 from .guard import RequiredToolCallGuard, guard_stream_fn
-from .hybrid_router import HybridModelRouter
+from .hybrid_router import HybridModelRouter, RouteAuthorizationPolicy
 from .routed_agent import RoutedAgent
 from .simple_config import (
     SimpleBusinessConfig,
@@ -28,8 +33,15 @@ from .simple_config import (
     load_simple_business_config,
 )
 from .types import (
+    JsonScalar,
+    JsonValue,
     RequestDecision,
+    RiskLevel,
+    RouteAuthorizationContext,
+    RouteAuthorizationDecision,
     RoutedPromptResult,
+    TaskDecision,
+    TaskDependencyHint,
     ToolChoicePolicy,
     ToolGuardViolation,
 )
@@ -38,11 +50,20 @@ __all__ = [
     "BusinessConfigError",
     "CapabilityMatch",
     "CapabilityRegistry",
+    "ClarificationState",
+    "ClarificationStateStore",
     "ConfidenceCalibration",
     "ConfidenceSample",
     "HybridModelRouter",
+    "InMemoryClarificationStateStore",
+    "JsonScalar",
+    "JsonValue",
     "LabelMetrics",
     "RequestDecision",
+    "RiskLevel",
+    "RouteAuthorizationContext",
+    "RouteAuthorizationDecision",
+    "RouteAuthorizationPolicy",
     "RequiredToolCallGuard",
     "RoutedAgent",
     "RoutedPromptResult",
@@ -58,6 +79,8 @@ __all__ = [
     "SimpleDeniedRule",
     "SimpleIntent",
     "SimpleProduct",
+    "TaskDecision",
+    "TaskDependencyHint",
     "ToolCapability",
     "ToolChoicePolicy",
     "ToolGuardViolation",

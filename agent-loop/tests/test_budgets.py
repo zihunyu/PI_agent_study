@@ -14,7 +14,9 @@ from pi_agent_loop import (  # noqa: E402
     AgentTool,
     AgentToolResult,
     Model,
+    RetryableToolError,
     ScriptedProvider,
+    ToolRetryPolicy,
     assistant_message,
 )
 
@@ -44,12 +46,28 @@ class AgentBudgetTests(unittest.IsolatedAsyncioTestCase):
             content=[{"type": "text", "text": text}],
         )
 
-    def make_tool(self, execute) -> AgentTool:
+    def make_tool(
+        self,
+        execute,
+        *,
+        retry_policy: ToolRetryPolicy | None = None,
+    ) -> AgentTool:
         return AgentTool(
             name="work",
             label="工作工具",
             description="预算测试工具",
             execute=execute,
+            retry_policy=retry_policy,
+        )
+
+    def retry_policy(self) -> ToolRetryPolicy:
+        return ToolRetryPolicy(
+            max_retries=1,
+            retryable_codes=frozenset({"upstream_unavailable"}),
+            idempotent=True,
+            initial_delay_seconds=0,
+            max_delay_seconds=1,
+            jitter_ratio=0,
         )
 
     async def test_预算内两轮两个工具正常完成(self) -> None:
@@ -274,6 +292,158 @@ class AgentBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             results[1]["details"]["code"], "tool_call_budget_exceeded"
         )
+
+    async def test_retry_真实_attempt_超过预算时不再次进入_handler(self) -> None:
+        executed = 0
+
+        async def execute(_id, _args, _token, _on_update):
+            nonlocal executed
+            executed += 1
+            raise RetryableToolError(
+                "上游暂时不可用",
+                code="upstream_unavailable",
+            )
+
+        provider = ScriptedProvider(
+            [self.tool_response([self.tool_call("retry-one")]), self.final_response()]
+        )
+        agent = Agent(
+            model=self.model,
+            stream_fn=provider.stream,
+            tools=[self.make_tool(execute, retry_policy=self.retry_policy())],
+            max_turns=20,
+            max_tool_calls=1,
+            max_parallel_tools=1,
+        )
+        budget_events: list[dict] = []
+        agent.subscribe(
+            lambda event, _token: budget_events.append(event)
+            if event["type"] == "budget_exceeded"
+            else None
+        )
+
+        await agent.prompt("重试不能突破真实调用预算")
+
+        self.assertEqual(executed, 1)
+        self.assertEqual(provider.call_count, 1)
+        result = agent.state.messages[-1]
+        self.assertEqual(result["role"], "toolResult")
+        self.assertTrue(result["isError"])
+        self.assertEqual(
+            result["details"]["code"], "tool_call_budget_exceeded"
+        )
+        self.assertEqual(result["details"]["attempt"], 2)
+        self.assertEqual(len(budget_events), 1)
+        self.assertEqual(budget_events[0]["budget"], "tool_calls")
+        self.assertEqual(budget_events[0]["used"], 1)
+
+    async def test_retry_有剩余预算时允许第二次_handler并继续模型(self) -> None:
+        executed = 0
+
+        async def execute(_id, _args, _token, _on_update):
+            nonlocal executed
+            executed += 1
+            if executed == 1:
+                raise RetryableToolError(
+                    "上游暂时不可用",
+                    code="upstream_unavailable",
+                )
+            return AgentToolResult(
+                content=[{"type": "text", "text": "retry-ok"}], details={}
+            )
+
+        provider = ScriptedProvider(
+            [self.tool_response([self.tool_call("retry-two")]), self.final_response()]
+        )
+        agent = Agent(
+            model=self.model,
+            stream_fn=provider.stream,
+            tools=[self.make_tool(execute, retry_policy=self.retry_policy())],
+            max_turns=20,
+            max_tool_calls=2,
+            max_parallel_tools=1,
+        )
+
+        await agent.prompt("预算允许一次重试")
+
+        self.assertEqual(executed, 2)
+        self.assertEqual(provider.call_count, 2)
+        results = [
+            message
+            for message in agent.state.messages
+            if message["role"] == "toolResult"
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]["isError"])
+
+    async def test_并发_retry_竞争最后一个预算名额时只有一个进入_handler(
+        self,
+    ) -> None:
+        first_attempts_ready = asyncio.Event()
+        release_first_attempts = asyncio.Event()
+        attempts_by_call: dict[str, int] = {}
+        attempts_guard = asyncio.Lock()
+
+        async def execute(call_id, _args, _token, _on_update):
+            async with attempts_guard:
+                attempt = attempts_by_call.get(call_id, 0) + 1
+                attempts_by_call[call_id] = attempt
+                if sum(attempts_by_call.values()) == 2:
+                    first_attempts_ready.set()
+            if attempt == 1:
+                await release_first_attempts.wait()
+                raise RetryableToolError(
+                    "并发上游暂时不可用",
+                    code="upstream_unavailable",
+                )
+            return AgentToolResult(
+                content=[{"type": "text", "text": f"{call_id}-ok"}], details={}
+            )
+
+        provider = ScriptedProvider(
+            [
+                self.tool_response(
+                    [self.tool_call("parallel-a"), self.tool_call("parallel-b")]
+                ),
+                self.final_response(),
+            ]
+        )
+        agent = Agent(
+            model=self.model,
+            stream_fn=provider.stream,
+            tools=[self.make_tool(execute, retry_policy=self.retry_policy())],
+            max_turns=20,
+            max_tool_calls=3,
+            max_parallel_tools=2,
+        )
+        budget_events: list[dict] = []
+        agent.subscribe(
+            lambda event, _token: budget_events.append(event)
+            if event["type"] == "budget_exceeded"
+            else None
+        )
+
+        prompt_task = asyncio.create_task(agent.prompt("两个工具同时重试"))
+        await asyncio.wait_for(first_attempts_ready.wait(), timeout=1)
+        release_first_attempts.set()
+        await asyncio.wait_for(prompt_task, timeout=1)
+
+        self.assertEqual(sum(attempts_by_call.values()), 3)
+        self.assertEqual(sorted(attempts_by_call.values()), [1, 2])
+        self.assertEqual(provider.call_count, 1)
+        results = [
+            message
+            for message in agent.state.messages
+            if message["role"] == "toolResult"
+        ]
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(bool(result["isError"]) for result in results), 1)
+        rejected = next(result for result in results if result["isError"])
+        self.assertEqual(
+            rejected["details"]["code"], "tool_call_budget_exceeded"
+        )
+        self.assertEqual(len(budget_events), 1)
+        self.assertEqual(budget_events[0]["used"], 3)
 
     async def test_新_prompt_重新获得独立预算(self) -> None:
         provider = ScriptedProvider(

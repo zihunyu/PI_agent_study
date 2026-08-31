@@ -472,14 +472,14 @@ class P0InvariantBindingTests(unittest.IsolatedAsyncioTestCase):
             first = WriteOperationService(
                 first_store,
                 ApprovalService(first_store),
-                reconcile_claim_lease_seconds=0.12,
-                reconcile_claim_renew_interval_seconds=0.03,
+                reconcile_claim_lease_seconds=1.0,
+                reconcile_claim_renew_interval_seconds=0.1,
             )
             second = WriteOperationService(
                 second_store,
                 ApprovalService(second_store),
-                reconcile_claim_lease_seconds=0.12,
-                reconcile_claim_renew_interval_seconds=0.03,
+                reconcile_claim_lease_seconds=1.0,
+                reconcile_claim_renew_interval_seconds=0.1,
             )
             write = await first.prepare(
                 session_id="session-1",
@@ -517,16 +517,29 @@ class P0InvariantBindingTests(unittest.IsolatedAsyncioTestCase):
             first_task = asyncio.create_task(
                 first.reconcile(write.write_id, slow_reconcile)
             )
-            await entered.wait()
-            await asyncio.sleep(0.2)
-            with self.assertRaises(WriteOperationError) as caught:
-                await second.reconcile(
-                    write.write_id,
-                    lambda _record: _async_result({"status": "succeeded"}),
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=10)
+                # Wait beyond the original lease to prove that the heartbeat,
+                # not merely the first claim TTL, prevents worker takeover.
+                await asyncio.sleep(1.25)
+                with self.assertRaises(WriteOperationError) as caught:
+                    await second.reconcile(
+                        write.write_id,
+                        lambda _record: _async_result(
+                            {"status": "succeeded"}
+                        ),
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "write_reconcile_claimed",
                 )
-            self.assertEqual(caught.exception.code, "write_reconcile_claimed")
-            release.set()
-            self.assertEqual((await first_task).state, "succeeded")
+                release.set()
+                self.assertEqual((await first_task).state, "succeeded")
+            finally:
+                release.set()
+                if not first_task.done():
+                    first_task.cancel()
+                await asyncio.gather(first_task, return_exceptions=True)
 
 
 async def _async_result(value):

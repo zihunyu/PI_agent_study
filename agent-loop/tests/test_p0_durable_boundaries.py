@@ -227,8 +227,9 @@ class P0DurableBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
             calls = 0
 
-            async def handler(_arguments, _key, _actor):
+            async def handler(_arguments, _key, _actor, *, fenced_claim):
                 nonlocal calls
+                self.assertIsNotNone(fenced_claim)
                 calls += 1
                 return {"status": "refunded"}
 

@@ -5,7 +5,7 @@
 - 学习 Agent Loop 的工作原理；
 - 编写自己的命令行 Agent；
 - 测试模型调用和工具调用流程；
-- 作为后续加入持久化、重试、压缩和 UI 的基础。
+- 学习并按需装配低层 Loop、持久 Session、重试、压缩、工具与上层 Host。
 
 本实现不是 Pi 官方 Python 包，也没有复制 Pi 的全部 Coding Agent 产品功能。它重点保留 Pi 低层 Agent Loop 最有价值的控制语义，并使用中文注释解释关键代码。
 
@@ -17,6 +17,266 @@
 - `pi/packages/agent/src/stream-fn.ts`
 
 Pi 原项目采用 MIT License。本目录保留了原许可证文件；若继续分发或改造，请同时遵守许可证要求。
+
+## 脚手架与真实项目的边界
+
+这个目录是可复用脚手架，不是某个订单、退款或其他真实业务的交付仓库。
+接入项目时采用“框架注入业务”的方式：
+
+```text
+pi_agent_loop（本目录）
+  ├─ Agent Loop / Harness / Session / Approval / Recovery
+  ├─ Tool、Capability、Provider、Store 的通用接口
+  └─ 虚构教学样例（可删除）
+
+独立业务适配包
+  ├─ 真实 Tool 与 Router
+  ├─ 身份、权限和 API Client
+  ├─ 业务配置与测试
+  └─ 通过公开扩展点注入脚手架
+```
+
+推荐的公开扩展点：
+
+- `ToolRegistry` / `CapabilityRegistry`：注册业务 Tool 和权限能力；
+- `stream_fn`：接入任意满足协议的模型 Provider，Harness 不依赖具体厂商；
+- `DurableHostResourceFactory`：接入 PostgreSQL、Redis 或其他持久化 Adapter；
+- Router / Planner / Approval / Identity 回调：实现领域策略；
+- `my_business.tools`：业务包使用独立命名空间，不放进 `pi_agent_loop`，也不从
+  核心包顶层导出。
+
+Calculator 是按需加载的教学样例。即使删除 Calculator 或任意业务适配包，
+`import pi_agent_loop` 也必须保持可用。真实项目代码只留在真实项目仓库；只有与领域
+无关的安全增强才回迁到本目录。
+
+当前能力边界必须按实际装配理解：
+
+- 澄清续接只保存一个待补充 Intent 及已提取槽位，且只有注入
+  `ClarificationStateStore` 并提供 tenant/session 作用域时启用；内置 Store 是进程内
+  实现，跨重启需应用注入持久 Store。这不是语义记忆或长期知识库；
+- 框架提供独立的单进程 `MultiAgentOrchestrator`：可信 Worker 注册、DAG 调度、
+  tenant/run 隔离、有界消息/结果、副本仲裁和取消预算均可直接运行；它不等同于跨进程
+  Durable Worker 集群，生产多机调度仍需共享状态、分布式资源锁和 Fencing；
+- `AutonomousPlanRunner` 的 completed 只表示结构执行结束。未注入可信
+  `PlanResultValidator` 时语义结果为 `outcome_unknown`，不会自动宣称成功；
+- `Agent.prompt(images=...)` 与内置 OpenAI-compatible Provider 支持受限的标准
+  `image_url`（HTTPS 或图片 data URL）；音频、视频、文件等未实现类型会在边界拒绝；
+- 核心包已交付 workspace-only 的 `read`、`list_dir`、`find`、`grep`，以及需
+  `workspace-write` + Runtime Approval 的本地 `write`/`edit`。`shell` 只有显式
+  `full-access` + `allow_trusted_shell=True` 才创建；它是受信本机执行，不是安全
+  沙箱。浏览器、MCP 和真实业务 API 仍需独立适配包；
+- 路径边界按 realpath 拒绝静态 symlink/junction/ADS 逃逸，但假定工作区目录树由
+  受信主体稳定维护；它不抵抗外部恶意进程在校验与 I/O 之间替换 reparse point；
+- 内置文件写工具只提供单进程 CAS、mutation lock 和原子发布，不等同于
+  `WriteOperationService` 的跨进程 Durable/Plan 写网关。生产恢复场景必须另接
+  DurableActionEnvelope、持久 Intent/Result、幂等键、Fencing 和 Reconciliation。
+
+完整接入边界和代码模板见 `SCAFFOLD_INTEGRATION_GUIDE.md`。
+
+### 可选内容安全管线
+
+`ContentSafetyPipeline` 是一个需要应用显式注入的安全编排边界，不是内置审核服务。
+未给 `Agent(content_safety=...)` 传入管线时，框架不会自行执行内容审核；生产应用必须
+注入经过信任评审的企业审核/分类 Adapter，不能把示例规则当作完整安全策略。
+
+管线依次覆盖三处数据边界：发送 Provider 前的 `model_input`、执行任何 Tool Call 前的
+`model_output`，以及工具结果重新进入模型前的 `tool_output`。策略可返回 `allow`、
+`replace` 或 `block`；策略超时、异常、无效返回值和被阻止内容都会 fail closed。审计
+事件只包含阶段、动作、受限原因码和策略序号等元数据，管线本身不把原始 prompt/结果
+写入审计 sink。
+
+启用 `content_safety` 后，Agent 会进入输出安全模式：Provider 的流式 partial
+`message_update` 先在内部缓冲，完成后的 terminal Assistant Message 通过
+`model_output` 检查后才向 listener 发布并进入 transcript；被阻止、超时或检查失败时，
+缓冲内容不会外泄，也不会执行 Tool preflight/dispatch。代价是启用安全管线的请求不再
+提供逐 token 增量展示；未配置 `content_safety` 的普通 Agent 保持原有流式行为。
+
+工具结果先经过一次 `tool_output` 检查，调用方 `after_tool_call` hook 只能看到该安全
+快照；hook 如果返回 override，override 还会再次经过 `tool_output` 检查，之后才可进入
+模型上下文。这样 hook 不能观察原始未审核 Tool output，也不能用改写绕过策略。自定义
+policy 应对同一逻辑工具结果的多次检查保持确定、可重复，并把两次检查的延迟纳入预算。
+
+```python
+pipeline = ContentSafetyPipeline(
+    [enterprise_moderation_policy, UntrustedToolOutputPolicy()],
+    policy_timeout_seconds=3,
+    audit_sink=record_safety_metadata,
+)
+agent = Agent(model=model, stream_fn=provider.stream, content_safety=pipeline)
+```
+
+`UntrustedToolOutputPolicy` 只把工具文本明确标成不可信 JSON 数据，是纵深防御提示，
+不是 prompt injection 的形式化隔离，也不能替代 Tool Schema、Authorization、Approval
+或副作用幂等控制。空策略列表不会产生任何审核效果。同步策略会在线程中调用，管线
+timeout 只能停止等待，不能强杀已经运行的 Python 线程；生产网络 Adapter 应优先使用
+可取消的异步 I/O，或在 Adapter 内设置自己的连接/响应 deadline，并避免在异常文本或
+审计错误中泄露原始内容。
+
+### 身份、OIDC 与审批注入边界
+
+`StaticIdentityVerifier` 只用于本地开发和测试。它签发的 `VerifiedIdentity` 带进程内
+来源封印；调用方直接构造同字段的 dataclass 不会通过默认 `ApprovalService` 校验，
+进程重启后的旧本地身份也不应视为可复用凭证。
+
+核心包没有内置 OIDC/JWT/IAM/SSO 登录流程。生产应用必须先在 Host 信任边界验证真实
+凭证，再创建当前请求的 `VerifiedIdentity`，并通过 `ApprovalService(identity_validator=...)`
+或 `DurableAgentHost(approval_identity_validator=...)` 注入能够核对该认证来源的
+validator。该 validator 不能只检查 `issuer`、角色或字符串格式；它必须绑定可信登录
+会话、签名证明或服务端认证记录。模型文本、Tool 参数、持久事件里回放出的字段，以及
+未经验证的 `VerifiedIdentity` 构造值都不能成为身份来源。
+
+Approval 仍需独立检查角色、自审限制、TTL 和精确 Action Hash。身份验证只证明主体，
+不等于该主体已获业务授权，也不等于已批准具体写操作。
+
+### 两轮澄清状态与语义记忆不是同一能力
+
+`HybridModelRouter` 只有在注入 `ClarificationStateStore` 后才续接上一轮缺失字段。每个
+记录严格绑定 `tenant_id + session_id`、只保存一个待定 Intent、已提取字段、缺失字段
+和 TTL。启用 Store 却没有可信 scope，或 Store 读写失败时，Router 会返回不可执行的
+澄清结果，不会回退到无作用域的全局状态。内置
+`InMemoryClarificationStateStore` 适合单进程；跨重启应用需实现同一 `load/save/clear`
+协议并使用事务数据库。它不保存完整对话，也不是长期记忆。
+
+独立的 `pi_agent_loop.memory` 提供显式的 `remember/recall/get/delete/forget` 生命周期：
+
+- 每次操作都必须提供由认证 Host 决定的
+  `MemoryScope(tenant_id, subject_id, namespace)`；模型不能选择 tenant；
+- `InMemoryMemoryStore` 仅用于本地，`SQLiteMemoryStore` 使用 AES-256-GCM 加密文本、
+  embedding、metadata、source 和 provenance；用于索引/AAD 的 scope、memory ID、时间戳
+  与 key ID 仍以明文字段保存，因此数据库文件权限与备份策略依然重要；
+- TTL、每 scope 数量、文本/metadata/向量维度、查询 top-k 和 prompt context 均有硬上限，
+  更新/删除可以使用 `expected_updated_at_ms` 做乐观并发控制；
+- `HashingEmbeddingProvider` 是确定性的离线 feature hashing，不是学习得到的语义模型；
+  生产检索质量需要注入真实 `EmbeddingProvider`；内置 SQLite 会在有界 scope 内解密并
+  排序，不是分布式向量数据库；
+- `MemoryContextProvider.retrieve()` 默认只返回结构化结果。注入 prompt 必须同时在构造
+  时启用 `prompt_injection_enabled=True`，并在每次
+  `build_prompt_context(..., opt_in=True)` 调用中再次确认；敏感记录还需要独立开关与
+  `include_sensitive=True`。`metadata.sensitive/classification` 必须由可信应用分类器写入，
+  不能采用模型自报标签。记忆内容始终按不可信历史数据处理，不会自动修改 Agent。
+
+密钥由 `JournalKeyProvider` 注入；`StaticJournalKeyProvider` 是本地/测试 key ring，生产
+应接入 KMS/HSM 或等价密钥服务并设计轮换、旧 key 读取和销毁流程。框架提供加密存储
+机制，但 `delete/forget` 不能擦除已有备份、SQLite WAL 副本或底层介质残留，也不会替
+部署方完成同意管理、数据分类、保留政策、主体删除请求或合规审计。
+
+### 真实多模型选择与故障转移
+
+`ResilientModelRouter.stream` 是可直接交给 `Agent` 的 `StreamFn`，不是只返回模型名的
+selector hook。每个 `ModelCandidate` 绑定具体 `Model`、Provider `stream_fn`、能力、
+上下文窗口、质量、单价和预期延迟；`TaskRequirements` 提供硬约束，
+`SelectionPolicy` 再按质量/成本/延迟做确定性排序：
+
+```python
+router = ResilientModelRouter(
+    [
+        ModelCandidate(
+            premium_model,
+            premium_provider.stream,
+            capabilities=frozenset({"tools", "vision"}),
+            quality_score=0.95,
+            input_cost_per_million=5.0,
+            output_cost_per_million=15.0,
+        ),
+        ModelCandidate(
+            fallback_model,
+            fallback_provider.stream,
+            capabilities=frozenset({"tools"}),
+            quality_score=0.8,
+        ),
+    ],
+    requirements=TaskRequirements(required_capabilities=frozenset({"tools"})),
+    max_attempts=2,
+    max_elapsed_seconds=30,
+)
+agent = Agent(model=premium_model, stream_fn=router.stream)
+```
+
+`HealthRegistry` 按 candidate 隔离 consecutive failure、cooldown 和 half-open probe，
+并用协程锁保证同一 half-open candidate 同时只有一个探测请求。Provider attempt 在
+首个非空 assistant text 或 Tool Call 前处于提交屏障之后；此时只有结构化且标记为
+retryable 的 Provider 错误才允许换候选。一旦可见输出已经发布，后续错误绝不回退，
+避免把两个模型的内容拼接到同一 assistant 消息。
+
+每次 candidate `stream_fn` 调用被视为一个物理 attempt，并记录 provider、model、
+安全原因码、耗时、是否已产生可见输出和最终选择；记录同时进入终态消息的
+`modelRouting`、Router 的有界 history 及可选 telemetry sink。候选 `stream_fn` 应代表
+单次物理派发；若应用在它内部再包重试层，内层 attempt 必须由该层自己计量，不能把
+多个物理请求伪装成 Router 的一次 attempt。总 attempt 数、总 deadline 和取消令牌均
+跨候选共享，所有候选失败时只聚合脱敏后的结构化原因。
+
+Candidate 的 capability、质量、单价和延迟都是调用方提供的配置，不是 Provider 自动
+发现、实时账单或 SLA 证明；配置过期会直接影响选择结果。内置 Health/History 也是
+进程内状态，跨进程一致的熔断与全局配额需要共享后端。Router 只选择模型，不授予业务
+权限，也不替代内容安全策略。
+
+### 有界多智能体 DAG 编排
+
+`MultiAgentOrchestrator` 只从宿主创建的 `WorkerRegistry` 选择 Worker。任务可以声明所需
+角色和能力，但不能提交 runner 或自行提升权限。`AgentPromptWorkerRunner` 会实际调用
+`Agent.prompt` 或 `RoutedAgent.prompt` 并提取终态；它不会替换 Worker 的 Tool、Router、
+Identity、Authorization 或 Approval，因此不会绕过各 Worker 自身的安全边界：
+
+```python
+worker = WorkerRegistration(
+    "researcher-1",
+    AgentPromptWorkerRunner(agent),
+    roles=frozenset({"researcher"}),
+    capabilities=frozenset({"document-analysis"}),
+    max_concurrency=1,
+)
+orchestrator = MultiAgentOrchestrator(
+    WorkerRegistry([worker]),
+    limits=OrchestrationLimits(
+        max_tasks=16,
+        max_worker_invocations=16,
+        max_concurrency=4,
+        total_deadline_seconds=60,
+    ),
+)
+plan = MultiAgentPlan(
+    (
+        MultiAgentTask(
+            "inspect",
+            "检查输入文档",
+            required_roles=frozenset({"researcher"}),
+            required_capabilities=frozenset({"document-analysis"}),
+            resource_keys=frozenset({"document:example"}),
+        ),
+        MultiAgentTask(
+            "summarize",
+            "根据检查结果给出摘要",
+            dependencies=frozenset({"inspect"}),
+            required_roles=frozenset({"researcher"}),
+        ),
+    )
+)
+result = await orchestrator.run(
+    plan,
+    tenant_id="tenant-example",
+    run_id="run-example",
+    cancellation=token,
+)
+```
+
+无依赖的 DAG 节点可以并行执行，但同时受全局 Semaphore、每 Worker Semaphore、逻辑
+任务数、物理 invocation 数和总 deadline 约束；相同 tenant 下相同 Resource Key 必须
+串行。失败或取消会显式传播到依赖节点。Worker 可通过 `WorkerRequest.send_message()`
+发送有大小/数量上限的 run-local 消息，状态读取始终需要完整的
+`tenant_id + run_id`。Telemetry 只含哈希化 scope/task/worker 引用、状态、白名单错误码
+和耗时，不记录原始标识符、prompt、Worker 消息或结果正文。
+
+副本执行默认关闭。只有调用方明确声明任务可安全复制、提供多个不同 Worker，并选择
+可信 `ResultArbitrator` 时才能启用；内置 `ExactMatchArbitrator` 要求所有副本成功且
+输出精确一致，任何分歧都 fail closed，框架不会把多数票自动解释为事实。副本仅适合
+只读或由业务层证明严格幂等的任务，审批和写操作不能因为编排层复制而放宽。
+
+内置 `BoundedRunStateStore` 和 Resource Lock 是协程安全的进程内实现。跨进程/多机
+生产部署必须注入共享状态实现，并在编排层外增加分布式锁、Claim、Heartbeat、Fencing
+和崩溃恢复；固定 `Agent` 适配器默认在每个任务前清空 transcript 并串行调用，以避免
+跨 tenant 上下文泄漏，需要并发时应注入返回全新 Agent 的 factory。自定义
+`WorkerRunner` 属于可信宿主代码，必须合作传播 `CancellationToken` 和
+`asyncio.CancelledError`，编排器无法强制终止阻塞的同步代码或恶意吞取消的协程。
 
 ---
 
@@ -167,6 +427,9 @@ python examples/basic_usage.py --session-id order-debug "我上个问题是什�
 
 ## 2. 目录结构
 
+下面只列职责入口和代表性测试，不是完整文件清单；新增模块与测试以当前 checkout 的
+`src/pi_agent_loop/`、`tests/` 为准。
+
 ```text
 agent-loop/
 ├─ AGENTS.md                         要求 AI 先读业务需求文件
@@ -220,7 +483,12 @@ agent-loop/
 │  ├─ test_business_requirements.py  AI 业务需求入口契约测试
 │  ├─ test_simple_business_config.py 简化业务配置测试
 │  ├─ test_hybrid_router.py          模型 Intent 路由测试
-│  └─ test_routed_agent.py           Required Tool Guard 集成测试
+│  ├─ test_routed_agent.py           Required Tool Guard 集成测试
+│  ├─ test_content_safety_pipeline.py 内容安全三边界测试
+│  ├─ test_clarification_state.py     tenant/session 澄清续接测试
+│  ├─ test_semantic_memory.py         加密、隔离、TTL 与 opt-in 记忆测试
+│  ├─ test_model_routing.py           多模型提交屏障与故障转移测试
+│  └─ test_multi_agent.py              有界多 Agent DAG 测试
 └─ src/pi_agent_loop/
    ├─ __init__.py                    公开导出
    ├─ cancellation.py                合作式取消令牌
@@ -232,7 +500,15 @@ agent-loop/
    ├─ types.py                       Model、Tool、Config 等类型
    ├─ loop.py                        低层 Agent Loop
    ├─ agent.py                       有状态 Agent 封装
+   ├─ safety.py                      可注入的内容安全编排边界
+   ├─ model_routing.py               多模型选择、健康与提交屏障
+   ├─ multi_agent.py                 单进程有界多 Agent DAG
+   ├─ tool_runtime.py                Tool 合同、调度、锁与遥测
    ├─ testing.py                     ScriptedProvider
+   ├─ memory/
+   │  ├─ manager.py                  显式记忆生命周期与 prompt opt-in
+   │  ├─ store.py                    内存/加密 SQLite Store
+   │  └─ embeddings.py               Embedding Protocol 与离线 hashing
    ├─ retry/
    │  ├─ types.py                    Model/Tool Retry Policy
    │  ├─ classifier.py               瞬时错误分类
@@ -291,15 +567,23 @@ agent-loop/
    │  ├─ simple_config.py            简化 business.toml 加载
    │  ├─ capabilities.py             CapabilityRegistry
    │  ├─ hybrid_router.py            大模型结构化 Intent 分类
+   │  ├─ clarification.py            作用域澄清状态协议与进程内 Store
+   │  ├─ evaluation.py               路由评测与回归门禁
    │  ├─ guard.py                    RequiredToolCallGuard
    │  └─ routed_agent.py             产品层 RoutedAgent
+   ├─ planning/                      Durable Plan、合同、执行与闭环
    └─ tools/
-      ├─ __init__.py                 计算工具公开导出
+      ├─ __init__.py                 计算与工作区工具公开导出
       ├─ validators.py               a、b 参数校验
       ├─ add.py                      加法工具
       ├─ multiply.py                 乘法工具
       ├─ divide.py                   除法工具与除零保护
-      └─ registry.py                 工具注册表
+      ├─ registry.py                 工具注册表
+      ├─ builtin_factory.py          profile 驱动的内置工具工厂
+      ├─ path_policy.py              workspace/reparse/ADS 路径边界
+      ├─ workspace_files.py          read/list/find/grep
+      ├─ workspace_mutations.py      write/edit 与 CAS
+      └─ workspace_shell.py          显式 trusted opt-in Shell
 ```
 
 ---
@@ -414,20 +698,31 @@ python examples/basic_usage.py
 ### 4.4 运行全部测试
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pip install -e ".[test]"
+python -m pytest -q
+```
+
+项目采用 `src` 布局。先安装当前 checkout，再运行 pytest；测试启动钩子会核对
+`pi_agent_loop` 的实际导入路径，若误用了相邻 checkout 或全局安装包会立即失败。
+
+分支覆盖率和静态检查使用与 CI 相同的命令：
+
+```bash
+python -m coverage run -m pytest -q
+python -m coverage report
+python -m ruff check src tests
 ```
 
 测试输出中的：
 
 ```text
-... ok
-Ran 167 tests
-OK
+... [100%]
+N passed
 ```
 
-表示一百六十七个自动测试全部通过，并不是 Agent 又执行了一百六十七个用户任务。
+表示自动测试全部通过，并不是 Agent 又执行了相同数量的用户任务。
 
-一百六十七个测试分别检查：
+这些测试分别检查：
 
 1. 最终回答能否进入 Agent 状态；
 2. 工具结果能否交回模型并触发第二次模型请求；
@@ -1178,19 +1473,13 @@ TypeScript 通过联合类型提供编译期检查。Python 版本为零依赖�
 
 ### 15.5 不是完整 Coding Agent
 
-本目录没有搬入 Pi 的：
+本目录没有复制 Pi 的完整产品层，包括 TUI、扩展市场、OAuth 登录体验、托管模型目录
+和 Pi 产品自己的 Session UX。当前仓库已经独立实现了通用 Provider Retry、Compaction、
+持久 Session Journal、工作区文件工具和受信 Shell Adapter；这些位于上层 Runtime/Host
+或 `tools/`，不属于 `loop.py` 的低层职责，也不代表复制了 Pi 的完整产品。
 
-- `AgentSession`；
-- 自动 Provider retry；
-- 自动 compaction；
-- SessionManager JSONL；
-- 扩展系统；
-- TUI；
-- OAuth；
-- 模型目录；
-- 文件和 shell 工具实现。
-
-这些应作为上层模块逐步加入，而不是全部塞进低层循环。
+OIDC/OAuth 登录、真实业务 API、跨机 Store、容器/OS 沙箱、审批 UI 和部署控制面仍由
+应用适配，不能因为存在相应 Protocol 或注入点就宣称已经内置。
 
 ---
 
@@ -1235,104 +1524,74 @@ TypeScript 通过联合类型提供编译期检查。Python 版本为零依赖�
 26. 未知工具消耗预算；
 27. 每次 prompt 独立预算。
 
-运行：
+运行这些低层测试或全部测试：
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest -q tests/test_agent_loop.py tests/test_calculator_tools.py
+python -m pytest -q
 ```
 
-测试完全使用 `ScriptedProvider`，不会调用真实网络。
+自动测试默认使用 `ScriptedProvider` 或本地 `MockTransport`，不会调用收费模型 API。
 
 ---
 
-## 17. 当前没有实现的生产能力
+## 17. 生产装配仍需明确的边界
 
-如果要把本项目用于生产，至少还应增加：
+这些不是“存在一个类就自动成立”的保证，而是部署方必须选择和验证的装配责任。
 
-### 17.1 其余运行预算
+### 17.1 预算与调用计量
 
-当前已完成最大 Turn 数和最大 Tool Call 数，还缺少：
+裸 `Agent` 提供 Turn、Tool Call 和并发上限。`ModelCallRuntime` 与自主任务闭环可以增加
+总 deadline、物理 Model Attempt、Token 和费用预算，但 Token/费用上限只有在 Provider
+参数或可信 Usage Meter 对每次物理派发做前置 Admission 时才是硬边界。框架无法在
+请求已经产生费用后追回首个超额调用。
 
-- 整个 Run 的最大总时间；
-- 最大 token；
-- 最大费用。
+### 17.2 并发、持久化与分布式执行
 
-### 17.2 更高级的并发调度
+`ToolDispatchRuntime` 已提供并发/独占/资源锁、公平队列、优先级、租户限流和本机
+SQLite Lease；Durable Host 已记录 Intent/Result、Approval、Write、Recovery 和
+`outcome_unknown`。这些保证只在实际使用对应 Runtime/Journal 时成立，裸 Agent 不会
+自动获得崩溃恢复。跨机部署仍需共享事务 Store、分布式资源锁、Fencing、Worker 唤醒
+和下游 CAS，进程内 Store 或 SQLite 不能冒充多机协调。
 
-当前已使用 Semaphore 实现 `max_parallel_tools`，后续生产系统还可增加：
+### 17.3 取消不是安全沙箱
 
-- 工具优先级；
-- 公平排队；
-- 不同工具类型分别限流；
-- 只读工具与有副作用工具的执行屏障。
+Shell 通过子进程管理器执行，并在 timeout/取消时尽力终止进程树；它仍是受信本机
+执行，不限制网络、系统调用、工作区外路径或所有脱离进程树的后代。完全阻塞事件循环、
+吞掉 `CancelledError` 的协程以及恶意同步代码也不能靠 `CancellationToken` 强制停止。
+不受信代码必须放进经过单独验证的容器/OS 沙箱。
 
-### 17.3 子进程级强制 Timeout
+### 17.4 仍由应用提供的产品能力
 
-当前已实现异步工具 timeout 和子 CancellationToken，但完全阻塞事件循环的
-同步代码仍无法被 asyncio timer 打断。Shell、外部程序等需要：
-
-- 子进程；
-- 进程组；
-- timeout 后终止整个进程树。
-
-### 17.4 持久 Inbox
-
-当前 steering/follow-up 只在内存。崩溃恢复需要把 enqueue/dequeue 写入 Session Store。
-
-### 17.5 Operation Log
-
-工具执行前保存 intent，执行后保存 result，避免崩溃恢复时误重复执行有副作用工具。
-
-### 17.6 Listener 隔离
-
-需要明确：
-
-- persistence listener 失败是否终止 Agent；
-- UI listener 失败是否只记录日志；
-- extension listener 是否 fail-open 或 fail-closed。
-
-### 17.7 Backpressure
-
-EventStream 和工具 update 已支持：
-
-- 有界队列；
-- update 合并；
-- 慢消费者策略；
-- 最大内存限制；
-- 终止事件优先投递。
-
-### 17.8 Retry 与 Compaction
-
-建议像 Pi 一样放在更高层 Session/Host，不要继续扩大 `loop.py`。
+- steering/follow-up 队列仍是当前 Agent 进程内 Inbox；需要跨重启消息投递时应由应用
+  设计持久 enqueue/dequeue、去重和租户隔离；
+- OIDC/SSO 登录、企业内容审核、真实 Embedding/KMS、业务 Tool/API、Reconciliation、
+  Approval UI/通知和跨机 Store 都是 Adapter，不在核心包内；
+- `EventStream` 已有有界队列、更新合并和终止事件保护，但各类 persistence/UI/plugin
+  listener 的失败策略仍必须由装配方按可信度分类，不能用一个通用 fail-open 规则；
+- Retry 与 Compaction 已放在上层 Runtime/Host；低层 `loop.py` 保持 Provider/Tool
+  协议职责，不直接持有业务恢复或长期记忆。
 
 ---
 
-## 18. 推荐的下一步目录
+## 18. 当前分层目录
 
-若继续开发完整 Agent，建议在当前目录上增加：
+生产相关能力已按职责拆分，主要目录如下：
 
 ```text
 src/pi_agent_loop/
-├─ providers/
-│  ├─ openai.py
-│  └─ deepseek.py
-├─ tools/
-│  ├─ read.py
-│  ├─ write.py
-│  ├─ edit.py
-│  └─ shell.py
-├─ session/
-│  ├─ events.py
-│  ├─ store.py
-│  ├─ jsonl.py
-│  └─ projection.py
-├─ policy/
-│  ├─ approval.py
-│  └─ filesystem.py
-└─ host/
-   ├─ retry.py
-   ├─ compaction.py
-   └─ coordinator.py
+├─ loop.py / agent.py       低层消息、模型、工具循环
+├─ providers/               OpenAI-compatible Adapter 与严格 SSE
+├─ tools/                   工作区文件、搜索、受信 Shell 与共享服务
+├─ routing/                 Intent、Capability、澄清状态与业务 Guard
+├─ safety.py                可注入内容安全编排边界
+├─ memory/                  显式 opt-in 的作用域语义记忆
+├─ session/                 Journal、Snapshot、Projection 与 Recovery
+├─ approval/ / writes/      审批和幂等写状态机
+├─ retry/ / runtime/        重试、熔断、运行状态与 Telemetry
+├─ planning/ / harness/     Durable Plan、Worker 与 Host 装配
+├─ model_routing.py         多模型选择与提交屏障
+└─ multi_agent.py           单进程有界多 Agent DAG 编排
 ```
 
 保持依赖方向：
@@ -1357,7 +1616,9 @@ Session/Host
 
 > **低层循环只负责模型、消息、工具和队列；重试、压缩、持久化和 UI 由外层负责。**
 
-如果只是学习 Agent 原理，可以直接阅读 `loop.py` 和 `agent.py`；如果准备做生产系统，请先运行测试，再按第 17 节补齐可靠性和安全能力。
+如果只是学习 Agent 原理，可以直接阅读 `loop.py` 和 `agent.py`；如果准备做生产系统，
+请先运行完整测试，再按第 17 节和 `SCAFFOLD_INTEGRATION_GUIDE.md` 验证每个外部 Adapter
+与部署边界。
 
 ---
 
@@ -1739,13 +2000,13 @@ python examples/basic_usage.py
 python -m unittest discover -s tests -v
 ```
 
-当前共有 167 项离线测试，覆盖 Agent Loop、Tool Closure、P0 清理、Approval/Write 感知恢复、P1 Host、Durable Session 和状态机。
+完整离线套件覆盖 Agent Loop、Tool Closure、取消清理、Approval/Write 感知恢复、
+Durable Host/Session、状态机及后续新增模块；具体数量以当前 checkout 的 pytest 输出为准。
 
 只有看到：
 
 ```text
-Ran 167 tests
-OK
+N passed
 ```
 
 才表示本阶段全部通过。
@@ -2099,8 +2360,7 @@ agent.prompt("任务二")  再获得一份新预算
 全部测试：
 
 ```text
-Ran 167 tests
-OK
+N passed
 ```
 
 测试覆盖：
@@ -2241,7 +2501,13 @@ Agent Loop 继续只依赖 `StreamFn`，没有混入 HTTP 和 API Key 逻辑。
 - Provider Timeout；
 - Agent CancellationToken；
 - `reasoning_content` 兼容事件；
-- API Key 脱敏。
+- API Key 脱敏；
+- 整条 HTTP 流使用 `request_timeout_seconds` 作为绝对截止时间；
+- SSE 默认限制单行 2 MiB、单事件 4 MiB、总响应 64 MiB 和 100,000 个事件；
+- 默认最多 128 个 Tool Call，单项 arguments 1 MiB、累计 4 MiB。
+
+上述资源上限可在直接构造 `OpenAICompatibleProvider` 时收紧；生产环境应按模型和
+业务协议设置更小的值，不能依赖上游主动结束异常流。
 
 暂未支持：
 
@@ -2249,7 +2515,7 @@ Agent Loop 继续只依赖 `StreamFn`，没有混入 HTTP 和 API Key 逻辑。
 - Anthropic `/messages`；
 - OAuth；
 - Azure/AWS 签名；
-- 图片、音频和文件上传；
+- 二进制图片/音频/文件上传（受限 HTTPS/data URL `image_url` 已支持）；
 - 非 OpenAI 格式 Tool Calling。
 
 ### 22.7 测试不访问真实网络
@@ -2639,8 +2905,7 @@ tests/test_hybrid_router.py
 覆盖 Hybrid 路由、Retry、状态机、Durable Session、P0 清理、Tool Closure、Approval/Write 感知恢复、P1 Host 和调度。
 
 ```text
-Ran 167 tests
-OK
+N passed
 ```
 
 ### 24.9 配置唯一性
@@ -2976,7 +3241,8 @@ python -m unittest discover -s tests -v
 
 ### 26.16 当前边界
 
-- Process Recovery 已实现 Chain 发现和 Handler 协调，但完整模型请求恢复仍依赖未来 Session Store；
+- Process Recovery 已接入持久 Session Journal、请求策略快照和正式 Model Runtime；
+  恢复时仍必须由 Host 注入真实 Provider Callback，缺少原请求策略会进入人工介入；
 - Circuit 状态尚未跨进程持久化；
 - 兼容用 Sliding Window Compactor 仍保留；生产入口默认使用 Token-aware 结构化摘要器；
 - TaskRetryExecutor 仍只负责单任务重试；多 Intent 请求使用独立的 `HybridRequestPlanner` 和 `PlanExecutor`；
@@ -3252,14 +3518,14 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 227 tests
-OK
+N passed
 ```
 
 ### 27.13 当前边界
 
 - DurableAgentHost 的 Runtime/Operation/Retry Event 默认共用加密的 SQLite Session Journal；
-- JSONL Store 只保留给单实例示例和兼容入口；
+- JSONL Store 只保留给直接使用底层 Store 的单进程示例和离线迁移；
+  `DurableAgentHost` 不接受 JSONL Backend；
 - 完整 Context 和恢复计划已实现，但真实 Provider/工具恢复要由 Host 注入 Callback；
 - DomainStateMachine 是基础框架，真实项目必须提供自己的状态表；
 - 多 Intent Plan、依赖图、审批屏障、Task 状态机和结果合成器已经提供，真实项目仍需注册 Intent 策略与执行 Handler；
@@ -3384,7 +3650,10 @@ identity = await verifier.verify(
 )
 ```
 
-后续 Approval 和写操作只接受 `VerifiedIdentity`。项目提供的 `StaticIdentityVerifier` 仅用于开发测试；生产必须替换为 OAuth、IAM、企业 SSO 或其他可信认证系统。
+后续 Approval 和写操作只接受通过来源校验的 `VerifiedIdentity`。项目提供的
+`StaticIdentityVerifier` 仅用于开发测试；生产必须接入 OAuth、IAM、企业 SSO 或其他
+可信认证系统，并注入验证该来源的 `identity_validator`。直接构造 dataclass 不等于
+验证身份，默认来源校验会拒绝它。
 
 持久事件只保存 Principal ID、Role、Issuer/Verification ID，不保存 Credential。
 
@@ -3480,14 +3749,13 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 189 tests
-OK
+N passed
 ```
 
 ### 28.11 骨架边界
 
 - SQLite 支持单机多进程事务；跨机器 Worker 仍需 PostgreSQL Store；
-- JSONL 仅适用于单 Store 实例兼容模式；
+- JSONL 仅适用于绕过 Durable Host、直接使用单一底层 Store 的单进程兼容模式；
 - 完整消息和工具参数可能包含敏感业务数据，生产存储必须加密、控制权限和设置保留周期；
 - Recovery Callback 是 Host 信任边界，必须调用真实 Provider/Tool Runtime，不能绕过 Guard；
 - StaticIdentityVerifier 只能用于开发测试；
@@ -3693,8 +3961,7 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 167 tests
-OK
+N passed
 ```
 
 覆盖 Exclusive Barrier、资源冲突、不同资源并行、Retry 释放锁、全局串行覆盖、Sequential 兼容和无资源解析器拒绝。
@@ -3767,8 +4034,7 @@ python -m unittest discover -s tests -v
 -用户取消后没有 Timer/Waiter/Update Task 残留。
 
 ```text
-Ran 167 tests
-OK
+N passed
 ```
 
 ### 31.6 边界
@@ -3977,8 +4243,7 @@ python -m unittest discover -s tests -v
 当前：
 
 ```text
-Ran 167 tests
-OK
+N passed
 ```
 
 覆盖正式 Model Runtime、Tool Runtime、Never Tool 拒绝、Startup Recovery、Approval Resume、崩溃恢复、Host 自动装配、缺失身份安全失败和幂等写后继续模型。
@@ -3988,10 +4253,13 @@ OK
 - StaticIdentityVerifier 仍只用于开发测试；
 - Approval UI/API 和通知尚未实现；
 - DurableAgentHost 默认使用加密、租户隔离的 SQLite Session Journal；
-- JSONL 只保留为 `store_backend="jsonl"` 单实例兼容模式；
-- 跨机器多 Worker 需要后续 PostgreSQL Store；
+- JSONL Store 只保留为底层单进程/离线迁移兼容实现，
+  `DurableAgentHost` 会拒绝 `store_backend="jsonl"`；
+- 跨机器多 Worker 必须通过 `DurableHostResourceFactory` 注入共享的事务
+  Journal/Store（例如 PostgreSQL Adapter）；内置 SQLite 只承诺单机多进程；
 - 真实业务 Tool/Identity/Reconciliation 需要后续 Adapter；
-- 多 Intent Plan/Task 执行框架已实现；跨机器 Worker Queue 和故障接管仍属于后续分布式能力。
+- 多 Intent Plan/Task 的 Claim、心跳、代际隔离和故障接管已由通用 Worker
+  边界实现；跨机器部署仍需业务部署层提供共享 Store 与任务唤醒 transport。
 
 ---
 
@@ -4102,8 +4370,7 @@ python -m unittest discover -s tests -v
 覆盖 Sequential/Parallel/Exclusive 取消、Listener 异常、Error Assistant、Duplicate/Orphan、Serializer 防线、Durable Cancelled Operation 和下一 Prompt 自动修复。
 
 ```text
-Ran 167 tests
-OK
+N passed
 ```
 
 ---
@@ -4200,8 +4467,7 @@ python -m unittest discover -s tests -v
 覆盖 Waiting、Granted、Consumed、Started、Completed、Rejected、并发 Resume、缺少 Consumer 和副作用 Idempotency。
 
 ```text
-Ran 167 tests
-OK
+N passed
 ```
 
 ---
@@ -4293,8 +4559,7 @@ python -m unittest discover -s tests -v
 覆盖 Waiting、Approved、Consumed、Rejected、OutcomeUnknown、Action Hash、Dispatch Invariant、Startup Report 和 Direct Recovery 防绕过。
 
 ```text
-Ran 189 tests
-OK
+N passed
 ```
 
 ---
@@ -4400,13 +4665,16 @@ store_backend="journal"
 <state_dir>/agent-state.sqlite3
 ```
 
-兼容旧 JSONL（仅普通 Agent/只读或离线示例）：
+兼容旧 JSONL 时应直接使用底层 Store（仅普通 Agent、只读或离线迁移）：
 
 ```python
-store_backend="jsonl"
+JsonlRuntimeEventStore("runtime-events.jsonl")
 ```
 
-`journal` 后端把 Runtime、Operation、Retry、Approval 和 Write 事实写进同一条加密时间线。旧 `sqlite` 和 `jsonl` 只作为兼容入口；JSONL 不保证崩溃时批次原子性，因此 DurableAgentHost 会拒绝在 JSONL Backend 上启动 Approval 写请求。
+一个 JSONL 文件只能对应一个 Runtime stream；不同 Session 必须使用不同文件，
+且调用方自行保证只有一个进程读写。
+
+`journal` 后端把 Runtime、Operation、Retry、Approval 和 Write 事实写进同一条加密时间线。旧 `sqlite` 只作为 Host 兼容入口；JSONL 不保证批次原子性和跨进程 Claim，因此任何 DurableAgentHost 都会拒绝 JSONL Backend，而不只是包含 Approval 的请求。
 
 ### 37.2 Store 类型
 
@@ -4415,7 +4683,9 @@ SQLiteOperationEventStore
 SQLiteRuntimeEventStore
 ```
 
-两者共用一个 SQLite 文件。Operation Store 使用：
+两者可以共用一个 SQLite 文件，但 Runtime Store 必须显式绑定
+`session_id`。`runtime_events` 使用 `(session_id, sequence)` 复合主键，
+不同 Session 的 CAS 和重放互不影响。Operation Store 使用：
 
 ```text
 WAL
@@ -4434,8 +4704,18 @@ SQLite Schema 强制：
 Approval Request approval_id 唯一
 Write Prepared write_id 唯一
 Write idempotency_key_hash 唯一
-Event sequence 单调唯一
+Runtime Event sequence 在每个 Session 内单调唯一
 Claim (claim_type, resource_id) 唯一
+```
+
+旧版 `runtime_events` 没有 `session_id`。只要其中已有事件，框架就会
+fail-closed，禁止猜测这些事件属于哪个对话；迁移人确认唯一归属后显式执行：
+
+```python
+migrate_legacy_sqlite_runtime_events(
+    "agent-state.sqlite3",
+    session_id="confirmed-legacy-session",
+)
 ```
 
 ### 37.4 原子状态转换
@@ -4494,8 +4774,7 @@ operation_recovery
 全部测试：
 
 ```text
-Ran 189 tests
-OK
+N passed
 ```
 
 ---
@@ -4646,8 +4925,7 @@ Grant/Reject 的 TTL 使用 Store `deadline_ms` 在 `BEGIN IMMEDIATE` 事务内�
 全部项目：
 
 ```text
-Ran 227 tests
-OK
+N passed
 ```
 
 ---
@@ -4687,7 +4965,23 @@ tests/test_p0_transcript_boundaries.py
 - `DurableAgentHost`：保留 Facade，对象创建、资源生命周期、恢复和审批分别由 `harness/factory.py`、`resources.py`、`lifecycle.py`、`recovery.py`、`approval.py` 负责；
 - `TokenAwareStructuredCompactor`：按 Token 预算保留近期消息，把早期 Tool/Approval/业务事实生成可校验的结构化摘要，并记录 Replacement Event；
 - `RouterEvaluator`：提供 Intent 数据集、Status + Intent 联合混淆矩阵、精确到工具名的 Required Tool 漏检、置信度校准、恶意输入、真实 Hybrid Router Usage/Cost/延迟和不可用 NaN 绕过的版本回归门禁；
+- `AgentEvaluator`：加载 `evals/agent-core-v1.json` 版本化场景，通过调用方注入的异步 Runner 评估多轮最终成功、Required/Forbidden Tool、未授权动作、重复副作用、`outcome_unknown`/恢复、秘密泄漏、模型调用、Token、费用和延迟，并提供绝对安全线与版本回归门禁；
 - `HybridRequestPlanner` 与 `PlanExecutor`：提供 Plan 校验、依赖图、Task 状态机、审批屏障、并行执行、恢复策略和结果合成；`DurableAgentHost.plan()`、`execute_plan()`、`resume_plan()` 已把它们接到统一 Session Journal，Plan/Event 绑定 Session + Plan ID，追加使用 CAS，同 Plan 跨 Worker 执行使用可续租 Lease，重启后从事件流重放。
+
+`AgentEvaluator` 的 production evidence 采用 fail-closed 的 v2 协议。每次
+`evaluate()` 都生成新的短期 `AgentEvaluationRunContext`（run ID、随机 challenge、
+生效与过期时间）；Runner 必须针对该 context 产生新证据，旧 evidence 即使签名有效也
+不能跨 evaluation run 重放。`HmacAgentEvidenceSigner` 只有在下面条件全部成立时才签发
+v2 evidence：完整 records 以唯一 terminal binding record 结束；调用方配置了受信、
+确定性的 `TrustedObservationReducer` 及稳定 reducer ID；该 reducer 从所有前置 records
+独立重建出的 observation 与 Runner 返回值完全一致。`HmacAgentEvidenceVerifier` 还必须
+锁定预期 reducer ID，并校验联合摘要、challenge 和有效时间窗。公开的
+`create_evaluation_observation_binding_record()` 只生成结构化 commitment，本身不是可信
+证明。旧 v1 evidence 保留用于 development 兼容，production 一律拒绝。
+
+框架没有内置适用于所有 Journal/Trace schema 的 reducer，也不负责外部记录来源认证、
+密钥托管或密钥轮换；生产装配方必须在受信采集边界提供领域 reducer，并确保交给 signer
+的 records 确实来自相应 Journal/Trace，而不是模型或普通业务调用方自报。
 
 生产边界也已补齐：
 
@@ -4707,7 +5001,178 @@ python -m unittest tests.test_p2_runtime_features -v
 python -m unittest tests.test_p2_host_integration -v
 python -m unittest tests.test_p2_context_compaction -v
 python -m unittest tests.test_p2_router_evaluation -v
+python -m pytest -q tests/test_agent_evaluation.py
 python -m unittest tests.test_p2_multi_intent_planning -v
 python -m unittest tests.test_p2_durable_planning -v
 python -m unittest tests.test_durable_to_thread -v
+```
+
+---
+
+## 41. 自主任务、结果校验与多 Worker 执行
+
+复杂请求不再停在 Intent 分类结果。完整路径是：
+
+```text
+HybridModelRouter
+→ TaskDecision（任务、参数、依赖、风险）
+→ HybridRequestPlanner（绑定可信 Policy）
+→ Durable Plan DAG
+→ PlanExecutor
+→ Result Validator
+→ 有限、安全的 Replanner
+→ Result Synthesizer
+```
+
+### 41.1 Router 是决策入口，不是可执行权限来源
+
+`TaskDecision` 会保存每个任务的 `task_id`、Intent、参数和 `depends_on`。
+`DurableAgentHost.prompt()` 收到 `in_scope_plan_required` 后，直接把这份结构化
+决策交给 Planner，不会再让自由文本 Planner 对同一句话重新分类。
+
+应用可以给 `HybridModelRouter` 注入同步或异步 `authorization_policy`。该策略
+接收已经过 Intent Catalog 和 Capability Registry 解析的事实快照；策略异常、
+非法返回或明确拒绝都会 fail-closed。复合请求中只要一个任务越权，整个请求返回
+`permission_denied`，不会执行其余“允许”的半个计划。
+
+Router 的结果仍不可信：`write`、`requires_approval`、`replay_policy`、Capability
+和审批角色全部从应用注册的 `IntentPlanPolicy` 重新绑定。缺少参数、缺少能力、
+未知 Intent、重复/循环依赖或没有 `TaskDecision` 时均停止执行。Policy 还可以
+声明 `PlanParameterContract`、可信前置 Intent、结果参数绑定、执行条件和
+`PlanResultContract`。依赖结果只能通过受限 JSON Path 读取，不会执行模型生成的
+表达式；危险副作用默认串行，只有双方可信 Policy 都明确允许时才并行。
+
+`replay_policy` 采用“只能收紧、不能放宽”的合并规则：Tool 注册信息、可信 Intent
+Policy、Workflow 和 Plan Step 中只要任一层为 `never`，最终执行策略就必须保持
+`never`。Router、Planner、恢复回调或调用参数都不能把它降级成 `safe`。
+
+Tool Runtime 会在注册时封存不可变 `ToolSecurityContract` 和 Handler 身份，拒绝同名
+不同实例覆盖，并让 Prepared Call 绑定 Runtime、注册代次和合同摘要。Durable Recovery
+只有在持久摘要与当前注册完全一致时才能执行 `safe` 重放；旧事件缺摘要、注册后策略或
+Handler 变化时一律人工介入，不会拿“当前看起来是 safe”作为降级依据。
+
+### 41.2 执行—检查—纠正闭环
+
+`AutonomousPlanRunner` 在 Plan 执行后调用应用注入的 `PlanResultValidator`。验证
+失败时，`PlanReplanner` 最多在 `ClosedLoopBudget` 范围内生成新的、再次经过
+Policy 和 DAG 校验的 Plan。`PlanResultSynthesizer` 负责把最终结构化结果转换为
+用户可读回答；Host 会把用户问题和最终回答写回 Durable Session。
+
+`PlanExecutionState.phase == "completed"` 只是结构状态，不是业务语义证据。没有
+应用注入的可信 Validator 时，默认校验返回 `outcome_unknown` 并进入人工处理；测试
+或业务若要确认成功，必须显式提供能检查真实结果合同的 Validator。
+
+每个 Step 在派发前都会重新解析依赖参数、检查参数合同和可信前置条件；执行后先
+检查 `PlanResultContract`，通过以后才把结果开放给下游 Step。写操作的结果无法
+确认或不符合合同会进入 `manual_intervention`，不会被自动重放成第二次副作用。
+Plan 中的写 Step 不能使用裸 `plan_step_executor` 回调，必须经
+`plan_tool_bindings` 进入 Approval、`ToolDispatchRuntime` 和完整
+`WriteOperationService` 状态机。它因此继承 Action Hash、一次性 Approval Receipt、
+Idempotency、`submitting`、`outcome_unknown` 和 Reconciliation 语义；外部副作用
+可能已发生而成功事件尚未落盘时，不能伪装成普通失败或直接重试。
+
+Closed-loop 的 Run、轮次、事件和资源消耗会写入 Session Journal。硬预算覆盖 Plan
+Step、实际 Step 尝试、实际 Tool 调用、全部 Model 调用、Token、费用和墙钟时长，
+Planner、Validator、Replanner 与 Synthesizer 也在预算内。不同资源使用不同 Admission：
+
+- Plan Step 数在 Plan 绑定时持久预扣；
+- Step/Tool 离散尝试在实际派发前按一次精确预扣，不做事后 Settle；
+- Duration 使用创建 Run 时持久化的墙钟 Deadline；
+- Model/Token/Cost 通过 `plan_usage_meter` 执行
+  `reserve → dispatch → settle`；`model_calls` 统计包括失败重试在内的物理 Provider
+  Attempt，Token/Cost 同样累计整个 Retry Tree。
+
+崩溃后未证明“从未派发”的预扣或 Reservation 保守计入消耗，重启或纠正 Plan 不会
+重置预算。配置 Model/Token/Cost 硬上限时必须提供对应 Usage Meter；Meter 必须把每次
+物理 Dispatch 放在 Provider Admission 边界内，否则 Host fail-closed。框架的 Attempt
+Scope 能在后续重试前阻止超额并核对累计用量，但无法追回第一个 Provider 已经产生的
+超额，因此单次请求的 Token/Cost 上界仍必须由受信 Meter/Provider 参数前置限制。
+
+安全边界：
+
+- 只有 `replay_policy="safe"` 的只读 Plan 可以自动纠正；
+- 写操作和 `never` Plan 最多执行一次，失败后进入人工处理；
+- `outcome_unknown` 不会被改写成普通失败，也不会自动重放；
+- `waiting_approval` 会暂停而不是误判失败，批准后可使用
+  `resume_autonomous_plan()` 回到同一套校验和合成流程；
+- 纠正轮数、动作数和取消均有明确上限。
+
+### 41.3 原子启动和 Durable Completion Outbox
+
+初始 Plan、Autonomous Run 和 Conversation Link 不是三个相互独立的“最终会补齐”
+写入。内置 SQLite Journal 会在同一个事务中，以精确覆盖全部 Stream 的 CAS 原子
+提交 Plan initialized、Run initial-plan-bound、Conversation Operation/Link 和 Run
+dispatchable；纠正 Plan 的初始化与 Run 注册也使用同一事务。Worker 只能执行已经
+`linked + dispatchable` 的 Plan。当前内置 Host 的这条三流原子边界要求 Plan、Run、
+Conversation 共享同一 Session Journal，并使用 `SessionJournalPlanStore`。普通自定义
+`DurablePlanStore` 即使通过基础 Capability 校验，也不能只凭
+`atomic_fenced_append=True` 推断它支持三流 Bootstrap。受管 Host 会在装配 Autonomous
+Runner 时拒绝不兼容 Store；直接组合底层组件时也必须在 Bootstrap/派发前
+fail-closed。同一个 Run 的并发 Begin 使用稳定的 Conversation Operation
+身份和 Stream CAS，只有一份 Bootstrap 能获胜；冲突方只能重载并核对同一
+Request/Plan，不能留下第二个 Operation 或孤立 Plan。
+
+Plan 首次进入 `waiting_approval` 或终态时，状态事件与 `completion_pending`
+Envelope 在同一事务提交。Envelope 固定绑定 `delivery_id`、generation、目标阶段、
+Plan 状态版本和摘要；Worker 使用带 generation 的 Claim 投递，只有匹配同一 Envelope
+的 `completion_ack` 才能清除 Pending。旧代 Ack 不能清除新状态生成的新 Pending，
+内置 `AutonomousPlanCompletionProjector` 会先持久化可恢复的
+`waiting_approval` Conversation 投影再允许 Ack。自定义 Completion Handler 必须自行
+完成同等持久化；Worker 只校验 Handler 接收 Envelope，不能替业务 Handler 证明投影
+已经提交。
+
+这里的保证是 **at-least-once 投递 + 幂等投影**，不是对任意外部副作用的泛化
+“恰好一次”。内置 Waiting Projection 使用 `delivery_id` 去重；内置 Final Projection
+使用稳定的 `run_id + final` 身份和 CAS，保证同一 Run 只有一条最终 Assistant 消息。
+自定义 Completion Handler 必须接收 Envelope，并把稳定的 `delivery_id` 作为下游
+幂等键。如果投影成功但 Ack 响应丢失，重试会再次收到同一个 Delivery。
+
+### 41.4 多 Worker 可靠性
+
+Session、Plan、Approval Resume、Write Reconciliation 使用带单调 `generation`
+的 `ClaimLease`。续租、提交和释放必须同时匹配 owner 与 generation；旧 Worker
+即使在网络恢复后“复活”，也不能提交或释放新 Worker 的租约。该 generation
+作为 `fencing_token` 继续传入 Plan Step、普通 Tool 的可信
+`ToolDispatchContext`、Approval Callback 和 Write Context，业务 Adapter 可在
+下游数据库再次做 Fence/CAS。普通 Tool Context 还携带 `fencing_scope`；下游必须
+按 scope + token 比较，不能把不同 Session/Plan 中恰好相同的整数当成全局版本。
+Workflow、Run Controller 与资源锁分别使用自己的精确 `resource_id`；一个 Scope 的
+Lease 不能拿去修改另一个 Run，也不能替代下游资源的 Fence。
+
+Plan Worker 使用持久 Plan 事件作为工作来源。多个 Worker 可以同时扫描，但同一
+Plan 只有取得 fenced lease 的 Worker 能执行；心跳丢失会取消本地任务，Lease
+到期后其他 Worker 可接管。`waiting_approval`、人工处理和终态 Plan 不会被轮询
+执行。已经过期的 Lease 不能原地续租“复活”，必须重新取得更高 generation。
+`DurablePlanWorker` 支持有界批量、并发上限、公平扫描、取消清理和完成回调；完成
+回调失败会显式报告 `completion_error`，Pending Envelope 仍可由本 Worker 或重启后的
+Worker 重新 Claim，直到幂等投影完成并提交匹配的 `completion_ack`。
+
+内置 SQLite 适合同一台机器的多个进程，不会声明自己支持多机。
+跨机器运行时，必须显式注入 caller-owned `DurablePlanStore`，设置
+`distributed_execution=True`，并由 Store 的 `DurablePlanStoreCapabilities`
+声明原子 Fenced Append、跨进程与多机能力。Host 会校验 tenant/session
+作用域，也不会关闭调用方注入的 Store。
+
+多机的危险 Plan 必须同时通过 `plan_tool_bindings` 进入统一
+`ToolDispatchRuntime`，使用 `resource_locked` 和声明多机能力的共享
+`resource_lock_backend`。缺少任一保证时严格模式拒绝启动，不会把本地
+SQLite 或进程内锁伪装成分布式。框架只定义可实现的协议、CAS、Lease、
+Heartbeat、Fencing 与接管规则，不把特定 PostgreSQL/Redis 客户端写死进核心包。
+
+专项测试：
+
+```bat
+python -m pytest -q tests/test_autonomous_plan_runner.py
+python -m pytest -q tests/test_autonomous_host_integration.py
+python -m pytest -q tests/test_autonomous_durability.py
+python -m pytest -q tests/test_closed_loop.py
+python -m pytest -q tests/test_plan_dataflow_conditions.py
+python -m pytest -q tests/test_plan_parameter_contracts.py
+python -m pytest -q tests/test_plan_approval_pending_resume.py
+python -m pytest -q tests/test_plan_tool_runtime_bridge.py
+python -m pytest -q tests/test_durable_plan_worker.py
+python -m pytest -q tests/test_distributed_plan_store_contract.py
+python -m pytest -q tests/test_router_security_contracts.py
+python -m pytest -q tests/test_p2_durable_planning.py
+python -m pytest -q tests/test_recovery_fencing_and_gate.py
 ```

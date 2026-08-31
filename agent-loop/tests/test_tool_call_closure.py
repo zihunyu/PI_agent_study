@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -154,8 +155,7 @@ class ToolCallClosureTests(unittest.IsolatedAsyncioTestCase):
             return AgentToolResult(content=[], details={})
 
         parallel = self.tool("a", execute)
-        exclusive = self.tool("b", execute)
-        exclusive.execution_mode = "exclusive"
+        exclusive = replace(self.tool("b", execute), execution_mode="exclusive")
         trailing = self.tool("c", execute)
         agent = Agent(
             model=self.model,

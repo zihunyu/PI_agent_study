@@ -71,6 +71,11 @@ async def domain_demo() -> None:
     print("\n[项目业务状态机：订单示例]")
     machine = DomainStateMachine(
         initial_state="pending_payment",
+        # 演示 verifier 只接受由示例 Approval Adapter 预先验证的记录标识；
+        # 真实项目应在进入纯 Reducer 前查询 Store，这里只做本地验签/快照验证。
+        approval_receipt_verifier=lambda receipt: (
+            receipt.verification_id.startswith("demo-approval-record:")
+        ),
         transitions=[
             DomainTransition(
                 event_type="payment_succeeded",

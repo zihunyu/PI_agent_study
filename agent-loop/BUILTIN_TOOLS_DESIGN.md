@@ -1,10 +1,15 @@
 # Python Agent 内置工具系统架构设计
 
-> 状态：总体架构设计已完成；当前已完成 P0 Task 清理与 Tool Call Closure、P1 DurableAgentHost/Approval Resume、三种调度策略、分层重试、Durable Session、幂等写操作和状态机。
+> 状态：第一版安全工作区工具已经交付。默认只启用 `read`、`list_dir`、`find`、
+> `grep`；`write`/`edit` 需要 `workspace-write` 且 Runtime 必须提供可信身份与
+> Approval；`shell` 需要显式 `full-access` + `allow_trusted_shell=True`。
 > 目标项目：`agent-loop/`  
 > 目标：为现有 Python Agent Loop 增加安全、可测试、可扩展的内置工具系统。  
-> 当前教学工具：`add`、`multiply`、`divide`。
-> 后续文件工具：`read`、`list_dir`、`write`、`edit`、`shell`、`find`、`grep`。
+> 教学工具：`add`、`multiply`、`divide`。
+> 工作区工具：`read`、`list_dir`、`write`、`edit`、`shell`、`find`、`grep`。
+> 安全边界：Shell 是 trusted opt-in 的本机执行，不是 OS 沙箱；标准库实现无法
+> 阻止网络、工作区外访问或所有脱离进程树的后代。文件路径策略也不抵抗拥有本机
+> 文件系统修改权限的并发攻击者；workspace tree/reparse point 必须由受信主体稳定维护。
 
 ---
 
@@ -32,7 +37,7 @@ Tool Services
 
 > **不要把文件、Shell、安全和输出逻辑继续塞进 `loop.py`。Agent Loop 仍然只调用统一的 `AgentTool.execute()`。**
 
-内置工具通过工厂函数创建 `AgentTool`，并把共享服务保存在闭包中，因此现有 Agent Loop 不需要大改。
+内置工具通过工厂函数创建 `AgentTool`，并使用封存的共享服务，因此现有 Agent Loop 不需要大改。
 
 ---
 
@@ -69,22 +74,21 @@ Tool Services
 - 关键安全规则可以单独测试；
 - README 能解释每个工具如何工作。
 
-### 2.3 当前阶段不做的功能
+### 2.3 内置工具模块不提供的功能
 
-第一版暂不实现：
+以下能力不由这组工作区工具提供：
 
 - Docker 或操作系统内核沙箱；
 - 网络访问控制；
 - MCP；
 - 插件动态安装；
 - 远程文件系统；
-- 多租户；
 - 管理员权限提升；
 - 图片读取和图片压缩；
-- 后台任务系统；
 - 完整终端模拟器。
 
-这些以后可以通过扩展能力增加，不应阻塞第一版工具系统。
+多租户作用域、后台任务、Durable Recovery 和分布式资源锁属于 Host/Runtime 层；即使
+上层已经装配这些能力，也不会把 Shell 变成 OS 沙箱或让文件工具访问远程文件系统。
 
 ---
 
@@ -104,7 +108,7 @@ Tool Services
 
 因此工具系统只需要负责“创建高质量的 AgentTool”，不需要重新实现 Agent Loop 的工具调度。
 
-最终使用方式计划如下：
+基本使用方式如下：
 
 ```python
 services = ToolServices.create(
@@ -112,10 +116,7 @@ services = ToolServices.create(
     security_profile="workspace-write",
 )
 
-tools = create_builtin_tools(
-    services,
-    names=["read", "list_dir", "write", "edit", "shell"],
-)
+tools = create_builtin_tools(services)
 
 agent = Agent(
     model=model,
@@ -124,7 +125,14 @@ agent = Agent(
 )
 ```
 
-上面只是接口草图，具体代码后续按实现阶段编写。
+`write`/`edit` 自身声明 `requires_approval=True`。上面的 Agent 还必须注入可信
+`tool_identity` 和 `tool_authorization` 才能执行写操作；缺少任一边界都会 fail-closed。
+Shell 不包含在 `workspace-write` profile 中。
+
+这些文件写工具是本机单进程 Adapter：它们提供 observation/CAS、同文件锁和原子
+发布，但不会冒充跨进程 Durable 写网关。Plan/恢复/多 Worker 场景仍必须通过
+`WriteOperationService` 绑定 DurableActionEnvelope、持久 Intent/Result、幂等键、
+资源 fencing 和 reconciliation。
 
 ---
 
@@ -593,7 +601,8 @@ workspace/link/password.txt
 
 - 可以输入绝对路径；
 - 但绝对路径仍必须位于 workspace；
-- `full-access` profile 才允许工作区外路径。
+- 即使是 `full-access`，Python 文件工具也不允许工作区外路径；该 profile 只额外
+  开启受信 Shell，而 Shell 本身不是文件沙箱。
 
 这样模型生成绝对路径不会无故失败，同时仍保持边界。
 
@@ -878,7 +887,9 @@ ToolError
 - timeout；
 - spill path。
 
-当前 Agent Loop 在工具抛异常时主要保留字符串。正式实现阶段可以决定是否小幅增强 Loop，让 `ToolError` details 也进入错误 ToolResultMessage。
+提交前路径/CAS/edit 校验会抛出 `WorkspaceToolPreconditionError`，Runtime 保留其
+结构化 code 并标记 `definitelyNotCommitted`。原子发布开始后的异常以及 Shell 的
+超时、取消和非零退出绝不使用该类型，Runtime 会保守转为 `outcome_unknown`。
 
 ---
 
@@ -1040,13 +1051,13 @@ shell
 
 ---
 
-## 18. 分阶段实现计划
+## 18. 已完成的实施阶段
 
-根据依赖关系，推荐按以下顺序编写代码。
+以下顺序保留为实现历史和回归测试分组；各阶段均已交付。
 
 ## 阶段 A：公共基础设施
 
-实现：
+已交付：
 
 1. `errors.py`；
 2. `path_policy.py`；
@@ -1064,7 +1075,7 @@ shell
 
 ## 阶段 B：只读工具
 
-实现：
+已交付：
 
 1. `read`；
 2. `list_dir`；
@@ -1081,7 +1092,7 @@ shell
 
 ## 阶段 C：文件修改工具
 
-实现：
+已交付：
 
 1. `write`；
 2. `edit` exact match；
@@ -1100,7 +1111,7 @@ shell
 
 ## 阶段 D：输出系统和 Shell
 
-实现：
+已交付：
 
 1. `output.py`；
 2. spill store；
@@ -1117,7 +1128,7 @@ shell
 
 ## 阶段 E：搜索工具
 
-实现：
+已交付：
 
 1. `find`；
 2. `grep`；
@@ -1133,7 +1144,7 @@ shell
 
 ## 阶段 F：工具集合与文档
 
-实现：
+已交付：
 
 1. `ToolServices`；
 2. `BuiltinToolRegistry`；
@@ -1144,59 +1155,39 @@ shell
 
 ---
 
-## 19. 需要用户确认的设计选择
+## 19. 已确认的第一版设计选择
 
-正式编写代码前，建议确认以下问题。
+第一版实现采用以下结论。
 
 ### 19.1 工作区边界
 
-推荐默认：所有文件工具只能访问 workspace 内部。
+默认所有 Python 文件工具只能访问 workspace 内部。
 
-待确认：
-
-- 是否允许 `full-access` 访问工作区外文件？
+`full-access` 不放宽 Python 文件工具的 workspace 边界，只显式开启受信 Shell。
 
 ### 19.2 Shell 默认状态
 
-推荐默认：不启用 Shell，用户明确选择 `full-access` 才启用。
-
-待确认：
-
-- 是否希望 Coding profile 默认包含 Shell？
+默认不启用 Shell。只有调用方同时选择 `full-access` 并设置
+`allow_trusted_shell=True` 才会创建该工具。
 
 ### 19.3 文件修改规则
 
-推荐默认：覆盖和 edit 已存在文件前必须先 read。
-
-待确认：
-
-- 是否接受“未 read 就拒绝修改”的严格行为？
+覆盖和 edit 已存在文件前必须先 read/observe，并使用版本做 CAS；版本变化时拒绝提交。
 
 ### 19.4 外部依赖
 
-推荐第一版只使用 Python 标准库。
-
-待确认：
-
-- 参数校验是否允许使用 Pydantic 或 `jsonschema`？
+工作区工具实现只使用标准库，不依赖 Pydantic 或 `jsonschema`。这不表示整个项目没有
+其他依赖；例如加密 Journal/Memory 使用 `cryptography`。
 
 ### 19.5 平台优先级
 
-当前开发环境是 Windows。
-
-推荐：
-
-- 第一版同时设计跨平台接口；
-- 优先把 Windows 行为测试通过；
-- Linux/macOS 使用 CI 或后续环境验证。
-
-待确认：
-
-- 是否要求第一版就完整支持 Linux/macOS？
+路径与进程层分别实现 Windows/POSIX 分支。任何部署仍必须在目标 OS 验证 Shell 选择、
+进程树终止、文件权限、reparse point/symlink 和原子替换语义，不能把一个平台的测试
+结果外推成另一平台的隔离保证。
 
 ### 19.6 工具范围
 
-推荐第一批：
+已交付：
 
 ```text
 read
@@ -1204,36 +1195,27 @@ list_dir
 write
 edit
 shell
-```
-
-第二批：
-
-```text
 find
 grep
 ```
 
-待确认：
-
-- 是否按这个顺序开发？
-
 ---
 
-## 20. 最终推荐方案
+## 20. 已交付方案
 
-当前最合适的实现策略是：
+当前代码结构是：
 
 ```text
 保持现有 Agent Loop 不变
   + 创建 pi_agent_loop.tools 子系统
-  + 第一阶段先做公共文件安全基础
-  + 第二阶段完成 read/list_dir
-  + 第三阶段完成 write/edit
-  + 第四阶段完成 shell
-  + 最后加入 find/grep 和 profile
+  + 公共路径、输出、原子写和进程管理服务
+  + read/list_dir/find/grep
+  + 需要身份、授权与审批的 write/edit
+  + 显式 trusted opt-in 的 shell
+  + read-only/workspace-write/full-access profile
 ```
 
-推荐默认安全配置：
+实际默认安全配置：
 
 ```text
 文件工具只允许 workspace
@@ -1242,7 +1224,8 @@ write/edit 已有文件前要求 read
 写入使用临时文件原子替换
 Shell 默认关闭
 输出限制 2,000 行或 50 KiB
-完整大输出保存到临时文件
+大输出在硬上限内保存到工作区外、权限收紧的临时目录；超过 spill 上限会明确记录
+droppedBytes/spillComplete=false，并由 ToolServices.close() 清理
 ```
 
 这套设计结合了：
@@ -1253,4 +1236,5 @@ Shell 默认关闭
 - DeepSeek Harness 的 observation/CAS；
 - DeepSeek Harness 的原子文件发布和安全边界。
 
-后续代码开发应严格按阶段进行，每个阶段先写测试，再写实现，测试通过后再进入下一阶段。
+后续增强仍应先补安全测试再修改实现。当前 stdlib 版本不声称提供 Shell 沙箱；若需
+对不受信命令提供隔离，必须接入容器/OS sandbox，并单独验证网络、挂载和进程边界。

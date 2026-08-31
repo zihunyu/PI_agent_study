@@ -5,9 +5,20 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..messages import MessageInputLimits, normalize_user_content
 from ..transcript import TranscriptIntegrityError, validate_closed_tool_call_transcript
 from .errors import ProviderProtocolError
 from .settings import ProviderProfile
+
+
+_DEFAULT_MAX_SYSTEM_PROMPT_BYTES = 1024 * 1024
+_DEFAULT_MAX_TOOL_SCHEMA_BYTES = 4 * 1024 * 1024
+_DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024
+_DEFAULT_MAX_USER_TEXT_BYTES = 256 * 1024
+_DEFAULT_MAX_IMAGES_PER_MESSAGE = 8
+_DEFAULT_MAX_IMAGE_URL_BYTES = 8 * 1024 * 1024
+_DEFAULT_MAX_TOTAL_IMAGE_URL_BYTES = 16 * 1024 * 1024
+_DEFAULT_MAX_CONTENT_BLOCKS = 16
 
 
 def _blocks_to_text(blocks: Any, *, role: str) -> str:
@@ -19,7 +30,12 @@ def _blocks_to_text(blocks: Any, *, role: str) -> str:
             raise ProviderProtocolError(f"{role} 消息包含无效 content block")
         block_type = block.get("type")
         if block_type == "text":
-            parts.append(str(block.get("text", "")))
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise ProviderProtocolError(
+                    f"{role} text content block 必须包含字符串 text"
+                )
+            parts.append(text)
         elif role == "assistant" and block_type == "thinking":
             # 隐藏推理内容不重新发送为普通文本。
             continue
@@ -31,6 +47,35 @@ def _blocks_to_text(blocks: Any, *, role: str) -> str:
                 f"content 类型：{block_type!r}"
             )
     return "".join(parts)
+
+
+def _serialize_user_content(
+    blocks: Any,
+    *,
+    limits: MessageInputLimits,
+) -> str | list[dict[str, Any]]:
+    try:
+        normalized = normalize_user_content(blocks, limits=limits)
+    except (TypeError, ValueError) as error:
+        raise ProviderProtocolError(f"无效的 user content：{error}") from error
+    if all(block["type"] == "text" for block in normalized):
+        return "".join(block["text"] for block in normalized)
+    serialized: list[dict[str, Any]] = []
+    for block in normalized:
+        if block["type"] == "text":
+            serialized.append({"type": "text", "text": block["text"]})
+        elif block["type"] == "image_url":
+            serialized.append(
+                {
+                    "type": "image_url",
+                    "image_url": dict(block["image_url"]),
+                }
+            )
+        else:  # normalize_user_content 已经 fail-closed；保留防御式边界。
+            raise ProviderProtocolError(
+                f"不支持的 user content 类型：{block['type']!r}"
+            )
+    return serialized
 
 
 def _serialize_assistant(message: dict[str, Any]) -> dict[str, Any]:
@@ -71,12 +116,21 @@ def _serialize_assistant(message: dict[str, Any]) -> dict[str, Any]:
     return serialized
 
 
-def _serialize_message(message: dict[str, Any]) -> dict[str, Any]:
+def _serialize_message(
+    message: dict[str, Any],
+    *,
+    user_limits: MessageInputLimits,
+) -> dict[str, Any]:
+    if not isinstance(message, dict):
+        raise ProviderProtocolError("模型消息必须是对象")
     role = message.get("role")
     if role == "user":
         return {
             "role": "user",
-            "content": _blocks_to_text(message.get("content"), role="user"),
+            "content": _serialize_user_content(
+                message.get("content"),
+                limits=user_limits,
+            ),
         }
     if role == "assistant":
         return _serialize_assistant(message)
@@ -124,6 +178,48 @@ def serialize_chat_request(
     """构造 OpenAI-compatible `/chat/completions` JSON 请求体。"""
 
     options = options or {}
+    max_system_prompt_bytes = _configured_limit(
+        options,
+        "max_system_prompt_bytes",
+        _DEFAULT_MAX_SYSTEM_PROMPT_BYTES,
+    )
+    max_tool_schema_bytes = _configured_limit(
+        options,
+        "max_tool_schema_bytes",
+        _DEFAULT_MAX_TOOL_SCHEMA_BYTES,
+    )
+    max_request_bytes = _configured_limit(
+        options,
+        "max_request_bytes",
+        _DEFAULT_MAX_REQUEST_BYTES,
+    )
+    user_limits = MessageInputLimits(
+        max_text_bytes=_configured_limit(
+            options,
+            "max_user_text_bytes",
+            _DEFAULT_MAX_USER_TEXT_BYTES,
+        ),
+        max_images=_configured_nonnegative_limit(
+            options,
+            "max_images_per_message",
+            _DEFAULT_MAX_IMAGES_PER_MESSAGE,
+        ),
+        max_image_url_bytes=_configured_limit(
+            options,
+            "max_image_url_bytes",
+            _DEFAULT_MAX_IMAGE_URL_BYTES,
+        ),
+        max_total_image_url_bytes=_configured_limit(
+            options,
+            "max_total_image_url_bytes",
+            _DEFAULT_MAX_TOTAL_IMAGE_URL_BYTES,
+        ),
+        max_content_blocks=_configured_limit(
+            options,
+            "max_content_blocks_per_message",
+            _DEFAULT_MAX_CONTENT_BLOCKS,
+        ),
+    )
     raw_messages = context.get("messages", [])
     if not isinstance(raw_messages, list):
         raise ProviderProtocolError("模型 context.messages 必须是列表")
@@ -136,11 +232,16 @@ def serialize_chat_request(
 
     messages: list[dict[str, Any]] = []
     system_prompt = context.get("systemPrompt", "")
+    if not isinstance(system_prompt, str):
+        raise ProviderProtocolError("systemPrompt 必须是字符串")
+    if len(system_prompt.encode("utf-8")) > max_system_prompt_bytes:
+        raise ProviderProtocolError("systemPrompt 字节数超过出站限制")
     if system_prompt:
-        if not isinstance(system_prompt, str):
-            raise ProviderProtocolError("systemPrompt 必须是字符串")
         messages.append({"role": "system", "content": system_prompt})
-    messages.extend(_serialize_message(message) for message in raw_messages)
+    messages.extend(
+        _serialize_message(message, user_limits=user_limits)
+        for message in raw_messages
+    )
 
     payload: dict[str, Any] = {
         "model": profile.model,
@@ -153,6 +254,8 @@ def serialize_chat_request(
         raise ProviderProtocolError("模型 context.tools 必须是列表")
     if raw_tools:
         payload["tools"] = [_serialize_tool(tool) for tool in raw_tools]
+        if _json_bytes(payload["tools"], label="工具 schema") > max_tool_schema_bytes:
+            raise ProviderProtocolError("工具 schema 累计字节数超过出站限制")
         available_names = {
             tool["function"]["name"] for tool in payload["tools"]
         }
@@ -172,7 +275,40 @@ def serialize_chat_request(
     reasoning = options.get("reasoning")
     if reasoning:
         payload["reasoning_effort"] = reasoning
+    if _json_bytes(payload, label="模型请求") > max_request_bytes:
+        raise ProviderProtocolError("模型请求累计字节数超过出站限制")
     return payload
+
+
+def _configured_limit(options: dict[str, Any], name: str, default: int) -> int:
+    value = options.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ProviderProtocolError(f"{name} 必须是正整数")
+    return value
+
+
+def _configured_nonnegative_limit(
+    options: dict[str, Any],
+    name: str,
+    default: int,
+) -> int:
+    value = options.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProviderProtocolError(f"{name} 必须是非负整数")
+    return value
+
+
+def _json_bytes(value: Any, *, label: str) -> int:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ProviderProtocolError(f"{label} 不是严格 JSON") from error
+    return len(encoded)
 
 
 def _serialize_tool_choice(

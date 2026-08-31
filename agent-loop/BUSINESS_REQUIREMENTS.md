@@ -9,14 +9,17 @@
 
 业务人员只在这里描述“系统应该支持什么”，不需要手写正则表达式或 Tool Calling JSON Schema。
 
-AI 读取本文件后，应生成或更新：
+AI 读取本文件后，应在独立业务仓库或独立 Python 包中生成或更新：
 
-1. `config/business.toml.example`；
-2. 本地 `config/business.toml`（该文件被 Git 忽略）；
-3. `src/pi_agent_loop/tools/` 中的真实工具；
-4. Capability 注册工厂；
-5. Router、Guard、参数校验和 Approval 测试；
-6. README 中的运行说明。
+1. `my_business/config/business.toml.example`；
+2. 业务仓库内被 Git 忽略的本地配置；
+3. `my_business/tools/` 中的真实工具；
+4. 业务包的 Capability 注册工厂；
+5. 业务 Router、Guard、参数校验和 Approval 测试；
+6. 业务包自己的运行说明。
+
+`src/pi_agent_loop/` 只在确实发现领域无关的通用扩展点或安全缺陷时修改。真实 Tool、
+Intent、账号、接口和数据库结构不得写入框架目录，也不得从框架根包导出。
 
 AI 不得根据不完整描述自行编造真实 API、数据库字段、权限或成功结果。信息不足时必须先提问。
 
@@ -207,87 +210,17 @@ AI 不得根据不完整描述自行编造真实 API、数据库字段、权限�
 - Outcome Unknown 必须提供状态核对入口；
 - AI 不得在缺少核对 API 时声称写操作可自动恢复。
 
-### 8.3 `test_demo` 退款审批（教学 Mock，已确认）
+### 8.3 真实项目隔离原则
 
-本节只约束 `test_demo/` 隔离演示，不表示已经提供生产退款 API 或生产身份认证。
+本仓库只保存可复用框架与虚构教学样例，不保存某个真实项目的账号、角色、接口、
+数据库结构、初始数据或专用 Tool 包。接入真实项目时应：
 
-#### 身份与权限
-
-| 身份角色 | 稳定标识 | 允许动作 |
-|---|---|---|
-| 买家 | `buyer` | 为已付款且未发货的订单申请退款 |
-| 经理（审批人） | `manager` | 批准或拒绝待审批退款 |
-
-演示接口使用 `X-Actor-Id` 和 `X-Actor-Role` 表示身份。生产系统必须替换为可信认证
-Adapter。申请人与审批人的 `actor_id` 必须不同，禁止申请人自审。
-
-#### 状态转换
-
-| 实体 | 事件 | 允许来源状态 | 目标状态 | 事实来源 | 是否审批 |
-|---|---|---|---|---|---|
-| order/refund_request | `refund_requested` | 已付款、未发货、未退款、无待审批退款 | `waiting_approval` | 已识别的 `buyer` 请求 + MySQL 事务 | 否 |
-| order/refund_request | `refund_approved` | `waiting_approval` | `refunded` | 非申请人的已识别 `manager` + MySQL 事务 | 是 |
-| order/refund_request | `refund_rejected` | `waiting_approval` | 订单恢复原业务状态；申请终态 `rejected` | 非申请人的已识别 `manager` + MySQL 事务 | 是 |
-
-规则：
-
-- 申请退款只进入 `waiting_approval`，不得设置 `is_refunded=true`；
-- 经理批准后，审批记录与订单 `refunded` 必须在同一 MySQL 事务内提交；
-- 拒绝后订单付款、发货、收货和物流字段保持不变；
-- 记录申请人、审批人、申请时间、审批时间和结果；
-- Approval Action Hash 精确绑定申请号、订单号、申请人和 `order.refund` 动作；
-- 重复审批、申请单与订单号不匹配、Action Hash 不匹配一律拒绝；
-- 未付款、已发货、已退款、已有待审批退款的订单不能申请简单退款；
-- 等待审批期间禁止发货；
-- `request_id` 由服务端生成；重复创建待审批申请会返回冲突；
-- 当前演示没有外部支付退款 API，不存在自动重放外部退款；接入生产前必须另行确认
-  Approval 过期时间、幂等键、真实退款流水、Timeout、Outcome Unknown 核对和恢复规则。
-
-### 8.4 `test_demo` 客户、商品与下单（教学 Mock，已确认）
-
-本节中的“确认订单是否充足”按上下文解释为“确认商品库存是否充足”。
-
-#### 初始客户
-
-| 客户标识 | 名称 | 角色 | 初始余额 |
-|---|---|---|---:|
-| `customer-a` | 客户A | `buyer` | 300.00 |
-| `customer-b` | 客户B | `buyer` | 400.00 |
-| `customer-c` | 客户C | `buyer` | 500.00 |
-
-#### 初始商品
-
-| 商品标识 | 名称 | 初始库存 | 单价 |
-|---|---|---:|---:|
-| `shoes` | 鞋子 | 1 | 200.00 |
-| `hat` | 帽子 | 2 | 100.00 |
-| `clothes` | 衣服 | 3 | 300.00 |
-
-初始化数据只在记录不存在时插入；重复执行数据库迁移不得重置已经变化的余额和库存。
-
-#### 下单转换
-
-| 实体 | 事件 | 允许来源状态 | 目标状态 | 事实来源 | 是否审批 |
-|---|---|---|---|---|---|
-| customer/product/order | `order_created_and_paid` | 客户存在且余额 ≥ 总价；商品存在且库存 ≥ 数量 | 余额扣减、库存扣减、生成归属该客户的已付款订单 | 已识别 `buyer` + MySQL 行锁事务 | 否 |
-
-规则：
-
-- 客户提交 `product_id` 和正整数 `quantity`，订单号必须由服务端生成；
-- 总价等于商品当前单价乘以数量，金额使用定点小数；
-- 余额检查、库存检查、余额扣减、库存扣减和订单写入必须在同一 MySQL 事务内；
-- 余额不足或库存不足时整笔回滚，不生成订单、不扣余额、不扣库存；
-- 下单必须提供 `Idempotency-Key`，只保存其 SHA-256 Hash；
-- 同一客户以同一幂等键重试相同商品和数量时返回原订单，不重复扣款或扣库存；
-- 同一客户以同一幂等键提交不同商品或数量时返回冲突；
-- 订单保存客户、商品、数量、单价和总价快照；
-- 客户查询或操作订单时必须匹配 `order.customer_id`；其他客户统一得到“订单不存在”，
-  不得泄漏订单是否存在；
-- 客户只能读取自己的余额；商品目录可读取；
-- 新下单已经完成余额支付，不保留可绕过余额检查的“指定订单号创建”和独立付款接口；
-- 未发货订单退款获经理批准时，订单退款、余额返还、库存返还和审批记录在同一事务内；
-- 退款被拒绝时余额和库存保持下单后的状态；
-- 当前 `X-Actor-Id`/`X-Actor-Role` 仍是教学身份标识，不能作为生产鉴权。
+- 在独立业务仓库或独立 Python 包中实现 Tool、Router、Identity 和 API Adapter；
+- 通过 `ToolRegistry`、`CapabilityRegistry`、`stream_fn` 和
+  `DurableHostResourceFactory` 注入框架；
+- 只把与领域无关的安全修复回迁到本脚手架；
+- 业务测试、配置和文档跟随业务适配包维护，不进入脚手架发布物；
+- 删除业务适配包后，`import pi_agent_loop` 仍必须成功。
 
 ---
 

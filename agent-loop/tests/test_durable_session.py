@@ -28,6 +28,7 @@ from pi_agent_loop import (  # noqa: E402
     RoutedAgent,
     ScriptedProvider,
     StaticIdentityVerifier,
+    VerifiedIdentity,
     WriteOperationService,
     assistant_message,
     create_divide_tool,
@@ -234,6 +235,7 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
                     "toolName": "write-or-read",
                     "arguments": {"value": 1},
                     "replayPolicy": replay_policy,
+                    "securityContractDigest": "a" * 64,
                 },
             )
             await store.append(
@@ -251,6 +253,49 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
         unsafe = await plan_for("never")
         self.assertEqual(safe.actions[0].kind, "replay_safe_tool")
         self.assertEqual(unsafe.actions[0].kind, "reconcile_tool")
+
+    async def test_recovery缺少_tool_intent时_fail_closed(self) -> None:
+        store = InMemoryOperationEventStore()
+        await self.start_operation(store)
+        policy = ModelRequestPolicy(
+            visible_tool_names=("write-or-read",),
+            tool_choice="required",
+            allowed_tool_names=("write-or-read",),
+            expected_tool_arguments={"value": 1},
+        )
+        assistant = assistant_message(
+            model=self.model,
+            stop_reason="toolUse",
+            content=[
+                {
+                    "type": "toolCall",
+                    "id": "missing-intent",
+                    "name": "write-or-read",
+                    "arguments": {"value": 1},
+                }
+            ],
+        )
+        await store.append(
+            "model_request_started",
+            "session-1",
+            "operation-1",
+            {"requestId": "request-1", "requestPolicy": policy.to_dict()},
+        )
+        await store.append(
+            "model_request_completed",
+            "session-1",
+            "operation-1",
+            {"requestId": "request-1", "message": assistant},
+        )
+
+        plan = await DurableSessionRecovery(store).plan(
+            session_id="session-1",
+            operation_id="operation-1",
+        )
+
+        self.assertEqual([action.kind for action in plan.actions], ["manual_intervention"])
+        self.assertIn("缺少可信 Dispatch Intent", plan.actions[0].reason)
+        self.assertFalse(any(action.kind == "execute_tool" for action in plan.actions))
 
     async def test_recovery_安全重放工具后继续模型并完成(self) -> None:
         store = InMemoryOperationEventStore()
@@ -299,6 +344,7 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
                 "toolName": "divide",
                 "arguments": {"a": 10, "b": 2},
                 "replayPolicy": "safe",
+                "securityContractDigest": "b" * 64,
             },
         )
         await store.append(
@@ -388,6 +434,124 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approval.state, "consumed")
         with self.assertRaises(ApprovalError):
             await service.consume(approval.approval_id, action=action, consumer=requester)
+
+    async def test_approval拒绝duck对象和未经签发的身份(self) -> None:
+        store = InMemoryOperationEventStore()
+        await self.start_operation(store)
+        _verifier, requester, approver = await self.identities()
+        service = ApprovalService(store)
+        action = {"tool": "cancel_order", "arguments": {"order_id": "1001"}}
+
+        class DuckIdentity:
+            principal_id = "forged-manager"
+            roles = frozenset({"approver"})
+            issuer = "forged"
+            verification_id = "forged-verification"
+
+        duck = DuckIdentity()
+        with self.assertRaises(ApprovalError) as request_error:
+            await service.request(
+                session_id="session-1",
+                operation_id="operation-1",
+                requester=duck,  # type: ignore[arg-type]
+                action=action,
+                action_summary="取消订单 1001",
+                required_role="approver",
+            )
+        self.assertEqual(request_error.exception.code, "verified_identity_required")
+
+        directly_constructed = VerifiedIdentity(
+            principal_id="forged-manager",
+            roles=frozenset({"approver"}),
+            issuer="forged",
+            verification_id="forged-verification",
+        )
+        with self.assertRaises(ApprovalError) as provenance_error:
+            await service.request(
+                session_id="session-1",
+                operation_id="operation-1",
+                requester=directly_constructed,
+                action=action,
+                action_summary="取消订单 1001",
+                required_role="approver",
+            )
+        self.assertEqual(
+            provenance_error.exception.code,
+            "identity_provenance_invalid",
+        )
+
+        approval = await service.request(
+            session_id="session-1",
+            operation_id="operation-1",
+            requester=requester,
+            action=action,
+            action_summary="取消订单 1001",
+            required_role="approver",
+        )
+        for transition in (
+            lambda: service.grant(approval.approval_id, duck),
+            lambda: service.reject(
+                approval.approval_id,
+                duck,
+                reason="forged",
+            ),
+        ):
+            with self.assertRaises(ApprovalError) as transition_error:
+                await transition()  # type: ignore[misc]
+            self.assertEqual(
+                transition_error.exception.code,
+                "verified_identity_required",
+            )
+
+        await service.grant(approval.approval_id, approver)
+        with self.assertRaises(ApprovalError) as consume_error:
+            await service.consume(
+                approval.approval_id,
+                action=action,
+                consumer=duck,  # type: ignore[arg-type]
+            )
+        self.assertEqual(consume_error.exception.code, "verified_identity_required")
+
+    async def test_approval支持注入生产身份来源验证器(self) -> None:
+        store = InMemoryOperationEventStore()
+        await self.start_operation(store)
+        requester = VerifiedIdentity(
+            principal_id="oidc-operator",
+            roles=frozenset({"operator"}),
+            issuer="enterprise-oidc",
+            verification_id="oidc-verification-1",
+        )
+        approver = VerifiedIdentity(
+            principal_id="oidc-approver",
+            roles=frozenset({"approver"}),
+            issuer="enterprise-oidc",
+            verification_id="oidc-verification-2",
+        )
+        issued_objects = {id(requester): requester, id(approver): approver}
+
+        def validate_runtime_issuance(identity: VerifiedIdentity) -> bool:
+            return issued_objects.get(id(identity)) is identity
+
+        service = ApprovalService(
+            store,
+            identity_validator=validate_runtime_issuance,
+        )
+        action = {"tool": "cancel_order", "arguments": {"order_id": "1001"}}
+        approval = await service.request(
+            session_id="session-1",
+            operation_id="operation-1",
+            requester=requester,
+            action=action,
+            action_summary="取消订单 1001",
+            required_role="approver",
+        )
+        await service.grant(approval.approval_id, approver)
+        consumed = await service.consume(
+            approval.approval_id,
+            action=action,
+            consumer=requester,
+        )
+        self.assertEqual(consumed.state, "consumed")
 
     async def test_write_审批_幂等_执行和重复请求去重(self) -> None:
         store = InMemoryOperationEventStore()

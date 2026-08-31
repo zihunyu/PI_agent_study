@@ -17,6 +17,7 @@ from pi_agent_loop import (
     DurableHostLifecycle,
     DurableHostResources,
     HybridModelRouter,
+    IdentityClaim,
     Model,
     ModelRequestPolicy,
     ModelRetryPolicy,
@@ -28,6 +29,7 @@ from pi_agent_loop import (
     SessionJournalRuntimeEventStore,
     SimpleBusinessConfig,
     SimpleProduct,
+    StaticIdentityVerifier,
     VerifiedIdentity,
     assistant_message,
 )
@@ -942,11 +944,14 @@ class P2HostIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     "approval-operation",
                     {"configuration": {}, "tools": []},
                 )
-                requester = VerifiedIdentity(
-                    "requester",
-                    frozenset({"operator"}),
-                    "test",
-                    "requester-verification",
+                verifier = StaticIdentityVerifier(
+                    {
+                        "requester": ("requester-test-credential", {"operator"}),
+                        "approver": ("approver-test-credential", {"approver"}),
+                    }
+                )
+                requester = await verifier.verify(
+                    IdentityClaim("requester", "requester-test-credential")
                 )
                 approval = await owner.approvals.request(
                     session_id=owner.session_id,
@@ -956,16 +961,14 @@ class P2HostIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     action_summary="cross-session",
                     required_role="approver",
                 )
-                approver = VerifiedIdentity(
-                    "approver",
-                    frozenset({"approver"}),
-                    "test",
-                    "approver-verification",
+                approver = await verifier.verify(
+                    IdentityClaim("approver", "approver-test-credential")
                 )
                 called = False
 
-                async def write_handler(*_args):
+                async def write_handler(*_args, fenced_claim):
                     nonlocal called
+                    self.assertIsNotNone(fenced_claim)
                     called = True
 
                 with self.assertRaises(ApprovalError) as raised:
@@ -981,6 +984,70 @@ class P2HostIntegrationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await outsider.close()
                 await owner.close()
+
+    async def test_host透传生产identity_validator并校验tool_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            identity = VerifiedIdentity(
+                principal_id="oidc-operator",
+                roles=frozenset({"operator"}),
+                issuer="enterprise-oidc",
+                verification_id="oidc-runtime-proof",
+            )
+
+            def validator(candidate: VerifiedIdentity) -> bool:
+                return candidate is identity
+
+            host = await DurableAgentHost.create(
+                session_id="production-identity",
+                state_dir=directory,
+                tenant_id="tenant-a",
+                model=MODEL,
+                stream_fn=ScriptedProvider([]).stream,
+                system_prompt="integration",
+                tools=[],
+                tool_identity=identity,
+                approval_identity_validator=validator,
+                auto_recover=False,
+            )
+            try:
+                await host.operation_store.append(
+                    "operation_started",
+                    host.session_id,
+                    "identity-operation",
+                    {"configuration": {}, "tools": []},
+                )
+                approval = await host.approvals.request(
+                    session_id=host.session_id,
+                    operation_id="identity-operation",
+                    requester=identity,
+                    action={"operation": "read"},
+                    action_summary="production identity",
+                    required_role="operator",
+                )
+                self.assertEqual(approval.requester_id, identity.principal_id)
+            finally:
+                await host.close()
+
+            rejected = VerifiedIdentity(
+                principal_id="forged",
+                roles=frozenset({"operator"}),
+                issuer="untrusted",
+                verification_id="forged-proof",
+            )
+            with self.assertRaises(ApprovalError) as raised:
+                await DurableAgentHost.create(
+                    session_id="rejected-tool-identity",
+                    state_dir=directory,
+                    tenant_id="tenant-a",
+                    model=MODEL,
+                    stream_fn=ScriptedProvider([]).stream,
+                    system_prompt="integration",
+                    tools=[],
+                    tool_identity=rejected,
+                    approval_identity_validator=validator,
+                    auto_recover=False,
+                )
+            self.assertEqual(raised.exception.code, "identity_provenance_invalid")
 
 
 if __name__ == "__main__":

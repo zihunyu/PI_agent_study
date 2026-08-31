@@ -17,6 +17,7 @@ from pi_agent_loop import (  # noqa: E402
     ScriptedProvider,
     SessionAlreadyOpenError,
     SessionConfigurationMismatchError,
+    SessionJournalOperationEventStore,
     assistant_message,
 )
 
@@ -364,6 +365,111 @@ class WorkspaceSessionTests(unittest.IsolatedAsyncioTestCase):
                 tools=[],
             )
             await correctly_configured.close()
+
+    async def test_explicit_configuration_migration_preserves_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "project"
+            project_path.mkdir()
+            workspace = DurableAgentWorkspace.open(root / "state")
+            project = await workspace.create_project(project_path, title="Demo")
+            session = await workspace.create_session(
+                project.project_id,
+                title="配置迁移测试",
+            )
+            old_host = await workspace.open_session(
+                session.session_id,
+                model=self.model,
+                stream_fn=ScriptedProvider(
+                    [
+                        assistant_message(
+                            model=self.model,
+                            content=[{"type": "text", "text": "旧配置回答"}],
+                        )
+                    ]
+                ).stream,
+                system_prompt="version-1",
+                tools=[],
+            )
+            await old_host.prompt("旧配置问题")
+            await old_host.close()
+            old_metadata = await workspace.catalog.get_session(session.session_id)
+
+            migrated_host = await workspace.open_session(
+                session.session_id,
+                model=self.model,
+                stream_fn=ScriptedProvider([]).stream,
+                system_prompt="version-2",
+                tools=[],
+                allow_configuration_migration=True,
+            )
+            try:
+                migrated_metadata = await workspace.catalog.get_session(
+                    session.session_id
+                )
+                self.assertNotEqual(
+                    old_metadata.configuration_hash,
+                    migrated_metadata.configuration_hash,
+                )
+                self.assertEqual(
+                    [message["role"] for message in migrated_host.agent.state.messages],
+                    ["user", "assistant"],
+                )
+                self.assertEqual(
+                    migrated_host.agent.state.messages[0]["content"][0]["text"],
+                    "旧配置问题",
+                )
+            finally:
+                await migrated_host.close()
+
+    async def test_configuration_migration_rejects_unfinished_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "project"
+            project_path.mkdir()
+            workspace = DurableAgentWorkspace.open(root / "state")
+            project = await workspace.create_project(project_path, title="Demo")
+            session = await workspace.create_session(
+                project.project_id,
+                title="未完成任务迁移测试",
+            )
+            old_host = await workspace.open_session(
+                session.session_id,
+                model=self.model,
+                stream_fn=ScriptedProvider([]).stream,
+                system_prompt="version-1",
+                tools=[],
+            )
+            await old_host.close()
+            old_metadata = await workspace.catalog.get_session(session.session_id)
+            operation_store = SessionJournalOperationEventStore(
+                workspace.catalog.journal,
+                workspace.principal,
+            )
+            await operation_store.append(
+                "operation_started",
+                session.session_id,
+                "unfinished-operation",
+                {"configuration": {}, "tools": []},
+            )
+
+            with self.assertRaisesRegex(
+                SessionConfigurationMismatchError,
+                "未完成 Operation",
+            ):
+                await workspace.open_session(
+                    session.session_id,
+                    model=self.model,
+                    stream_fn=ScriptedProvider([]).stream,
+                    system_prompt="version-2",
+                    tools=[],
+                    allow_configuration_migration=True,
+                )
+            unchanged = await workspace.catalog.get_session(session.session_id)
+            self.assertEqual(
+                unchanged.configuration_hash,
+                old_metadata.configuration_hash,
+            )
 
 
 if __name__ == "__main__":

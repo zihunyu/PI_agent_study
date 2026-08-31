@@ -7,7 +7,7 @@ from typing import Any
 
 from .events import RuntimeEvent
 from .invariants import RuntimeInvariantError, validate_runtime_transition
-from .states import RunState, ToolCallState
+from .states import RunPhase, RunState, ToolCallPhase, ToolCallState
 
 
 def reduce_runtime_state(state: RunState, event: RuntimeEvent) -> RunState:
@@ -46,6 +46,8 @@ def reduce_runtime_state(state: RunState, event: RuntimeEvent) -> RunState:
             failure_code = str(event.data.get("errorCode", "model_error"))
         elif stop_reason == "aborted":
             failure_code = "cancelled"
+        elif stop_reason == "length":
+            failure_code = "model_output_truncated"
         return replace(base, phase="running", failure_code=failure_code)
     if event.type == "model_retry_scheduled":
         return replace(
@@ -105,18 +107,22 @@ def reduce_runtime_state(state: RunState, event: RuntimeEvent) -> RunState:
         success = event.data.get("success") is True
         error_code = None if success else str(event.data.get("errorCode", "tool_error"))
         if success:
-            phase = "succeeded"
+            tool_phase: ToolCallPhase = "succeeded"
         elif error_code == "tool_timeout":
-            phase = "timed_out"
+            tool_phase = "timed_out"
         elif error_code == "tool_cancelled":
-            phase = "cancelled"
+            tool_phase = "cancelled"
         elif error_code == "outcome_unknown":
-            phase = "outcome_unknown"
+            tool_phase = "outcome_unknown"
         else:
-            phase = "failed"
+            tool_phase = "failed"
         tools = {
             **state.tools,
-            tool_call_id: replace(current, phase=phase, error_code=error_code),
+            tool_call_id: replace(
+                current,
+                phase=tool_phase,
+                error_code=error_code,
+            ),
         }
         active = any(not tool.terminal for tool in tools.values())
         return replace(base, phase="executing_tools" if active else "running", tools=tools)
@@ -144,17 +150,19 @@ def reduce_runtime_state(state: RunState, event: RuntimeEvent) -> RunState:
     if event.type == "run_finished":
         outcome = event.data.get("outcome")
         if outcome == "completed" and base.failure_code is None:
-            phase = "completed"
+            run_phase: RunPhase = "completed"
         elif outcome == "cancelled" or base.failure_code == "cancelled":
-            phase = "cancelled"
+            run_phase = "cancelled"
         else:
-            phase = "failed"
-        if phase == "completed" and any(not tool.terminal for tool in state.tools.values()):
+            run_phase = "failed"
+        if run_phase == "completed" and any(
+            not tool.terminal for tool in state.tools.values()
+        ):
             raise RuntimeInvariantError(
                 "unfinished_tools_at_completion",
                 "Run 完成时仍存在未结束 Tool Call",
             )
-        return replace(base, phase=phase)
+        return replace(base, phase=run_phase)
 
     raise RuntimeInvariantError("unknown_runtime_event", f"未知 Runtime Event：{event.type}")
 
@@ -163,7 +171,7 @@ def _update_tool(
     state: RunState,
     event: RuntimeEvent,
     *,
-    phase: Any,
+    phase: ToolCallPhase,
     retry_attempt: int | None = None,
 ) -> RunState:
     tool_call_id = _required_text(event.data, "toolCallId")

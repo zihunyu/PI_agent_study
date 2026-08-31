@@ -11,15 +11,24 @@ from ..runtime.events import RuntimeEvent
 from .journal import (
     JournalConflictError,
     JournalDeadlineExceeded,
+    JournalFencedClaimLostError,
     JournalPrincipal,
     SQLiteSessionEventJournal,
     SessionEventSpec,
 )
 from .operation_events import OperationEvent
 from .operation_store import (
+    ClaimLease,
     OperationEventSpec,
     OperationStoreConflictError,
     OperationStoreDeadlineExceeded,
+    OperationStoreFencedClaimLostError,
+    validate_fenced_claim_scope,
+)
+from .store import (
+    RuntimeStoreConflictError,
+    RuntimeStoreFencedClaimLostError,
+    validate_runtime_fenced_claim_scope,
 )
 
 _RETRY_TERMINAL_EVENTS = frozenset(
@@ -36,6 +45,7 @@ class SessionJournalOperationEventStore:
     """让现有 Approval/Write/Recovery 直接使用统一加密 Journal。"""
 
     supports_atomic_transactions = True
+    supports_cross_process_claims = True
 
     def __init__(
         self,
@@ -87,6 +97,60 @@ class SessionJournalOperationEventStore:
             )
         except JournalDeadlineExceeded as error:
             raise OperationStoreDeadlineExceeded(str(error)) from error
+        except JournalConflictError as error:
+            raise OperationStoreConflictError(str(error)) from error
+        return [
+            OperationEvent(
+                type=event.event_type,
+                session_id=event.session_id,
+                operation_id=event.operation_id or operation_id,
+                sequence=event.sequence,
+                timestamp=event.timestamp,
+                data=event.payload,
+            )
+            for event in appended
+        ]
+
+    async def append_batch_if_fenced_claim(
+        self,
+        session_id: str,
+        operation_id: str,
+        events: list[OperationEventSpec],
+        lease: ClaimLease,
+        *,
+        renew_lease_seconds: float,
+        expected_last_sequence: int | None = None,
+        deadline_ms: int | None = None,
+        expected_claim_entity_id: str | None = None,
+    ) -> list[OperationEvent]:
+        validate_fenced_claim_scope(
+            lease,
+            session_id=session_id,
+            operation_id=operation_id,
+            expected_entity_id=expected_claim_entity_id,
+        )
+        try:
+            appended = await self.journal.append_events_if_fenced_claim(
+                self.principal,
+                [
+                    SessionEventSpec(
+                        "operation",
+                        event_type,
+                        session_id,
+                        dict(data),
+                        operation_id=operation_id,
+                    )
+                    for event_type, data in events
+                ],
+                lease,
+                renew_lease_seconds=renew_lease_seconds,
+                expected_last_sequence=expected_last_sequence,
+                deadline_ms=deadline_ms,
+            )
+        except JournalDeadlineExceeded as error:
+            raise OperationStoreDeadlineExceeded(str(error)) from error
+        except JournalFencedClaimLostError as error:
+            raise OperationStoreFencedClaimLostError(str(error)) from error
         except JournalConflictError as error:
             raise OperationStoreConflictError(str(error)) from error
         return [
@@ -154,9 +218,45 @@ class SessionJournalOperationEventStore:
             owner_token,
         )
 
+    async def acquire_fenced_claim(
+        self,
+        claim_type: str,
+        resource_id: str,
+        owner_token: str,
+        *,
+        lease_seconds: float = 300,
+    ) -> ClaimLease | None:
+        return await self.journal.acquire_fenced_claim(
+            self.principal,
+            claim_type,
+            resource_id,
+            owner_token,
+            lease_seconds=lease_seconds,
+        )
+
+    async def renew_fenced_claim(
+        self,
+        lease: ClaimLease,
+        *,
+        lease_seconds: float = 300,
+    ) -> bool:
+        return await self.journal.renew_fenced_claim(
+            self.principal,
+            lease,
+            lease_seconds=lease_seconds,
+        )
+
+    async def verify_fenced_claim(self, lease: ClaimLease) -> bool:
+        return await self.journal.verify_fenced_claim(self.principal, lease)
+
+    async def release_fenced_claim(self, lease: ClaimLease) -> None:
+        await self.journal.release_fenced_claim(self.principal, lease)
+
 
 class SessionJournalRuntimeEventStore:
     """兼容 RuntimeStateTracker/RuntimeRecoveryManager 的统一 Journal 视图。"""
+
+    supports_fenced_runtime_append = True
 
     def __init__(
         self,
@@ -172,30 +272,64 @@ class SessionJournalRuntimeEventStore:
         self.session_id = session_id
 
     async def append(self, event: RuntimeEvent) -> None:
+        events = await self.load()
+        expected = events[-1].sequence if events else -1
+        await self.append_cas(event, expected_last_sequence=expected)
+
+    async def append_cas(
+        self,
+        event: RuntimeEvent,
+        *,
+        expected_last_sequence: int,
+    ) -> None:
+        rows = await self._load_rows()
+        current = rows[-1].source_sequence if rows else -1
+        if current != expected_last_sequence or event.sequence != current + 1:
+            raise RuntimeStoreConflictError(
+                f"Runtime Version 冲突：expected={expected_last_sequence}, actual={current}"
+            )
         try:
             await self.journal.append_events(
                 self.principal,
-                [
-                    SessionEventSpec(
-                        "runtime",
-                        event.type,
-                        self.session_id,
-                        dict(event.data),
-                        run_id=event.run_id,
-                        source_sequence=event.sequence,
-                        timestamp=event.timestamp,
-                    )
-                ],
+                [self._spec(event)],
+                expected_last_sequence=(rows[-1].sequence if rows else -1),
             )
         except JournalConflictError as error:
-            raise ValueError(str(error)) from error
+            raise RuntimeStoreConflictError(str(error)) from error
+
+    async def append_cas_if_fenced_claim(
+        self,
+        event: RuntimeEvent,
+        lease: ClaimLease,
+        *,
+        renew_lease_seconds: float,
+        expected_last_sequence: int,
+    ) -> None:
+        validate_runtime_fenced_claim_scope(
+            lease,
+            session_id=self.session_id,
+        )
+        rows = await self._load_rows()
+        current = rows[-1].source_sequence if rows else -1
+        if current != expected_last_sequence or event.sequence != current + 1:
+            raise RuntimeStoreConflictError(
+                f"Runtime Version 冲突：expected={expected_last_sequence}, actual={current}"
+            )
+        try:
+            await self.journal.append_events_if_fenced_claim(
+                self.principal,
+                [self._spec(event)],
+                lease,
+                renew_lease_seconds=renew_lease_seconds,
+                expected_last_sequence=(rows[-1].sequence if rows else -1),
+            )
+        except JournalFencedClaimLostError as error:
+            raise RuntimeStoreFencedClaimLostError(str(error)) from error
+        except JournalConflictError as error:
+            raise RuntimeStoreConflictError(str(error)) from error
 
     async def load(self) -> list[RuntimeEvent]:
-        events = await self.journal.load_events(
-            self.principal,
-            session_id=self.session_id,
-            journal_kind="runtime",
-        )
+        events = await self._load_rows()
         return [
             RuntimeEvent(
                 type=event.event_type,  # type: ignore[arg-type]
@@ -210,6 +344,24 @@ class SessionJournalRuntimeEventStore:
             )
             for event in events
         ]
+
+    async def _load_rows(self):
+        return await self.journal.load_events(
+            self.principal,
+            session_id=self.session_id,
+            journal_kind="runtime",
+        )
+
+    def _spec(self, event: RuntimeEvent) -> SessionEventSpec:
+        return SessionEventSpec(
+            "runtime",
+            event.type,
+            self.session_id,
+            dict(event.data),
+            run_id=event.run_id,
+            source_sequence=event.sequence,
+            timestamp=event.timestamp,
+        )
 
 
 class SessionJournalRetryEventStore:

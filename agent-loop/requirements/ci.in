@@ -1,0 +1,30 @@
+# Runtime dependencies exercised by CI.
+cryptography==50.0.1
+httpx==0.28.1
+
+# Test and quality gates. pytest 9.0.3 is the first release carrying the fix
+# for PYSEC-2026-1845, so CI intentionally requires that security baseline.
+coverage[toml]==7.16.0
+mypy==1.20.2
+pytest==9.0.3
+pytest-asyncio==1.4.0
+ruff==0.15.22
+
+# Reproducible build and supply-chain tooling.
+build==1.6.0
+cyclonedx-bom==7.3.1
+pip==26.2.1
+pip-audit==2.10.1
+pip-licenses==5.5.5
+pip-tools==7.6.1
+setuptools==84.0.0
+twine==7.0.0
+wheel==0.48.0
+
+# Cross-platform closure for conditional keyring dependencies. pip-compile
+# resolves markers for its host, so these are explicit to keep one lock valid
+# for Python 3.11-3.13 on Linux and Python 3.12 on Windows.
+importlib-metadata==9.0.1
+jeepney==0.9.0
+secretstorage==3.5.0
+zipp==4.1.0

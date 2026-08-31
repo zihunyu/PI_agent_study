@@ -91,7 +91,8 @@ class ParallelCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(slow_completed.is_set())
         self.assertTrue(agent.listener_errors)
-        self.assertIn("primary-listener-error", agent.listener_errors[0])
+        self.assertIn("[RuntimeError]", agent.listener_errors[0])
+        self.assertNotIn("primary-listener-error", agent.listener_errors[0])
         self.assertEqual(_live_tool_tasks(), [])
 
     async def test_update_listener_异常后仍然_detach_子令牌(self) -> None:
@@ -127,7 +128,7 @@ class ParallelCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(captured_token)
         self.assertEqual(captured_token.child_count, 0)
-        self.assertEqual(agent.state.error_message, "update-listener-error")
+        self.assertEqual(agent.state.error_message, "Agent 运行失败")
         self.assertEqual(_live_tool_tasks(), [])
 
     async def test_tool_end_listener异常不会触发虚假的兄弟取消清理(self) -> None:

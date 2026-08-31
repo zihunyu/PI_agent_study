@@ -35,6 +35,3 @@ Thumbs.db
 *.sqlite3-wal
 *.sqlite3-shm
 **/.agent-journal.key
-
-# 本地订单业务演示不提交到代码仓库。
-/test_demo/

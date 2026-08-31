@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import os
 import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from collections.abc import Awaitable, Callable
+from typing import Any, Literal, TypeAlias
 
 from ..retry.events import JsonlRetryEventStore
 from ..session import (
     JournalKeyProvider,
     JournalPrincipal,
-    JsonlOperationEventStore,
-    JsonlRuntimeEventStore,
     OperationEventStore,
     SessionJournalOperationEventStore,
     SessionJournalRetryEventStore,
@@ -54,6 +54,9 @@ class DurableHostResources:
         root.mkdir(parents=True, exist_ok=True)
         journal: SQLiteSessionEventJournal | None = None
         principal: JournalPrincipal | None = None
+        runtime_store: Any
+        operation_store: OperationEventStore
+        retry_store: Any
         if store_backend == "journal":
             provider = journal_key_provider or local_journal_key_provider(root)
             principal = journal_principal or JournalPrincipal.system(tenant_id)
@@ -66,23 +69,31 @@ class DurableHostResources:
                 principal,
                 session_id=session_id,
             )
-            operation_store: OperationEventStore = (
+            operation_store = (
                 SessionJournalOperationEventStore(journal, principal)
             )
-            retry_store: Any = SessionJournalRetryEventStore(
+            retry_store = SessionJournalRetryEventStore(
                 journal,
                 principal,
                 session_id=session_id,
             )
         elif store_backend == "sqlite":
             path = root / "agent-state.sqlite3"
-            runtime_store = SQLiteRuntimeEventStore(path)
-            operation_store: OperationEventStore = SQLiteOperationEventStore(path)
-            retry_store = JsonlRetryEventStore(root / "retry-events.jsonl")
+            runtime_store = SQLiteRuntimeEventStore(
+                path,
+                session_id=session_id,
+            )
+            operation_store = SQLiteOperationEventStore(path)
+            retry_key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+            retry_store = JsonlRetryEventStore(
+                root / "legacy-sqlite-retry" / f"{retry_key}.jsonl"
+            )
         elif store_backend == "jsonl":
-            runtime_store = JsonlRuntimeEventStore(root / "runtime-events.jsonl")
-            operation_store = JsonlOperationEventStore(root / "operation-events.jsonl")
-            retry_store = JsonlRetryEventStore(root / "retry-events.jsonl")
+            raise ValueError(
+                "DurableAgentHost 不支持 JSONL Backend：JSONL 仅保留为底层"
+                "单进程/离线迁移兼容 Store；请使用 journal、sqlite 或注入"
+                "支持事务 Claim 的 resource_factory"
+            )
         else:
             raise ValueError(f"不支持的 Store Backend：{store_backend}")
         return cls(
@@ -100,6 +111,13 @@ class DurableHostResources:
         ):
             self.owned_resources.append(resource)
         return resource
+
+    def disown(self, resource: Any) -> None:
+        """Remove one caller-owned resource from Host lifecycle management."""
+
+        self.owned_resources[:] = [
+            item for item in self.owned_resources if item is not resource
+        ]
 
     async def close(self) -> None:
         errors: list[BaseException] = []
@@ -122,6 +140,23 @@ class DurableHostResources:
         self.owned_resources[:] = list(reversed(failed))
         if errors:
             raise BaseExceptionGroup("关闭 Durable Host 资源失败", errors)
+
+
+@dataclass(frozen=True, slots=True)
+class DurableResourceRequest:
+    """外部 Store Adapter 创建一组 Host 资源时收到的稳定参数。"""
+
+    state_dir: Path
+    session_id: str
+    tenant_id: str
+    journal_key_provider: JournalKeyProvider | None = None
+    journal_principal: JournalPrincipal | None = None
+
+
+DurableHostResourceFactory: TypeAlias = Callable[
+    [DurableResourceRequest],
+    DurableHostResources | Awaitable[DurableHostResources],
+]
 
 
 def local_journal_key_provider(root: str | Path) -> StaticJournalKeyProvider:
@@ -167,4 +202,9 @@ def local_journal_key_provider(root: str | Path) -> StaticJournalKeyProvider:
     )
 
 
-__all__ = ["DurableHostResources", "local_journal_key_provider"]
+__all__ = [
+    "DurableHostResourceFactory",
+    "DurableHostResources",
+    "DurableResourceRequest",
+    "local_journal_key_provider",
+]

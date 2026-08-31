@@ -15,7 +15,12 @@ from ..cancellation import (
     OperationCancelledError,
 )
 from ..event_stream import AssistantMessageEventStream
-from ..messages import assistant_message
+from ..messages import assistant_message, public_error_message
+from ..model_attempts import (
+    ModelAttemptBudgetExceeded,
+    current_model_attempt_admission_scope,
+    model_attempt_usage,
+)
 from ..types import Model, StreamFn
 from .backoff import cancellable_sleep, retry_delay_seconds
 from .circuit_breaker import CircuitBreaker, CircuitOpenError
@@ -74,6 +79,7 @@ class RetryingStreamFn:
         random: Callable[[], float] | None = None,
         event_store: RetryEventStore | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        physical_attempt_admission: bool = False,
     ) -> None:
         self.stream_fn = stream_fn
         self.policy = policy
@@ -82,6 +88,9 @@ class RetryingStreamFn:
         self.circuit_breaker = circuit_breaker or CircuitBreaker(
             policy.circuit_breaker
         )
+        if type(physical_attempt_admission) is not bool:
+            raise TypeError("physical_attempt_admission must be a bool")
+        self.physical_attempt_admission = physical_attempt_admission
 
     def __call__(
         self,
@@ -89,7 +98,7 @@ class RetryingStreamFn:
         context: dict[str, Any],
         options: dict[str, Any],
     ) -> Any:
-        if not self.policy.enabled:
+        if not self.policy.enabled and not self.physical_attempt_admission:
             return self.stream_fn(model, context, options)
         output = ProducerOwnedAssistantMessageEventStream()
         task = asyncio.create_task(
@@ -123,7 +132,10 @@ class RetryingStreamFn:
                     final = assistant_message(
                         model=model,
                         stop_reason="error",
-                        error_message=str(error),
+                        error_message=public_error_message(
+                            error,
+                            fallback="Model provider circuit is open",
+                        ),
                     )
                     final["providerError"] = {
                         "code": "provider_circuit_open",
@@ -196,7 +208,10 @@ class RetryingStreamFn:
                             aborted = assistant_message(
                                 model=model,
                                 stop_reason="aborted",
-                                error_message=str(error),
+                                error_message=public_error_message(
+                                    error,
+                                    fallback="Model retry was cancelled",
+                                ),
                             )
                             output.push(
                                 {
@@ -248,26 +263,68 @@ class RetryingStreamFn:
         context: dict[str, Any],
         options: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        value = self.stream_fn(model, context, options)
-        stream = (
-            await cast(Awaitable[Any], value)
-            if inspect.isawaitable(value)
-            else value
+        scope = (
+            current_model_attempt_admission_scope()
+            if self.physical_attempt_admission
+            else None
         )
-        if not hasattr(stream, "__aiter__") or not hasattr(stream, "result"):
-            raise TypeError("RetryingStreamFn 收到不符合契约的事件流")
+        identity = None
+        if scope is not None:
+            try:
+                identity = await scope.begin_attempt()
+            except ModelAttemptBudgetExceeded as error:
+                final = _model_attempt_budget_error(model, scope, error)
+                return [{"type": "error", "reason": "error", "error": final}], final
+        stream: Any = None
         events: list[dict[str, Any]] = []
         completed = False
+        settled = False
         try:
+            value = self.stream_fn(model, context, options)
+            stream = (
+                await cast(Awaitable[Any], value)
+                if inspect.isawaitable(value)
+                else value
+            )
+            if not hasattr(stream, "__aiter__") or not hasattr(stream, "result"):
+                raise TypeError("RetryingStreamFn 收到不符合契约的事件流")
             async for event in stream:
                 events.append(event)
             final = await stream.result()
+            if identity is not None and scope is not None:
+                metered_final = final
+                usage_transform = options.get("_model_attempt_usage_transform")
+                if callable(usage_transform):
+                    transformed = usage_transform(final)
+                    if not isinstance(transformed, dict):
+                        raise TypeError(
+                            "_model_attempt_usage_transform must return a dict"
+                        )
+                    metered_final = transformed
+                tokens, cost = model_attempt_usage(metered_final)
+                try:
+                    await scope.finish_attempt(identity, tokens=tokens, cost=cost)
+                    settled = True
+                except ModelAttemptBudgetExceeded as error:
+                    settled = True
+                    final = _model_attempt_budget_error(model, scope, error)
+                    return [
+                        {"type": "error", "reason": "error", "error": final}
+                    ], final
             if not events or events[-1].get("type") not in {"done", "error"}:
                 raise RuntimeError("模型 Attempt 没有产生终止事件")
             completed = True
             return events, final
+        except BaseException:
+            if identity is not None and scope is not None and not settled:
+                try:
+                    await scope.finish_attempt(identity, usage_unknown=True)
+                except BaseException:
+                    pass
+            raise
         finally:
-            await settle_stream_producer(stream, cancel=not completed)
+            if stream is not None:
+                await settle_stream_producer(stream, cancel=not completed)
 
     async def _emit_retry_event(
         self,
@@ -292,6 +349,7 @@ def retry_model_stream(
     random: Callable[[], float] | None = None,
     event_store: RetryEventStore | None = None,
     circuit_breaker: CircuitBreaker | None = None,
+    physical_attempt_admission: bool = False,
 ) -> StreamFn:
     """函数式工厂，便于注入 Agent 或 Provider。"""
 
@@ -303,5 +361,31 @@ def retry_model_stream(
             random=random,
             event_store=event_store,
             circuit_breaker=circuit_breaker,
+            physical_attempt_admission=physical_attempt_admission,
         ),
     )
+
+
+def _model_attempt_budget_error(model, scope, error):
+    final = assistant_message(
+        model=model,
+        stop_reason="error",
+        error_message="Model Provider attempt was rejected by the hard budget",
+    )
+    final["providerError"] = {
+        "code": ModelAttemptBudgetExceeded.code,
+        "statusCode": None,
+        "retryAfterMs": None,
+        "retryable": False,
+    }
+    final["modelAttemptAdmission"] = {
+        "runId": scope.run_id,
+        "stage": scope.stage,
+        "reservationId": scope.reservation_id,
+        "reason": public_error_message(
+            error,
+            fallback="Model provider attempt was rejected by the hard budget",
+        ),
+        "errorType": type(error).__name__,
+    }
+    return final

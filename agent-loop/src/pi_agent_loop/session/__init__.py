@@ -22,6 +22,7 @@ from .journal import (
     JournalConflictError,
     JournalCorruptionError,
     JournalDeadlineExceeded,
+    JournalFencedClaimLostError,
     JournalEncryptionKey,
     JournalKeyProvider,
     JournalPrincipal,
@@ -61,15 +62,21 @@ from .operation_state import (
     replay_operation,
 )
 from .operation_store import (
+    ClaimLease,
     InMemoryOperationEventStore,
     JsonlOperationEventStore,
     OperationEventStore,
     OperationStoreConflictError,
     OperationStoreDeadlineExceeded,
 )
-from .sqlite import SQLiteOperationEventStore, SQLiteRuntimeEventStore
+from .sqlite import (
+    SQLiteOperationEventStore,
+    SQLiteRuntimeEventStore,
+    SQLiteRuntimeStoreMigrationRequiredError,
+    migrate_legacy_sqlite_runtime_events,
+)
 from .recorder import DurableOperationRecorder
-from .recovery import RuntimeRecoveryManager
+from .recovery import RuntimeRecoveryClaimError, RuntimeRecoveryManager
 from .resume import (
     DurableSessionRecovery,
     OperationRecoveryPlan,
@@ -78,13 +85,18 @@ from .resume import (
     RecoveryExecutionResult,
 )
 from .replay import replay_runtime_events
-from .store import InMemoryRuntimeEventStore, RuntimeEventStore
+from .store import (
+    InMemoryRuntimeEventStore,
+    RuntimeEventStore,
+    RuntimeStoreConflictError,
+)
 
 __all__ = [
     "DurableOperationRecorder",
     "DurableSessionRecovery",
     "ConversationSession",
     "ConversationSessionNotFoundError",
+    "ClaimLease",
     "InMemoryOperationEventStore",
     "InMemoryRuntimeEventStore",
     "ApprovalSnapshot",
@@ -95,6 +107,7 @@ __all__ = [
     "JournalConflictError",
     "JournalCorruptionError",
     "JournalDeadlineExceeded",
+    "JournalFencedClaimLostError",
     "JournalEncryptionKey",
     "JournalKeyProvider",
     "JournalMigrationError",
@@ -117,7 +130,9 @@ __all__ = [
     "RecoveryCallbacks",
     "RecoveryExecutionResult",
     "RuntimeEventStore",
+    "RuntimeRecoveryClaimError",
     "RuntimeRecoveryManager",
+    "RuntimeStoreConflictError",
     "SessionConfigurationMismatchError",
     "SessionContext",
     "SessionContextProjection",
@@ -132,6 +147,7 @@ __all__ = [
     "SQLiteSessionEventJournal",
     "SQLiteOperationEventStore",
     "SQLiteRuntimeEventStore",
+    "SQLiteRuntimeStoreMigrationRequiredError",
     "ToolInvocationState",
     "StateMigrationRegistry",
     "StaticJournalKeyProvider",
@@ -141,6 +157,7 @@ __all__ = [
     "WorkspaceProject",
     "WorkspaceSessionCatalog",
     "import_legacy_jsonl_conversation",
+    "migrate_legacy_sqlite_runtime_events",
     "reduce_operation_event",
     "replay_operation",
     "replay_runtime_events",

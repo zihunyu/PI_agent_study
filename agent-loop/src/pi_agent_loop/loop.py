@@ -17,7 +17,7 @@ import asyncio
 import copy
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 from uuid import uuid4
 
@@ -30,7 +30,11 @@ from .event_stream import (
     AssistantMessageEventStream,
 )
 from .messages import clone_message, error_tool_result, now_ms
-from .model_policy import capture_model_request_policy
+from .model_policy import (
+    ModelRequestPolicyError,
+    capture_model_request_policy,
+    validate_model_response_policy,
+)
 from .retry.errors import OutcomeUnknownToolError, RetryableToolError
 from .retry.tool import execute_tool_with_retry
 from .transcript import (
@@ -38,7 +42,7 @@ from .transcript import (
     sanitize_terminal_assistant_tool_calls,
     validate_closed_tool_call_transcript,
 )
-from .tool_runtime import ToolDispatchRuntime
+from .tool_runtime import ToolAttemptAdmissionDenied, ToolDispatchRuntime
 from .types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -85,6 +89,31 @@ class _RunBudgetState:
 
     turns_used: int = 0
     tool_calls_used: int = 0
+    tool_budget_exceeded: bool = False
+    _tool_attempt_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        repr=False,
+    )
+
+    async def try_consume_retry_attempt(
+        self,
+        limit: int,
+    ) -> tuple[bool, int, bool]:
+        """Atomically charge one retry attempt across parallel Tool Calls.
+
+        Returns ``(admitted, used, first_denial)``. Once one retry observes an
+        exhausted budget, every later retry is denied so no handler can slip
+        through while the current parallel batch is finishing.
+        """
+
+        async with self._tool_attempt_lock:
+            if self.tool_budget_exceeded:
+                return False, self.tool_calls_used, False
+            if self.tool_calls_used >= limit:
+                self.tool_budget_exceeded = True
+                return False, self.tool_calls_used, True
+            self.tool_calls_used += 1
+            return True, self.tool_calls_used, False
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -96,9 +125,9 @@ async def _maybe_await(value: Any) -> Any:
 
 
 async def _emit(sink: EventSink, event: AgentEvent) -> None:
-    """发出事件，并等待可能存在的异步 listener。"""
+    """向观察者发送隔离快照，永不接收 Observer 回写。"""
 
-    await _maybe_await(sink(event))
+    await _maybe_await(sink(copy.deepcopy(event)))
 
 
 async def _emit_transcript_repairs(
@@ -148,6 +177,118 @@ def _assistant_tool_calls(message: AgentMessage) -> list[dict]:
         for block in content
         if isinstance(block, dict) and block.get("type") == "toolCall"
     ]
+
+
+def _prior_tool_call_ids(messages: list[AgentMessage]) -> set[str]:
+    """收集已提交历史中的 Tool Call ID，保证整个 Session 内唯一。"""
+
+    identifiers: set[str] = set()
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        for call in _assistant_tool_calls(message):
+            value = call.get("id")
+            if isinstance(value, str) and value.strip():
+                identifiers.add(value.strip())
+    return identifiers
+
+
+def _preflight_assistant_tool_batch(
+    prior_messages: list[AgentMessage],
+    message: AgentMessage,
+    context: AgentContext,
+    config: AgentLoopConfig,
+) -> None:
+    """在 Assistant Message 提交前完成整批纯校验。
+
+    失败只给消息加上受信的批次拒绝标记，实际 Tool Runtime 随后会为整批
+    生成 Synthetic ToolResult。畸形/重复 ID 会先替换成内部唯一 ID，以便
+    被拒绝的每个调用仍能形成合法、一一对应的 Transcript Closure。
+    """
+
+    message.pop("toolCallBatchError", None)
+    tool_calls = _assistant_tool_calls(message)
+    if not tool_calls:
+        return
+
+    errors: list[str] = []
+    prior_ids = _prior_tool_call_ids(prior_messages)
+    current_ids: set[str] = set()
+    rewritten: list[dict[str, Any]] = []
+    for index, tool_call in enumerate(tool_calls):
+        raw_id = tool_call.get("id")
+        normalized = raw_id.strip() if isinstance(raw_id, str) else ""
+        reason: str | None = None
+        if not normalized:
+            reason = "ID 为空或不是字符串"
+        elif normalized in prior_ids:
+            reason = "ID 已在当前 Session 历史中使用"
+        elif normalized in current_ids:
+            reason = "ID 在当前 Assistant 批次中重复"
+        if reason is not None:
+            replacement = f"rejected-tool-call-{uuid4()}"
+            tool_call["id"] = replacement
+            current_ids.add(replacement)
+            rewritten.append(
+                {
+                    "index": index,
+                    "originalId": raw_id if isinstance(raw_id, str) else None,
+                    "replacementId": replacement,
+                    "reason": reason,
+                }
+            )
+            errors.append(f"第 {index + 1} 个 Tool Call {reason}")
+        else:
+            # 去掉只由空白造成的歧义，持久化稳定 ID。
+            tool_call["id"] = normalized
+            current_ids.add(normalized)
+
+    # length 响应会走专门的整批截断拒绝；这里只规范 ID 以保证结果闭合。
+    if message.get("stopReason") != "length":
+        tool_by_name: dict[str, AgentTool] = {}
+        for tool in context.tools:
+            if tool.name in tool_by_name:
+                errors.append(f"Runtime 注册了重复工具名：{tool.name}")
+            tool_by_name[tool.name] = tool
+
+        try:
+            policy = capture_model_request_policy(
+                [tool.name for tool in context.tools],
+                config.stream_options,
+            )
+            validate_model_response_policy(message, policy)
+        except ModelRequestPolicyError:
+            errors.append(
+                "当前模型请求策略拒绝该批调用 [ModelRequestPolicyError]"
+            )
+        except Exception as error:
+            errors.append(
+                "当前模型请求策略验证失败 "
+                f"[{type(error).__name__}]"
+            )
+
+        for index, tool_call in enumerate(tool_calls):
+            raw_name = tool_call.get("name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                errors.append(f"第 {index + 1} 个 Tool Call 的工具名无效")
+                continue
+            if raw_name not in tool_by_name:
+                errors.append(
+                    f"第 {index + 1} 个 Tool Call 工具不存在：{raw_name}"
+                )
+                continue
+            raw_arguments = tool_call.get("arguments")
+            if not isinstance(raw_arguments, dict):
+                errors.append(f"第 {index + 1} 个 Tool Call 的 arguments 必须是对象")
+            # 业务 prepare/validate 只能在 ToolDispatchRuntime 中运行一次，
+            # 并由那里形成 canonical 参数快照。这里仅做无副作用结构校验。
+
+    if errors:
+        message["toolCallBatchError"] = {
+            "code": "tool_call_batch_rejected",
+            "message": "；".join(errors),
+            "rewrittenIds": rewritten,
+        }
 
 
 def _serialize_tools(tools: list[AgentTool]) -> list[dict[str, Any]]:
@@ -412,6 +553,7 @@ async def _run_loop(
                 stream_fn,
             )
             new_messages.append(message)
+            truncated_response = message.get("stopReason") == "length"
 
             # Provider/模型失败是本次低层 run 的 terminal 状态。
             if message.get("stopReason") in {"error", "aborted"}:
@@ -464,9 +606,11 @@ async def _run_loop(
                             current_context,
                             message,
                             config,
+                            budget,
                             cancellation,
                             emit,
                         )
+                        hard_budget_stop = budget.tool_budget_exceeded
                 tool_results.extend(batch.messages)
                 has_more_tool_calls = not batch.terminate
                 for result_message in tool_results:
@@ -481,6 +625,16 @@ async def _run_loop(
                     "toolResults": tool_results,
                 },
             )
+
+            # length 与 Recovery Runtime 使用同一失败语义。若它携带 Tool
+            # Call，上方已逐个生成 Synthetic ToolResult 保持 Transcript
+            # Closure；无论是否携带工具，都不能进入 hook、follow-up 或下一轮。
+            if truncated_response:
+                await _emit(
+                    emit,
+                    {"type": "agent_end", "messages": list(new_messages)},
+                )
+                return
 
             # Tool Call 硬预算超限时，错误结果已完整记录；现在直接结束，
             # 不再调用 prepareNextTurn，也不让队列消息绕过本次预算。
@@ -597,6 +751,17 @@ async def _stream_assistant_response(
             config.transform_context(messages, cancellation)
         )
         messages = list(transformed)
+    if config.inspect_model_input is not None:
+        inspected = await _maybe_await(
+            config.inspect_model_input(copy.deepcopy(messages), cancellation)
+        )
+        if not isinstance(inspected, list) or any(
+            not isinstance(message, dict) for message in inspected
+        ):
+            raise TypeError(
+                "inspect_model_input 必须返回 AgentMessage 列表"
+            )
+        messages = copy.deepcopy(inspected)
 
     llm_messages = list(await _maybe_await(config.convert_to_llm(messages)))
     validate_closed_tool_call_transcript(llm_messages)
@@ -623,10 +788,9 @@ async def _stream_assistant_response(
         }
     )
 
-    # The low-level loop owns the request identity.  Durable listeners enrich
-    # this same event with the active operation/run identity before the model
-    # boundary is entered, so the Operation projection and the unified model
-    # event log cannot accidentally allocate unrelated request IDs.
+    # The low-level loop owns the request identity. Durable correlation comes
+    # only from the trusted Agent/Host assembly boundary; event listeners are
+    # observers and cannot forge Session/Operation/Run audit links.
     request_id = str(uuid4())
     request_event: AgentEvent = {
         "type": "model_request_start",
@@ -636,6 +800,21 @@ async def _stream_assistant_response(
             config.stream_options,
         ).to_dict(),
     }
+    if config.durable_metadata_provider is not None:
+        supplied_metadata = await _maybe_await(config.durable_metadata_provider())
+        if not isinstance(supplied_metadata, dict):
+            raise TypeError("durable_metadata_provider 必须返回 dict")
+        allowed_metadata = {"sessionId", "operationId", "runId"}
+        unexpected = set(supplied_metadata) - allowed_metadata
+        if unexpected:
+            raise ValueError(
+                "durable_metadata_provider 返回了不支持的字段: "
+                + ", ".join(sorted(str(name) for name in unexpected))
+            )
+        for name, value in supplied_metadata.items():
+            if not isinstance(value, str) or not value:
+                raise TypeError(f"durable metadata {name} 必须是非空字符串")
+            request_event[name] = value
     await _emit(emit, request_event)
     options["model_request_id"] = request_id
     bound_metadata = {
@@ -660,20 +839,25 @@ async def _stream_assistant_response(
 
     partial_message: AgentMessage | None = None
     added_partial = False
+    # A terminal output policy cannot make already-published deltas safe.  When
+    # one is configured, keep Provider partials private until the complete
+    # message has passed the policy and Tool Call structural preflight.
+    buffer_uninspected_output = config.inspect_model_output is not None
 
     async for event in response:
         event_type = event.get("type")
         if event_type == "start":
             partial_message = event["partial"]
-            context.messages.append(partial_message)
-            added_partial = True
-            await _emit(
-                emit,
-                {
-                    "type": "message_start",
-                    "message": clone_message(partial_message),
-                },
-            )
+            if not buffer_uninspected_output:
+                context.messages.append(partial_message)
+                added_partial = True
+                await _emit(
+                    emit,
+                    {
+                        "type": "message_start",
+                        "message": clone_message(partial_message),
+                    },
+                )
         elif event_type in _MODEL_RETRY_EVENT_TYPES:
             # Retry 实现在 StreamFn/Host；低层循环只把结构化事件转发给 UI。
             await _emit(emit, dict(event))
@@ -681,18 +865,34 @@ async def _stream_assistant_response(
             if partial_message is None:
                 continue
             partial_message = event["partial"]
-            context.messages[-1] = partial_message
-            await _emit(
-                emit,
-                {
-                    "type": "message_update",
-                    "message": clone_message(partial_message),
-                    "assistantMessageEvent": event,
-                },
-            )
+            if not buffer_uninspected_output:
+                context.messages[-1] = partial_message
+                await _emit(
+                    emit,
+                    {
+                        "type": "message_update",
+                        "message": clone_message(partial_message),
+                        "assistantMessageEvent": event,
+                    },
+                )
         elif event_type in {"done", "error"}:
             final_message = sanitize_terminal_assistant_tool_calls(
                 await response.result()
+            )
+            final_message = await _inspect_terminal_model_output(
+                final_message,
+                config,
+                cancellation,
+            )
+            _mark_truncated_model_response(final_message)
+            prior_messages = (
+                context.messages[:-1] if added_partial else context.messages
+            )
+            _preflight_assistant_tool_batch(
+                list(prior_messages),
+                final_message,
+                context,
+                config,
             )
             if added_partial:
                 context.messages[-1] = final_message
@@ -720,6 +920,19 @@ async def _stream_assistant_response(
     final_message = sanitize_terminal_assistant_tool_calls(
         await response.result()
     )
+    final_message = await _inspect_terminal_model_output(
+        final_message,
+        config,
+        cancellation,
+    )
+    _mark_truncated_model_response(final_message)
+    prior_messages = context.messages[:-1] if added_partial else context.messages
+    _preflight_assistant_tool_batch(
+        list(prior_messages),
+        final_message,
+        context,
+        config,
+    )
     if added_partial:
         context.messages[-1] = final_message
     else:
@@ -738,6 +951,38 @@ async def _stream_assistant_response(
         },
     )
     return final_message
+
+
+async def _inspect_terminal_model_output(
+    message: AgentMessage,
+    config: AgentLoopConfig,
+    cancellation: CancellationToken,
+) -> AgentMessage:
+    """Apply the trusted output guard before Tool Call preflight/dispatch."""
+
+    if config.inspect_model_output is None:
+        return message
+    inspected = await _maybe_await(
+        config.inspect_model_output(copy.deepcopy(message), cancellation)
+    )
+    if not isinstance(inspected, dict) or inspected.get("role") != "assistant":
+        raise TypeError(
+            "inspect_model_output 必须返回 Assistant Message"
+        )
+    if not isinstance(inspected.get("content"), list):
+        raise TypeError("inspect_model_output 返回的 content 必须是列表")
+    # A rewriting policy is trusted but still cannot bypass the terminal Tool
+    # Call structural sanitizer.
+    return sanitize_terminal_assistant_tool_calls(copy.deepcopy(inspected))
+
+
+def _mark_truncated_model_response(message: AgentMessage) -> None:
+    """把 length 明确标记为不完整结果，供状态与持久化层判定失败。"""
+
+    if message.get("stopReason") == "length":
+        message["errorMessage"] = (
+            "模型响应达到长度上限，结果不完整，已拒绝作为成功响应。"
+        )
 
 
 @dataclass(slots=True)
@@ -855,7 +1100,12 @@ async def _fail_truncated_tool_calls(
             tool_call=tool_call,
             result=error_tool_result(
                 f'工具 "{tool_call.get("name", "")}" 未执行：模型输出达到长度上限，'
-                "参数可能被截断。请使用完整参数重新发起工具调用。"
+                "参数可能被截断。请使用完整参数重新发起工具调用。",
+                terminate=True,
+                details={
+                    "code": "model_output_truncated",
+                    "synthetic": True,
+                },
             ),
             is_error=True,
         )
@@ -863,7 +1113,7 @@ async def _fail_truncated_tool_calls(
         message = _create_tool_result_message(finalized)
         await _emit_tool_result_message(message, emit)
         messages.append(message)
-    return _ExecutedToolBatch(messages=messages, terminate=False)
+    return _ExecutedToolBatch(messages=messages, terminate=True)
 
 
 async def _append_skipped_tool_results(
@@ -899,10 +1149,26 @@ async def _execute_tool_calls(
     context: AgentContext,
     assistant_message: AgentMessage,
     config: AgentLoopConfig,
+    budget: _RunBudgetState,
     cancellation: CancellationToken,
     emit: EventSink,
 ) -> _ExecutedToolBatch:
     tool_calls = _assistant_tool_calls(assistant_message)
+    batch_error = assistant_message.get("toolCallBatchError")
+    if isinstance(batch_error, dict):
+        reason = str(
+            batch_error.get(
+                "message",
+                "Tool Call 批次未通过执行前安全校验。",
+            )
+        )
+        _finalized, messages = await _append_skipped_tool_results(
+            tool_calls,
+            emit,
+            code="tool_call_batch_rejected",
+            reason=f"整批工具均未执行：{reason}",
+        )
+        return _ExecutedToolBatch(messages=messages, terminate=False)
     runtime = config.tool_runtime
     if not isinstance(runtime, ToolDispatchRuntime):
         runtime = ToolDispatchRuntime(
@@ -915,6 +1181,49 @@ async def _execute_tool_calls(
         )
     else:
         runtime.register_tools(context.tools)
+
+    attempt_admission: Callable[[AgentTool, int], Any] | None = None
+    if config.max_tool_calls is not None:
+        limit = config.max_tool_calls
+
+        async def admit_retry_attempt(tool: AgentTool, attempt: int) -> None:
+            # Initial logical calls were charged atomically as a whole batch
+            # before validation/dispatch. Only real retry attempts add usage.
+            if attempt <= 1:
+                return
+            admitted, used, first_denial = await budget.try_consume_retry_attempt(
+                limit
+            )
+            if admitted:
+                return
+            if first_denial:
+                await _emit_budget_exceeded(
+                    emit,
+                    budget="tool_calls",
+                    limit=limit,
+                    used=used,
+                    requested=1,
+                )
+            remaining = max(0, limit - used)
+            raise ToolAttemptAdmissionDenied(
+                error_tool_result(
+                    f"工具 {tool.name} 第 {attempt} 次执行未开始："
+                    f"Tool Call 预算不足。限制 {limit}，已使用 {used}，"
+                    f"本次请求 1，剩余 {remaining}。",
+                    terminate=True,
+                    details={
+                        "code": "tool_call_budget_exceeded",
+                        "limit": limit,
+                        "used": used,
+                        "requested": 1,
+                        "remaining": remaining,
+                        "attempt": attempt,
+                        "toolName": tool.name,
+                    },
+                )
+            )
+
+        attempt_admission = admit_retry_attempt
     batch = await runtime.dispatch_many(
         tool_calls,
         context=context,
@@ -922,9 +1231,14 @@ async def _execute_tool_calls(
         cancellation=cancellation,
         emit=emit,
         execution=config.tool_execution,
+        dispatch_context=config.tool_dispatch_context,
         tenant_id=config.tenant_id,
+        attempt_admission=attempt_admission,
     )
-    return _ExecutedToolBatch(messages=batch.messages, terminate=batch.terminate)
+    return _ExecutedToolBatch(
+        messages=batch.messages,
+        terminate=batch.terminate or budget.tool_budget_exceeded,
+    )
 
 
 async def _execute_tools_sequential(
@@ -1034,7 +1348,7 @@ async def _execute_tools_scheduled(
                 finalized = _FinalizedToolCall(
                     tool_call=tool_call,
                     result=error_tool_result(
-                        str(error),
+                        error,
                         details={"code": "invalid_execution_policy"},
                     ),
                     is_error=True,
@@ -1264,7 +1578,7 @@ async def _prepare_tool_call(
         return _PreparedToolCall(tool_call=tool_call, tool=tool, args=validated_args)
     except Exception as error:
         return _ImmediateToolCall(
-            result=error_tool_result(str(error)),
+            result=error_tool_result(error),
             is_error=True,
         )
 
@@ -1325,11 +1639,16 @@ async def _execute_prepared_tool(
         )
 
     tool_call_id = str(prepared.tool_call.get("id", ""))
+    execute_handler = prepared.tool.execute
     execution_started = asyncio.Event()
     dispatch_attempt = 0
 
     async def dispatch_tool_body() -> AgentToolResult:
         nonlocal dispatch_attempt
+        if execute_handler is None:
+            raise RuntimeError(
+                "仅支持 execute_with_context 的工具必须通过 ToolDispatchRuntime 执行"
+            )
         dispatch_attempt += 1
         await _emit(
             emit,
@@ -1340,7 +1659,7 @@ async def _execute_prepared_tool(
                 "attempt": dispatch_attempt,
             },
         )
-        return await prepared.tool.execute(
+        return await execute_handler(
             tool_call_id,
             prepared.args,
             tool_cancellation,
@@ -1441,7 +1760,7 @@ async def _execute_prepared_tool(
                 is_error = True
             except OutcomeUnknownToolError as error:
                 result = error_tool_result(
-                    str(error),
+                    error,
                     details={
                         "code": "outcome_unknown",
                         "operationId": error.operation_id,
@@ -1452,7 +1771,7 @@ async def _execute_prepared_tool(
                 is_error = True
             except RetryableToolError as error:
                 result = error_tool_result(
-                    str(error),
+                    error,
                     details={
                         "code": error.code,
                         "retryable": True,
@@ -1467,7 +1786,7 @@ async def _execute_prepared_tool(
                 is_error = True
             except Exception as error:
                 result = error_tool_result(
-                    str(error),
+                    error,
                     details={"code": "tool_execution_error"},
                 )
                 is_error = True
@@ -1592,7 +1911,7 @@ async def _finalize_executed_tool(
                 if override.is_error is not UNSET:
                     is_error = bool(override.is_error)
         except Exception as error:
-            result = error_tool_result(str(error))
+            result = error_tool_result(error)
             is_error = True
 
     return _FinalizedToolCall(

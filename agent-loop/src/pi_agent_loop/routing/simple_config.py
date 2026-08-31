@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import BusinessConfigError
+from .types import RiskLevel, validate_risk_level
 
 # 文件内部保留短别名以避免每个校验分支重复冗长名称。
 _ConfigError = BusinessConfigError
@@ -31,6 +32,68 @@ class SimpleIntent:
     must_use_tool: bool
     requires_approval: bool
     ask_when_missing: str
+    optional_fields: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ()
+    side_effect: bool | None = None
+    risk: RiskLevel = "low"
+
+    def __post_init__(self) -> None:
+        if self.capability is not None and (
+            not isinstance(self.capability, str) or not self.capability.strip()
+        ):
+            raise ValueError("capability 必须是非空字符串或 None")
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.capabilities
+        ):
+            raise ValueError("capabilities 不能包含空值")
+        if len(self.capabilities) != len(set(self.capabilities)):
+            raise ValueError("capabilities 不能重复")
+        if self.capability is not None and self.capabilities:
+            raise ValueError("SimpleIntent 不能同时配置 capability 和 capabilities")
+        required_capabilities = self.required_capabilities
+        if self.must_use_tool and not required_capabilities:
+            raise ValueError("must_use_tool=true 时必须配置 capability/capabilities")
+        if not self.must_use_tool and required_capabilities:
+            raise ValueError("不使用工具的 Intent 不能配置 capability/capabilities")
+        if self.requires_approval and not self.must_use_tool:
+            raise ValueError("需要审批的 Intent 必须使用工具")
+        if self.side_effect is not None and not isinstance(self.side_effect, bool):
+            raise ValueError("side_effect 必须是 true、false 或省略")
+        if self.side_effect and not self.must_use_tool:
+            raise ValueError("有副作用的 Intent 必须使用工具")
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.optional_fields
+        ):
+            raise ValueError("optional_fields 不能包含空值")
+        if len(self.optional_fields) != len(set(self.optional_fields)):
+            raise ValueError("optional_fields 不能重复")
+        overlap = set(self.required_fields).intersection(self.optional_fields)
+        if overlap:
+            raise ValueError(
+                "required_fields 与 optional_fields 不能重复："
+                + ", ".join(sorted(overlap))
+            )
+        normalized_risk = validate_risk_level(self.risk)
+        if normalized_risk != self.risk:
+            object.__setattr__(self, "risk", normalized_risk)
+
+    @property
+    def required_capabilities(self) -> tuple[str, ...]:
+        """Return the new multi-capability form with legacy fallback."""
+
+        if self.capabilities:
+            return self.capabilities
+        return (self.capability,) if self.capability is not None else ()
+
+    @property
+    def has_side_effect(self) -> bool:
+        """Use explicit metadata; legacy configs conservatively follow approval."""
+
+        if self.side_effect is not None:
+            return self.side_effect
+        return self.requires_approval
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +124,13 @@ _INTENT_FIELDS = {
     "description",
     "examples",
     "required_fields",
+    "optional_fields",
     "capability",
+    "capabilities",
     "must_use_tool",
     "requires_approval",
+    "side_effect",
+    "risk",
     "ask_when_missing",
 }
 _DENIED_FIELDS = {"name", "description", "examples", "message"}
@@ -103,6 +170,12 @@ def _boolean(value: Any, label: str) -> bool:
     return value
 
 
+def _optional_boolean(value: Any, label: str) -> bool | None:
+    if value is None:
+        return None
+    return _boolean(value, label)
+
+
 def _parse_intent(raw: Any, index: int) -> SimpleIntent:
     data = _table(raw, f"[[intents]] #{index}")
     unknown = sorted(data.keys() - _INTENT_FIELDS)
@@ -125,13 +198,33 @@ def _parse_intent(raw: Any, index: int) -> SimpleIntent:
         if raw_capability is not None
         else None
     )
-    if must_use_tool and capability is None:
-        raise _ConfigError(
-            f"Intent {intent_id} 设置 must_use_tool=true，必须提供 capability"
+    raw_capabilities = data.get("capabilities")
+    capabilities = (
+        _texts(
+            raw_capabilities,
+            f"Intent {intent_id}.capabilities",
+            allow_empty=True,
         )
-    if not must_use_tool and capability is not None:
+        if raw_capabilities is not None
+        else ()
+    )
+    if capability is not None and raw_capabilities is not None:
         raise _ConfigError(
-            f"Intent {intent_id} 不使用工具，不应配置 capability"
+            f"Intent {intent_id} 不能同时配置 capability 和 capabilities"
+        )
+    required_capabilities = capabilities or (
+        (capability,) if capability is not None else ()
+    )
+    if len(required_capabilities) != len(set(required_capabilities)):
+        raise _ConfigError(f"Intent {intent_id}.capabilities 不能重复")
+    if must_use_tool and not required_capabilities:
+        raise _ConfigError(
+            f"Intent {intent_id} 设置 must_use_tool=true，"
+            "必须提供 capability 或 capabilities"
+        )
+    if not must_use_tool and required_capabilities:
+        raise _ConfigError(
+            f"Intent {intent_id} 不使用工具，不应配置 capability/capabilities"
         )
     if requires_approval and not must_use_tool:
         raise _ConfigError(
@@ -143,6 +236,31 @@ def _parse_intent(raw: Any, index: int) -> SimpleIntent:
         f"Intent {intent_id}.required_fields",
         allow_empty=True,
     )
+    optional_fields = _texts(
+        data.get("optional_fields", []),
+        f"Intent {intent_id}.optional_fields",
+        allow_empty=True,
+    )
+    overlap = set(required_fields).intersection(optional_fields)
+    if overlap:
+        raise _ConfigError(
+            f"Intent {intent_id} 的 required_fields 与 optional_fields 重复："
+            + ", ".join(sorted(overlap))
+        )
+    if len(optional_fields) != len(set(optional_fields)):
+        raise _ConfigError(f"Intent {intent_id}.optional_fields 不能重复")
+    side_effect = _optional_boolean(
+        data.get("side_effect"),
+        f"Intent {intent_id}.side_effect",
+    )
+    if side_effect and not must_use_tool:
+        raise _ConfigError(
+            f"Intent {intent_id} 设置 side_effect=true 时必须使用工具"
+        )
+    try:
+        risk = validate_risk_level(data.get("risk", "low"))
+    except ValueError as error:
+        raise _ConfigError(f"Intent {intent_id}.{error}") from error
     ask_when_missing = data.get("ask_when_missing")
     if required_fields:
         ask = _text(
@@ -170,6 +288,10 @@ def _parse_intent(raw: Any, index: int) -> SimpleIntent:
         must_use_tool=must_use_tool,
         requires_approval=requires_approval,
         ask_when_missing=ask,
+        optional_fields=optional_fields,
+        capabilities=capabilities,
+        side_effect=side_effect,
+        risk=risk,
     )
 
 

@@ -8,12 +8,44 @@ version = "0.1.0"
 description = "参考 Pi Agent Loop 语义编写的纯 Python 教学实现"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Python adaptation" }]
 dependencies = ["cryptography>=42", "httpx>=0.27,<1"]
+
+[project.optional-dependencies]
+test = [
+    "coverage[toml]>=7,<8",
+    "mypy>=1.15,<2",
+    "pytest>=9,<10",
+    "pytest-asyncio>=1,<2",
+    "ruff>=0.15,<0.16",
+]
+build = ["build>=1,<2"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pi_agent_loop = ["py.typed"]
+
+[tool.setuptools.data-files]
+"share/pi-agent-loop/evals" = ["evals/*.json"]
+"share/pi-agent-loop/config" = ["config/*.toml.example", "config/README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["--strict-config", "--strict-markers"]
+faulthandler_timeout = 60
+
+[tool.coverage.run]
+branch = true
+source = ["pi_agent_loop"]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+skip_covered = true

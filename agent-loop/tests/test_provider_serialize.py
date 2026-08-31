@@ -177,6 +177,129 @@ class ProviderSerializeTests(unittest.TestCase):
                 },
             )
 
+    def test_标准image_url和data_url被序列化为多模态content(self) -> None:
+        data_url = "data:image/png;base64,aGVsbG8="
+        payload = serialize_chat_request(
+            self.profile,
+            {
+                "systemPrompt": "",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "比较两张图"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://cdn.example/a.png",
+                                    "detail": "high",
+                                },
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url},
+                            },
+                        ],
+                    }
+                ],
+                "tools": [],
+            },
+        )
+
+        content = payload["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0], {"type": "text", "text": "比较两张图"})
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertEqual(content[1]["image_url"]["detail"], "high")
+        self.assertEqual(content[2]["image_url"]["url"], data_url)
+
+    def test_不支持的用户媒体类型在provider边界明确拒绝(self) -> None:
+        with self.assertRaisesRegex(ProviderProtocolError, "不支持"):
+            serialize_chat_request(
+                self.profile,
+                {
+                    "systemPrompt": "",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_audio", "input_audio": {}}
+                            ],
+                        }
+                    ],
+                    "tools": [],
+                },
+            )
+
+    def test_system_tool_schema和完整请求均有可配置出站上限(self) -> None:
+        with self.assertRaisesRegex(ProviderProtocolError, "systemPrompt"):
+            serialize_chat_request(
+                self.profile,
+                {"systemPrompt": "中文", "messages": [], "tools": []},
+                {"max_system_prompt_bytes": 5},
+            )
+        with self.assertRaisesRegex(ProviderProtocolError, "工具 schema"):
+            serialize_chat_request(
+                self.profile,
+                {
+                    "systemPrompt": "",
+                    "messages": [],
+                    "tools": [
+                        {
+                            "name": "large",
+                            "description": "x" * 100,
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                },
+                {"max_tool_schema_bytes": 32},
+            )
+        with self.assertRaisesRegex(ProviderProtocolError, "模型请求"):
+            serialize_chat_request(
+                self.profile,
+                {
+                    "systemPrompt": "",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "hello"}],
+                        }
+                    ],
+                    "tools": [],
+                },
+                {"max_request_bytes": 16},
+            )
+
+    def test_provider再次限制content_block和image_url字节(self) -> None:
+        context = {
+            "systemPrompt": "",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看图"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://cdn.example/a.png"},
+                        },
+                    ],
+                }
+            ],
+            "tools": [],
+        }
+        with self.assertRaisesRegex(ProviderProtocolError, "block"):
+            serialize_chat_request(
+                self.profile,
+                context,
+                {"max_content_blocks_per_message": 1},
+            )
+        with self.assertRaisesRegex(ProviderProtocolError, "URL"):
+            serialize_chat_request(
+                self.profile,
+                context,
+                {"max_image_url_bytes": 8},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

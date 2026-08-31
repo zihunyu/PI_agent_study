@@ -5,12 +5,14 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pi_agent_loop import (  # noqa: E402
     Agent,
+    ApprovalReceipt,
     CapabilityRegistry,
     DomainEvent,
     DomainStateMachine,
@@ -29,6 +31,7 @@ from pi_agent_loop import (  # noqa: E402
     ScriptedProvider,
     assistant_message,
     create_divide_tool,
+    domain_action_hash,
     project_runtime_state,
     reduce_runtime_state,
     replay_runtime_events,
@@ -281,40 +284,144 @@ class RuntimeStateMachineTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_domain_审批和乐观版本检查(self) -> None:
+        transitions = [
+            DomainTransition(
+                event_type="change_approved",
+                from_states=frozenset({"pending"}),
+                to_state="accepted",
+                allowed_sources=frozenset({"resource_api"}),
+                requires_approval=True,
+            ),
+            DomainTransition(
+                event_type="change_approved",
+                from_states=frozenset({"accepted"}),
+                to_state="finalized",
+                allowed_sources=frozenset({"resource_api"}),
+                requires_approval=True,
+            ),
+        ]
+        with self.assertRaisesRegex(ValueError, "ApprovalReceipt verifier"):
+            DomainStateMachine(initial_state="pending", transitions=transitions)
         machine = DomainStateMachine(
-            initial_state="paid",
-            transitions=[
-                DomainTransition(
-                    event_type="cancel_approved",
-                    from_states=frozenset({"paid"}),
-                    to_state="cancelled",
-                    allowed_sources=frozenset({"cancel_api"}),
-                    requires_approval=True,
-                )
-            ],
+            initial_state="pending",
+            transitions=transitions,
+            approval_receipt_verifier=lambda receipt: (
+                receipt.verification_id == "verified-by-test-approval-service"
+            ),
         )
-        state = machine.initial("order-1002")
-        event = DomainEvent(
-            entity_id="order-1002",
-            type="cancel_approved",
-            source="cancel_api",
+        state = machine.initial("resource-1002")
+        data = {"target": "blue", "replicas": 2}
+        event_without_receipt = DomainEvent(
+            entity_id="resource-1002",
+            type="change_approved",
+            source="resource_api",
             expected_version=0,
-            approved=False,
+            data=data,
+            occurred_at=120.0,
         )
-        with self.assertRaisesRegex(DomainTransitionError, "需要审批"):
-            machine.apply(state, event)
+        with self.assertRaises(DomainTransitionError) as missing_approval:
+            machine.apply(state, event_without_receipt)
+        self.assertEqual(missing_approval.exception.code, "approval_required")
 
+        receipt = ApprovalReceipt(
+            receipt_id="receipt-1",
+            action_hash=domain_action_hash(
+                entity_id="resource-1002",
+                event_type="change_approved",
+                data=data,
+            ),
+            approver_id="approver-7",
+            entity_id="resource-1002",
+            event_type="change_approved",
+            issued_at=100.0,
+            consumed_at=110.0,
+            expires_at=200.0,
+            verification_id="verified-by-test-approval-service",
+        )
+        with self.assertRaises(DomainTransitionError) as forged_action:
+            machine.apply(
+                state,
+                DomainEvent(
+                    entity_id="resource-1002",
+                    type="change_approved",
+                    source="resource_api",
+                    expected_version=0,
+                    data=data,
+                    occurred_at=120.0,
+                    approval_receipt=replace(receipt, action_hash="0" * 64),
+                ),
+            )
+        self.assertEqual(forged_action.exception.code, "approval_action_mismatch")
+        with self.assertRaises(DomainTransitionError) as expired:
+            machine.apply(
+                state,
+                DomainEvent(
+                    entity_id="resource-1002",
+                    type="change_approved",
+                    source="resource_api",
+                    expected_version=0,
+                    data=data,
+                    occurred_at=120.0,
+                    approval_receipt=replace(receipt, expires_at=115.0),
+                ),
+            )
+        self.assertEqual(expired.exception.code, "approval_expired")
+        with self.assertRaises(DomainTransitionError) as unverified:
+            machine.apply(
+                state,
+                DomainEvent(
+                    entity_id="resource-1002",
+                    type="change_approved",
+                    source="resource_api",
+                    expected_version=0,
+                    data=data,
+                    occurred_at=120.0,
+                    approval_receipt=replace(receipt, verification_id="forged"),
+                ),
+            )
+        self.assertEqual(
+            unverified.exception.code,
+            "approval_verification_failed",
+        )
         approved = DomainEvent(
-            entity_id="order-1002",
-            type="cancel_approved",
-            source="cancel_api",
+            entity_id="resource-1002",
+            type="change_approved",
+            source="resource_api",
             expected_version=0,
-            approved=True,
+            data=data,
+            occurred_at=120.0,
+            approval_receipt=receipt,
         )
         state = machine.apply(state, approved)
-        self.assertEqual(state.state, "cancelled")
+        self.assertEqual(state.state, "accepted")
+        self.assertEqual(state.consumed_approval_receipts, ("receipt-1",))
+
+        replay = DomainEvent(
+            entity_id="resource-1002",
+            type="change_approved",
+            source="resource_api",
+            expected_version=1,
+            data=data,
+            occurred_at=121.0,
+            approval_receipt=receipt,
+        )
+        with self.assertRaises(DomainTransitionError) as replayed_approval:
+            machine.apply(state, replay)
+        self.assertEqual(
+            replayed_approval.exception.code,
+            "approval_already_consumed",
+        )
         with self.assertRaisesRegex(DomainTransitionError, "版本"):
             machine.apply(state, approved)
+
+        with self.assertRaises(TypeError):
+            DomainEvent(  # type: ignore[call-arg]
+                entity_id="resource-1002",
+                type="change_approved",
+                source="resource_api",
+                expected_version=1,
+                approved=True,
+            )
 
 
 if __name__ == "__main__":

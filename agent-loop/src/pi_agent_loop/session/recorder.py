@@ -7,9 +7,11 @@ from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
+from ..tool_contract import ToolSecurityContract
 from ..types import AgentTool
 from .operation_state import replay_operation, replay_operation_with_specs
 from .operation_store import (
+    ClaimLease,
     OperationEventStore,
     OperationStoreConflictError,
     operation_last_sequence,
@@ -27,18 +29,52 @@ class DurableOperationRecorder:
         tools: list[AgentTool],
         configuration: dict[str, Any] | None = None,
         run_id_provider: Callable[[], str | None] | None = None,
+        fenced_lease: ClaimLease | None = None,
+        fenced_lease_seconds: float | None = None,
     ) -> None:
         if not session_id:
             raise ValueError("session_id 不能为空")
         self.store = store
         self.session_id = session_id
         self.tools = {tool.name: tool for tool in tools}
+        if len(self.tools) != len(tools):
+            raise ValueError("Durable Recorder 不接受重复 Tool 名称")
+        self.tool_contracts = {
+            name: ToolSecurityContract.capture(tool)
+            for name, tool in self.tools.items()
+        }
         self.configuration = dict(configuration or {})
         self.run_id_provider = run_id_provider
+        if fenced_lease is not None:
+            if (
+                fenced_lease.claim_type != "conversation_session_writer"
+                or fenced_lease.resource_id != session_id
+            ):
+                raise ValueError("Recorder Fenced Lease 与 Session 不匹配")
+            if fenced_lease_seconds is None or fenced_lease_seconds <= 0:
+                raise ValueError("Recorder Fenced Lease 必须提供正数续租时长")
+        elif fenced_lease_seconds is not None:
+            raise ValueError("fenced_lease_seconds 只能与 fenced_lease 一起提供")
+        self.fenced_lease = fenced_lease
+        self.fenced_lease_seconds = fenced_lease_seconds
         self.operation_id: str | None = None
         self.last_operation_id: str | None = None
         self._active_request_id: str | None = None
         self._last_failure: str | None = None
+
+    def current_durable_metadata(self) -> dict[str, str]:
+        """返回供可信 Agent/Host 装配边界使用的当前请求关联标识。"""
+
+        values: dict[str, str | None] = {
+            "sessionId": self.session_id,
+            "operationId": self.operation_id,
+            "runId": self.run_id_provider() if self.run_id_provider is not None else None,
+        }
+        return {
+            key: value
+            for key, value in values.items()
+            if isinstance(value, str) and value
+        }
 
     async def start_operation(
         self,
@@ -55,8 +91,11 @@ class DurableOperationRecorder:
                 {
                     "configuration": self.configuration,
                     "tools": [
-                        {"name": tool.name, "replayPolicy": tool.replay_policy}
-                        for tool in self.tools.values()
+                        {
+                            **contract.to_dict(),
+                            "securityContractDigest": contract.digest,
+                        }
+                        for contract in self.tool_contracts.values()
                     ],
                 },
             )
@@ -69,7 +108,7 @@ class DurableOperationRecorder:
             for message in list(initial_messages or [])
         )
         try:
-            await self.store.append_batch(
+            await self._append_batch(
                 self.session_id,
                 self.operation_id,
                 specs,
@@ -100,7 +139,7 @@ class DurableOperationRecorder:
             )
             replay_operation_with_specs(events, specs)
             try:
-                await self.store.append_batch(
+                await self._append_batch(
                     self.session_id,
                     operation_id,
                     specs,
@@ -164,16 +203,6 @@ class DurableOperationRecorder:
                 if isinstance(supplied_request_id, str) and supplied_request_id
                 else str(uuid4())
             )
-            # Enrich the mutable lifecycle event before loop.py enters the
-            # ModelCallRuntime.  These values are trusted Host state rather
-            # than caller/model supplied metadata.
-            event["requestId"] = self._active_request_id
-            event["sessionId"] = self.session_id
-            event["operationId"] = self.operation_id
-            if self.run_id_provider is not None:
-                run_id = self.run_id_provider()
-                if isinstance(run_id, str) and run_id:
-                    event["runId"] = run_id
             await self._append(
                 "model_request_started",
                 {
@@ -202,17 +231,42 @@ class DurableOperationRecorder:
                 if self._active_request_id is None:
                     raise RuntimeError("Assistant Message 没有 Model Request Started")
                 stop_reason = message.get("stopReason")
-                if stop_reason in {"error", "aborted"}:
-                    self._last_failure = (
-                        "cancelled" if stop_reason == "aborted" else "model_error"
+                if stop_reason in {"error", "aborted", "length"}:
+                    if stop_reason == "aborted":
+                        self._last_failure = "cancelled"
+                    elif stop_reason == "length":
+                        self._last_failure = "model_output_truncated"
+                    else:
+                        self._last_failure = "model_error"
+                if stop_reason == "length":
+                    # length 是不完整响应，不能伪装成 Model Request Completed。
+                    # 同一批次仍保存 Assistant Message，使随后生成的 Synthetic
+                    # ToolResult 可与截断 Tool Call 形成闭合 Transcript。
+                    operation_id = self.operation_id
+                    if operation_id is None:
+                        raise RuntimeError("没有活动 Durable Operation")
+                    await self._append_batch(
+                        self.session_id,
+                        operation_id,
+                        [
+                            (
+                                "model_request_failed",
+                                {
+                                    "requestId": self._active_request_id,
+                                    "errorCode": "model_output_truncated",
+                                },
+                            ),
+                            ("message_appended", {"message": message}),
+                        ],
                     )
-                await self._append(
-                    "model_request_completed",
-                    {
-                        "requestId": self._active_request_id,
-                        "message": message,
-                    },
-                )
+                else:
+                    await self._append(
+                        "model_request_completed",
+                        {
+                            "requestId": self._active_request_id,
+                            "message": message,
+                        },
+                    )
                 self._active_request_id = None
             elif role == "toolResult":
                 await self._record_tool_result_message(message)
@@ -221,14 +275,29 @@ class DurableOperationRecorder:
             return
         if event_type == "tool_execution_start":
             tool_name = str(event.get("toolName", ""))
-            tool = self.tools.get(tool_name)
+            contract = self.tool_contracts.get(tool_name)
             await self._append(
                 "tool_intent_recorded",
                 {
                     "toolCallId": str(event.get("toolCallId", "")),
                     "toolName": tool_name,
                     "arguments": event.get("args", {}),
-                    "replayPolicy": tool.replay_policy if tool else "never",
+                    "replayPolicy": (
+                        contract.replay_policy if contract is not None else "never"
+                    ),
+                    "securityContractDigest": (
+                        contract.digest if contract is not None else None
+                    ),
+                    "implementationVersion": (
+                        contract.implementation_version
+                        if contract is not None
+                        else None
+                    ),
+                    "securityPolicyVersion": (
+                        contract.security_policy_version
+                        if contract is not None
+                        else None
+                    ),
                 },
             )
             return
@@ -313,7 +382,7 @@ class DurableOperationRecorder:
             ]
             replay_operation_with_specs(events, specs)
             try:
-                await self.store.append_batch(
+                await self._append_batch(
                     self.session_id,
                     self.operation_id,
                     specs,
@@ -374,7 +443,7 @@ class DurableOperationRecorder:
             specs.append(("message_appended", {"message": message}))
             replay_operation_with_specs(events, specs)
             try:
-                await self.store.append_batch(
+                await self._append_batch(
                     self.session_id,
                     self.operation_id,
                     specs,
@@ -388,9 +457,42 @@ class DurableOperationRecorder:
     async def _append(self, event_type: str, data: dict[str, Any]) -> None:
         if self.operation_id is None:
             raise RuntimeError("没有活动 Durable Operation")
-        await self.store.append(
-            event_type,
+        await self._append_batch(
             self.session_id,
             self.operation_id,
-            data,
+            [(event_type, data)],
+        )
+
+    async def _append_batch(
+        self,
+        session_id: str,
+        operation_id: str,
+        events: list[tuple[str, dict[str, Any]]],
+        *,
+        expected_last_sequence: int | None = None,
+        deadline_ms: int | None = None,
+    ) -> list[Any]:
+        if self.fenced_lease is None:
+            return await self.store.append_batch(
+                session_id,
+                operation_id,
+                events,
+                expected_last_sequence=expected_last_sequence,
+                deadline_ms=deadline_ms,
+            )
+        append_fenced = getattr(
+            self.store, "append_batch_if_fenced_claim", None
+        )
+        if not callable(append_fenced):
+            raise OperationStoreConflictError(
+                "Operation Store 不支持原子 Fenced Append"
+            )
+        return await append_fenced(
+            session_id,
+            operation_id,
+            events,
+            self.fenced_lease,
+            renew_lease_seconds=self.fenced_lease_seconds,
+            expected_last_sequence=expected_last_sequence,
+            deadline_ms=deadline_ms,
         )

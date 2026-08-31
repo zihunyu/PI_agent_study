@@ -11,7 +11,11 @@ from .compaction import (
     estimate_message_tokens,
     validate_context_replacement,
 )
-from .errors import OutcomeUnknownToolError, RetryableToolError
+from .errors import (
+    DefinitelyNotCommittedToolError,
+    OutcomeUnknownToolError,
+    RetryableToolError,
+)
 from .types import ModelRetryPolicy, ToolRetryPolicy
 
 __all__ = [
@@ -19,6 +23,7 @@ __all__ = [
     "ContextCompactionValidationError",
     "ContextOverflowCompactingStreamFn",
     "ContextReplacement",
+    "DefinitelyNotCommittedToolError",
     "ModelRetryPolicy",
     "OutcomeUnknownToolError",
     "RetryableToolError",

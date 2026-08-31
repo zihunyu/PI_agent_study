@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..event_stream import AssistantMessageEventStream
@@ -13,23 +13,50 @@ from ..types import Model
 from .errors import ProviderProtocolError
 
 
+DEFAULT_MAX_TOOL_CALLS = 128
+DEFAULT_MAX_TOOL_ARGUMENT_BYTES = 1024 * 1024
+DEFAULT_MAX_TOTAL_TOOL_ARGUMENT_BYTES = 4 * 1024 * 1024
+
+
+def _positive_limit(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} 必须是正整数")
+    return value
+
+
 @dataclass(slots=True)
 class _ToolAccumulator:
     api_index: int
     content_index: int
     call_id: str = ""
     name: str = ""
-    arguments_text: str = ""
+    argument_fragments: list[str] = field(default_factory=list)
+    argument_bytes: int = 0
 
 
 class OpenAIStreamTranslator:
     """有状态地累积 content/tool_call delta 并推送 Pi 风格事件。"""
 
     def __init__(
-        self, stream: AssistantMessageEventStream, model: Model
+        self,
+        stream: AssistantMessageEventStream,
+        model: Model,
+        *,
+        max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+        max_tool_argument_bytes: int = DEFAULT_MAX_TOOL_ARGUMENT_BYTES,
+        max_total_tool_argument_bytes: int = DEFAULT_MAX_TOTAL_TOOL_ARGUMENT_BYTES,
     ) -> None:
         self.stream = stream
         self.model = model
+        self.max_tool_calls = _positive_limit("max_tool_calls", max_tool_calls)
+        self.max_tool_argument_bytes = _positive_limit(
+            "max_tool_argument_bytes",
+            max_tool_argument_bytes,
+        )
+        self.max_total_tool_argument_bytes = _positive_limit(
+            "max_total_tool_argument_bytes",
+            max_total_tool_argument_bytes,
+        )
         self.partial = assistant_message(
             model=model,
             content=[],
@@ -42,6 +69,7 @@ class OpenAIStreamTranslator:
         self._finished = False
         self._started = False
         self._saw_payload = False
+        self._total_tool_argument_bytes = 0
 
     @property
     def finished(self) -> bool:
@@ -141,9 +169,7 @@ class OpenAIStreamTranslator:
     def _append_thinking(self, delta: str) -> None:
         if self._thinking_index is None:
             self._thinking_index = len(self.partial["content"])
-            self.partial["content"].append(
-                {"type": "thinking", "thinking": ""}
-            )
+            self.partial["content"].append({"type": "thinking", "thinking": ""})
             self.stream.push(
                 {
                     "type": "thinking_start",
@@ -170,6 +196,8 @@ class OpenAIStreamTranslator:
 
         accumulator = self._tools.get(api_index)
         if accumulator is None:
+            if len(self._tools) >= self.max_tool_calls:
+                raise ProviderProtocolError("流式 tool call 数量超过上限")
             content_index = len(self.partial["content"])
             accumulator = _ToolAccumulator(api_index, content_index)
             self._tools[api_index] = accumulator
@@ -206,10 +234,21 @@ class OpenAIStreamTranslator:
         arguments = function.get("arguments")
         if arguments is not None:
             if not isinstance(arguments, str):
-                raise ProviderProtocolError(
-                    "tool call arguments fragment 必须是字符串"
-                )
-            accumulator.arguments_text += arguments
+                raise ProviderProtocolError("tool call arguments fragment 必须是字符串")
+            argument_bytes = len(arguments.encode("utf-8"))
+            if (
+                accumulator.argument_bytes + argument_bytes
+                > self.max_tool_argument_bytes
+            ):
+                raise ProviderProtocolError("单个 tool call arguments 超过字节上限")
+            if (
+                self._total_tool_argument_bytes + argument_bytes
+                > self.max_total_tool_argument_bytes
+            ):
+                raise ProviderProtocolError("全部 tool call arguments 超过累计字节上限")
+            accumulator.argument_fragments.append(arguments)
+            accumulator.argument_bytes += argument_bytes
+            self._total_tool_argument_bytes += argument_bytes
 
         block = self.partial["content"][accumulator.content_index]
         block["id"] = accumulator.call_id
@@ -255,7 +294,7 @@ class OpenAIStreamTranslator:
         ):
             if not accumulator.call_id or not accumulator.name:
                 raise ProviderProtocolError("流式 tool call 缺少 id 或 function.name")
-            raw_arguments = accumulator.arguments_text or "{}"
+            raw_arguments = "".join(accumulator.argument_fragments) or "{}"
             try:
                 arguments = json.loads(raw_arguments)
             except json.JSONDecodeError as error:
@@ -290,13 +329,9 @@ class OpenAIStreamTranslator:
         final = copy.deepcopy(self.partial)
         if stop_reason == "error":
             final["errorMessage"] = "模型响应被内容安全策略阻止"
-            self.stream.push(
-                {"type": "error", "reason": "error", "error": final}
-            )
+            self.stream.push({"type": "error", "reason": "error", "error": final})
         else:
-            self.stream.push(
-                {"type": "done", "reason": stop_reason, "message": final}
-            )
+            self.stream.push({"type": "done", "reason": stop_reason, "message": final})
 
 
 def _translate_stop_reason(reason: str | None, *, has_tools: bool) -> str:

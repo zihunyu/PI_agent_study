@@ -26,13 +26,16 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from ..async_utils import durable_to_thread
+from ..messages import is_sensitive_key, redact_sensitive_text
 from .migrations import (
     EventMigrationRegistry,
     JournalMigrationError,
     StateMigrationRegistry,
 )
+from .operation_store import ClaimLease
 
 JournalKind = Literal["runtime", "operation", "retry", "audit"]
+SessionStreamKey = tuple[JournalKind, str, str | None]
 _JOURNAL_KINDS = frozenset({"runtime", "operation", "retry", "audit"})
 _DATABASE_SCHEMA_VERSION = 2
 _INTEGRITY_MANIFEST_VERSION = 2
@@ -49,6 +52,10 @@ class JournalAccessDenied(SessionJournalError):
 
 class JournalConflictError(SessionJournalError):
     """CAS、唯一约束或 Stream Sequence 冲突。"""
+
+
+class JournalFencedClaimLostError(JournalConflictError):
+    """The exact owner/generation lease is no longer current and unexpired."""
 
 
 class JournalCorruptionError(SessionJournalError):
@@ -158,12 +165,14 @@ class JournalRedactionPolicy:
                 normalized = key.casefold().replace("_", "").replace("-", "")
                 redacted[key] = (
                     self.replacement
-                    if normalized in sensitive
+                    if normalized in sensitive or is_sensitive_key(key)
                     else self.redact(item)
                 )
             return redacted
         if isinstance(value, (list, tuple)):
             return [self.redact(item) for item in value]
+        if isinstance(value, str):
+            return redact_sensitive_text(value, replacement=self.replacement)
         return copy.deepcopy(value)
 
 
@@ -368,6 +377,7 @@ class SQLiteSessionEventJournal:
         specs: list[SessionEventSpec],
         *,
         expected_last_sequence: int | None = None,
+        expected_stream_sequences: Mapping[SessionStreamKey, int] | None = None,
         deadline_ms: int | None = None,
     ) -> list[SessionEvent]:
         self.access_policy.authorize(principal, "write")
@@ -378,6 +388,47 @@ class SQLiteSessionEventJournal:
             principal,
             specs,
             expected_last_sequence,
+            _validated_stream_heads(expected_stream_sequences),
+            deadline_ms,
+        )
+
+    async def append_events_if_fenced_claim(
+        self,
+        principal: JournalPrincipal,
+        specs: list[SessionEventSpec],
+        lease: ClaimLease,
+        *,
+        renew_lease_seconds: float,
+        expected_last_sequence: int | None = None,
+        expected_stream_sequences: Mapping[SessionStreamKey, int] | None = None,
+        deadline_ms: int | None = None,
+    ) -> list[SessionEvent]:
+        """Verify, append and renew one exact fenced lease transactionally.
+
+        The lease is required to be live when the SQLite write transaction
+        starts.  ``BEGIN IMMEDIATE`` then prevents a successor from taking the
+        same claim until the events and the lease renewal commit together.
+        """
+
+        self.access_policy.authorize(principal, "write")
+        if not specs:
+            raise ValueError("Session Event Batch 不能为空")
+        if not isinstance(lease, ClaimLease):
+            raise TypeError("lease 必须是 ClaimLease")
+        if (
+            isinstance(renew_lease_seconds, bool)
+            or not isinstance(renew_lease_seconds, (int, float))
+            or renew_lease_seconds <= 0
+        ):
+            raise ValueError("renew_lease_seconds 必须是正数")
+        return await durable_to_thread(
+            self._append_events_if_fenced_claim_sync,
+            principal,
+            specs,
+            lease,
+            float(renew_lease_seconds),
+            expected_last_sequence,
+            _validated_stream_heads(expected_stream_sequences),
             deadline_ms,
         )
 
@@ -610,13 +661,79 @@ class SQLiteSessionEventJournal:
     ) -> bool:
         self.access_policy.authorize(principal, "write")
         _validate_claim(claim_type, resource_id, owner_token, lease_seconds)
-        return await durable_to_thread(
-            self._try_acquire_claim_sync,
+        lease = await durable_to_thread(
+            self._acquire_fenced_claim_sync,
             principal,
             claim_type,
             resource_id,
             owner_token,
             lease_seconds,
+        )
+        return lease is not None
+
+    async def acquire_fenced_claim(
+        self,
+        principal: JournalPrincipal,
+        claim_type: str,
+        resource_id: str,
+        owner_token: str,
+        *,
+        lease_seconds: float = 300,
+    ) -> ClaimLease | None:
+        self.access_policy.authorize(principal, "write")
+        _validate_claim(claim_type, resource_id, owner_token, lease_seconds)
+        return await durable_to_thread(
+            self._acquire_fenced_claim_sync,
+            principal,
+            claim_type,
+            resource_id,
+            owner_token,
+            lease_seconds,
+        )
+
+    async def renew_fenced_claim(
+        self,
+        principal: JournalPrincipal,
+        lease: ClaimLease,
+        *,
+        lease_seconds: float = 300,
+    ) -> bool:
+        self.access_policy.authorize(principal, "write")
+        _validate_claim(
+            lease.claim_type,
+            lease.resource_id,
+            lease.owner_token,
+            lease_seconds,
+        )
+        return await durable_to_thread(
+            self._renew_fenced_claim_sync,
+            principal,
+            lease,
+            lease_seconds,
+        )
+
+    async def verify_fenced_claim(
+        self,
+        principal: JournalPrincipal,
+        lease: ClaimLease,
+    ) -> bool:
+        self.access_policy.authorize(principal, "read")
+        return await durable_to_thread(
+            self._verify_fenced_claim_sync,
+            principal,
+            lease,
+        )
+
+    async def release_fenced_claim(
+        self,
+        principal: JournalPrincipal,
+        lease: ClaimLease,
+    ) -> None:
+        self.access_policy.authorize(principal, "write")
+        await durable_to_thread(
+            self._release_fenced_claim_sync,
+            principal,
+            lease,
         )
 
     async def release_claim(
@@ -752,6 +869,7 @@ class SQLiteSessionEventJournal:
                     resource_id TEXT NOT NULL,
                     owner_token TEXT NOT NULL,
                     lease_expires_at INTEGER NOT NULL,
+                    generation INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (tenant_id, claim_type, resource_id)
                 );
 
@@ -769,6 +887,17 @@ class SQLiteSessionEventJournal:
                 );
                 """
             )
+            claim_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(session_claims)")
+            }
+            if "generation" not in claim_columns:
+                # Claims are unsigned coordination metadata. This additive
+                # migration does not alter the protected event/snapshot roots.
+                connection.execute(
+                    "ALTER TABLE session_claims "
+                    "ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"
+                )
             row = connection.execute(
                 "SELECT value FROM session_journal_meta WHERE key = 'database_schema_version'"
             ).fetchone()
@@ -1227,15 +1356,90 @@ class SQLiteSessionEventJournal:
         principal: JournalPrincipal,
         specs: list[SessionEventSpec],
         expected_last_sequence: int | None,
+        expected_stream_sequences: dict[SessionStreamKey, int] | None,
         deadline_ms: int | None,
+    ) -> list[SessionEvent]:
+        return self._append_events_transaction_sync(
+            principal,
+            specs,
+            expected_last_sequence,
+            expected_stream_sequences,
+            deadline_ms,
+            lease=None,
+        )
+
+    def _append_events_if_fenced_claim_sync(
+        self,
+        principal: JournalPrincipal,
+        specs: list[SessionEventSpec],
+        lease: ClaimLease,
+        renew_lease_seconds: float,
+        expected_last_sequence: int | None,
+        expected_stream_sequences: dict[SessionStreamKey, int] | None,
+        deadline_ms: int | None,
+    ) -> list[SessionEvent]:
+        return self._append_events_transaction_sync(
+            principal,
+            specs,
+            expected_last_sequence,
+            expected_stream_sequences,
+            deadline_ms,
+            lease=lease,
+            renew_lease_seconds=renew_lease_seconds,
+        )
+
+    def _append_events_transaction_sync(
+        self,
+        principal: JournalPrincipal,
+        specs: list[SessionEventSpec],
+        expected_last_sequence: int | None,
+        expected_stream_sequences: dict[SessionStreamKey, int] | None,
+        deadline_ms: int | None,
+        *,
+        lease: ClaimLease | None,
+        renew_lease_seconds: float | None = None,
     ) -> list[SessionEvent]:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if lease is not None:
+                now = int(time.time() * 1000)
+                owned = connection.execute(
+                    """
+                    SELECT 1 FROM session_claims
+                    WHERE tenant_id = ? AND claim_type = ? AND resource_id = ?
+                      AND owner_token = ? AND generation = ?
+                      AND lease_expires_at > ?
+                    """,
+                    (
+                        principal.tenant_id,
+                        lease.claim_type,
+                        lease.resource_id,
+                        lease.owner_token,
+                        lease.generation,
+                        now,
+                    ),
+                ).fetchone()
+                if owned is None:
+                    raise JournalFencedClaimLostError(
+                        "Fenced Claim 已失效，禁止追加 Session Event"
+                    )
+            # BEGIN IMMEDIATE prevents a successor from taking over between
+            # this lease check and the event insert. Integrity verification can
+            # be comparatively expensive, so it must happen after ownership is
+            # fenced by the write transaction rather than before the check.
             self._verify_all_manifests_sync(connection)
             if deadline_ms is not None and int(time.time() * 1000) >= deadline_ms:
                 raise JournalDeadlineExceeded(
                     f"Session Journal 事务截止时间已到：{deadline_ms}"
+                )
+            if (
+                expected_last_sequence is not None
+                and expected_stream_sequences is not None
+            ):
+                raise ValueError(
+                    "expected_last_sequence 与 expected_stream_sequences "
+                    "不能同时使用"
                 )
             if expected_last_sequence is not None:
                 first = specs[0]
@@ -1258,7 +1462,60 @@ class SQLiteSessionEventJournal:
                         "Session Journal Version 冲突："
                         f"expected={expected_last_sequence}, actual={current}"
                     )
+            if expected_stream_sequences is not None:
+                batch_streams: set[SessionStreamKey] = {
+                    (
+                        spec.journal_kind,
+                        spec.session_id,
+                        spec.operation_id,
+                    )
+                    for spec in specs
+                }
+                if batch_streams != set(expected_stream_sequences):
+                    raise ValueError(
+                        "expected_stream_sequences 必须精确覆盖 Event Batch "
+                        f"的全部 Stream：expected={set(expected_stream_sequences)!r}, "
+                        f"actual={batch_streams!r}"
+                    )
+                for stream, expected in expected_stream_sequences.items():
+                    journal_kind, session_id, operation_id = stream
+                    current = self._last_stream_sequence(
+                        connection,
+                        principal.tenant_id,
+                        journal_kind,
+                        session_id,
+                        operation_id,
+                    )
+                    if current != expected:
+                        raise JournalConflictError(
+                            "Session Journal Multi-Stream Version 冲突："
+                            f"stream={stream!r}, expected={expected}, actual={current}"
+                        )
             appended = self._insert_specs_sync(connection, principal, specs)
+            if lease is not None:
+                assert renew_lease_seconds is not None
+                renewed_until = int(time.time() * 1000) + int(
+                    renew_lease_seconds * 1000
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE session_claims SET lease_expires_at = ?
+                    WHERE tenant_id = ? AND claim_type = ? AND resource_id = ?
+                      AND owner_token = ? AND generation = ?
+                    """,
+                    (
+                        renewed_until,
+                        principal.tenant_id,
+                        lease.claim_type,
+                        lease.resource_id,
+                        lease.owner_token,
+                        lease.generation,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise JournalFencedClaimLostError(
+                        "Fenced Claim 在提交事件时已失效"
+                    )
             connection.execute("COMMIT")
             return appended
         except (JournalConflictError, JournalDeadlineExceeded):
@@ -2210,14 +2467,14 @@ class SQLiteSessionEventJournal:
             connection.close()
         return migrated
 
-    def _try_acquire_claim_sync(
+    def _acquire_fenced_claim_sync(
         self,
         principal: JournalPrincipal,
         claim_type: str,
         resource_id: str,
         owner_token: str,
         lease_seconds: float,
-    ) -> bool:
+    ) -> ClaimLease | None:
         now = int(time.time() * 1000)
         expires = now + int(lease_seconds * 1000)
         connection = self._connect()
@@ -2225,7 +2482,8 @@ class SQLiteSessionEventJournal:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT owner_token, lease_expires_at FROM session_claims
+                SELECT owner_token, lease_expires_at, generation
+                FROM session_claims
                 WHERE tenant_id = ? AND claim_type = ? AND resource_id = ?
                 """,
                 (principal.tenant_id, claim_type, resource_id),
@@ -2236,15 +2494,25 @@ class SQLiteSessionEventJournal:
                 and int(row["lease_expires_at"]) > now
             ):
                 connection.execute("ROLLBACK")
-                return False
+                return None
+            if (
+                row is not None
+                and str(row["owner_token"]) == owner_token
+                and int(row["lease_expires_at"]) > now
+            ):
+                generation = int(row["generation"])
+            else:
+                generation = int(row["generation"]) + 1 if row is not None else 1
             connection.execute(
                 """
                 INSERT INTO session_claims(
-                    tenant_id, claim_type, resource_id, owner_token, lease_expires_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    tenant_id, claim_type, resource_id, owner_token,
+                    lease_expires_at, generation
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tenant_id, claim_type, resource_id) DO UPDATE SET
                     owner_token = excluded.owner_token,
-                    lease_expires_at = excluded.lease_expires_at
+                    lease_expires_at = excluded.lease_expires_at,
+                    generation = excluded.generation
                 """,
                 (
                     principal.tenant_id,
@@ -2252,10 +2520,11 @@ class SQLiteSessionEventJournal:
                     resource_id,
                     owner_token,
                     expires,
+                    generation,
                 ),
             )
             connection.execute("COMMIT")
-            return True
+            return ClaimLease(claim_type, resource_id, owner_token, generation)
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -2273,11 +2542,87 @@ class SQLiteSessionEventJournal:
         with closing(self._connect()) as connection:
             connection.execute(
                 """
-                DELETE FROM session_claims
+                UPDATE session_claims
+                SET lease_expires_at = 0, generation = generation + 1
                 WHERE tenant_id = ? AND claim_type = ?
                   AND resource_id = ? AND owner_token = ?
                 """,
                 (principal.tenant_id, claim_type, resource_id, owner_token),
+            )
+
+    def _renew_fenced_claim_sync(
+        self,
+        principal: JournalPrincipal,
+        lease: ClaimLease,
+        lease_seconds: float,
+    ) -> bool:
+        now = int(time.time() * 1000)
+        expires = now + int(lease_seconds * 1000)
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE session_claims SET lease_expires_at = ?
+                WHERE tenant_id = ? AND claim_type = ? AND resource_id = ?
+                  AND owner_token = ? AND generation = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    expires,
+                    principal.tenant_id,
+                    lease.claim_type,
+                    lease.resource_id,
+                    lease.owner_token,
+                    lease.generation,
+                    now,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def _verify_fenced_claim_sync(
+        self,
+        principal: JournalPrincipal,
+        lease: ClaimLease,
+    ) -> bool:
+        now = int(time.time() * 1000)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM session_claims
+                WHERE tenant_id = ? AND claim_type = ? AND resource_id = ?
+                  AND owner_token = ? AND generation = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    principal.tenant_id,
+                    lease.claim_type,
+                    lease.resource_id,
+                    lease.owner_token,
+                    lease.generation,
+                    now,
+                ),
+            ).fetchone()
+        return row is not None
+
+    def _release_fenced_claim_sync(
+        self,
+        principal: JournalPrincipal,
+        lease: ClaimLease,
+    ) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                UPDATE session_claims
+                SET lease_expires_at = 0, generation = generation + 1
+                WHERE tenant_id = ? AND claim_type = ? AND resource_id = ?
+                  AND owner_token = ? AND generation = ?
+                """,
+                (
+                    principal.tenant_id,
+                    lease.claim_type,
+                    lease.resource_id,
+                    lease.owner_token,
+                    lease.generation,
+                ),
             )
 
     def _append_audit_sync(
@@ -2319,6 +2664,38 @@ class SQLiteSessionEventJournal:
             (tenant_id, journal_kind, session_id, operation_id),
         ).fetchone()
         return int(row["value"])
+
+
+def _validated_stream_heads(
+    value: Mapping[SessionStreamKey, int] | None,
+) -> dict[SessionStreamKey, int] | None:
+    """Copy and validate a multi-stream CAS precondition for a worker thread."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("expected_stream_sequences 必须是非空 Mapping")
+    validated: dict[SessionStreamKey, int] = {}
+    for raw_stream, expected in value.items():
+        if not isinstance(raw_stream, tuple) or len(raw_stream) != 3:
+            raise ValueError(
+                "expected_stream_sequences Key 必须为 "
+                "(journal_kind, session_id, operation_id)"
+            )
+        journal_kind, session_id, operation_id = raw_stream
+        if journal_kind not in _JOURNAL_KINDS:
+            raise ValueError(f"Journal Kind 无效：{journal_kind}")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("Stream session_id 不能为空")
+        if operation_id is not None and (
+            not isinstance(operation_id, str) or not operation_id
+        ):
+            raise ValueError("Stream operation_id 必须是非空字符串或 None")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < -1:
+            raise ValueError("Stream Expected Sequence 必须是不小于 -1 的整数")
+        stream: SessionStreamKey = (journal_kind, session_id, operation_id)
+        validated[stream] = expected
+    return validated
 
 
 def _event_metadata(**values: Any) -> dict[str, Any]:

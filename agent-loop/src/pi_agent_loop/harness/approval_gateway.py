@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import copy
 import inspect
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, cast
@@ -23,9 +23,17 @@ from ..security import VerifiedIdentity
 from ..session.operation_events import OperationEvent
 from ..session.operation_state import replay_operation, replay_operation_with_specs
 from ..session.operation_store import (
+    ClaimLease,
     OperationEventStore,
     OperationStoreConflictError,
+    OperationStoreFencedClaimLostError,
+    fenced_claim_resource_id,
     operation_last_sequence,
+)
+from ..writes import (
+    hash_idempotency_key,
+    hash_scoped_idempotency_key,
+    is_outcome_unknown_error,
 )
 
 
@@ -46,6 +54,7 @@ IdentityResolver = Callable[
     [PendingApprovalResume],
     VerifiedIdentity | Awaitable[VerifiedIdentity],
 ]
+ResumeCallback = Callable[..., Any]
 
 
 class ApprovalResumeCoordinator:
@@ -91,14 +100,20 @@ class ApprovalResumeCoordinator:
         resume_payload: dict[str, Any],
         idempotency_key: str,
         ttl_seconds: float = 300,
+        fenced_claim: ClaimLease | None = None,
+        fenced_claim_lease_seconds: float = 300,
     ) -> PendingApprovalResume:
         self._require_atomic_store()
+        requester = self.approvals.assert_trusted_identity(
+            requester,
+            purpose="Approval resume requester",
+        )
         try:
             envelope = DurableActionEnvelope.from_dict(action)
         except DurableActionEnvelopeError as error:
             raise ApprovalResumeError(
                 "approval_action_envelope_invalid",
-                str(error),
+                "Approval Action Envelope 无效",
             ) from error
         if envelope.operation_id != operation_id:
             raise ApprovalResumeError(
@@ -119,7 +134,7 @@ class ApprovalResumeCoordinator:
             except DurableActionEnvelopeError as error:
                 raise ApprovalResumeError(
                     "approval_resume_envelope_invalid",
-                    str(error),
+                    "Approval Resume Envelope 无效",
                 ) from error
             if supplied != envelope:
                 raise ApprovalResumeError(
@@ -132,9 +147,13 @@ class ApprovalResumeCoordinator:
                 "approval_idempotency_key_missing",
                 "Approval Write 必须提供 Idempotency Key",
             )
-        idempotency_key_hash = hashlib.sha256(
-            idempotency_key.encode("utf-8")
-        ).hexdigest()
+        idempotency_key_hash = hash_scoped_idempotency_key(
+            idempotency_key,
+            session_id=session_id,
+            principal_id=requester.principal_id,
+            tool_name=envelope.tool_name,
+        )
+        legacy_idempotency_key_hash = hash_idempotency_key(idempotency_key)
         approval_id, approval_data = build_approval_request_event(
             requester=requester,
             action=envelope.to_dict(),
@@ -160,7 +179,10 @@ class ApprovalResumeCoordinator:
             if any(
                 event.type == "write_prepared"
                 and event.data.get("idempotencyKeyHash")
-                == idempotency_key_hash
+                in {idempotency_key_hash, legacy_idempotency_key_hash}
+                and event.session_id == session_id
+                and event.data.get("requesterId") == requester.principal_id
+                and event.data.get("toolName") == envelope.tool_name
                 for event in all_events
             ):
                 raise ApprovalResumeError(
@@ -193,9 +215,15 @@ class ApprovalResumeCoordinator:
                         "arguments": envelope.arguments,
                         "actionHash": envelope.action_hash,
                         "idempotencyKeyHash": idempotency_key_hash,
+                        "idempotencyHashVersion": 2,
                         "requesterId": requester.principal_id,
                         "requesterVerificationId": requester.verification_id,
                         "toolCallId": envelope.tool_call_id,
+                        "entityId": envelope.entity_id,
+                        "expectedEntityVersion": envelope.expected_entity_version,
+                        "businessPreconditions": copy.deepcopy(
+                            envelope.business_preconditions
+                        ),
                     },
                 ),
                 ("approval_requested", approval_data),
@@ -227,12 +255,27 @@ class ApprovalResumeCoordinator:
             ]
             replay_operation_with_specs(events, specs)
             try:
-                await self.store.append_batch(
-                    session_id,
-                    operation_id,
-                    specs,
-                    expected_last_sequence=operation_last_sequence(events),
-                )
+                if fenced_claim is None:
+                    await self.store.append_batch(
+                        session_id,
+                        operation_id,
+                        specs,
+                        expected_last_sequence=operation_last_sequence(events),
+                    )
+                else:
+                    await self.store.append_batch_if_fenced_claim(
+                        session_id,
+                        operation_id,
+                        specs,
+                        fenced_claim,
+                        renew_lease_seconds=fenced_claim_lease_seconds,
+                        expected_last_sequence=operation_last_sequence(events),
+                    )
+            except OperationStoreFencedClaimLostError as error:
+                raise ApprovalResumeError(
+                    "approval_request_claim_lost",
+                    "Session Writer Lease 已丢失，禁止注册 Approval Resume",
+                ) from error
             except OperationStoreConflictError:
                 continue
             approval = await self.approvals.get(approval_id)
@@ -252,7 +295,7 @@ class ApprovalResumeCoordinator:
         *,
         approver: VerifiedIdentity,
         consumer: VerifiedIdentity,
-        resume: Callable[[dict[str, Any]], Awaitable[Any]],
+        resume: ResumeCallback,
         atomic_write_start: bool = True,
     ) -> Any:
         """Waiting/Approved/Consumed/Started 均可安全重复调用。"""
@@ -307,7 +350,7 @@ class ApprovalResumeCoordinator:
 
     async def recover_incomplete(
         self,
-        resume: Callable[[dict[str, Any]], Awaitable[Any]],
+        resume: ResumeCallback,
         *,
         consumer_resolver: IdentityResolver | None = None,
     ) -> list[str]:
@@ -370,7 +413,7 @@ class ApprovalResumeCoordinator:
         *,
         approver: VerifiedIdentity | None,
         consumer: VerifiedIdentity | None,
-        resume: Callable[[dict[str, Any]], Awaitable[Any]],
+        resume: ResumeCallback,
         allow_grant: bool,
         atomic_write_start: bool,
     ) -> asyncio.Task[Any]:
@@ -410,47 +453,74 @@ class ApprovalResumeCoordinator:
         *,
         approver: VerifiedIdentity | None,
         consumer: VerifiedIdentity | None,
-        resume: Callable[[dict[str, Any]], Awaitable[Any]],
+        resume: ResumeCallback,
         allow_grant: bool,
         atomic_write_start: bool,
     ) -> Any:
         owner_token = str(uuid4())
-        acquired = await self.store.try_acquire_claim(
+        scoped_pending = await self.get_pending(approval_id)
+        resource_id = fenced_claim_resource_id(
             "approval_resume",
-            approval_id,
+            session_id=scoped_pending.approval.session_id,
+            operation_id=scoped_pending.approval.operation_id,
+            entity_id=approval_id,
+        )
+        lease = await self.store.acquire_fenced_claim(
+            "approval_resume",
+            resource_id,
             owner_token,
             lease_seconds=self.claim_lease_seconds,
         )
-        if not acquired:
+        if lease is None:
             raise ApprovalResumeError(
                 "approval_resume_claimed",
                 "Approval Resume 已被另一个 Worker Claim",
             )
         claim_lost = asyncio.Event()
         heartbeat = asyncio.create_task(
-            self._renew_claim(approval_id, owner_token, claim_lost),
+            self._renew_claim(lease, claim_lost),
             name=f"approval-resume-heartbeat:{approval_id}",
         )
-        try:
-            return await self._advance_and_resume_claimed(
+        execution = asyncio.create_task(
+            self._advance_and_resume_claimed(
                 approval_id,
                 approver=approver,
                 consumer=consumer,
                 resume=resume,
                 allow_grant=allow_grant,
                 atomic_write_start=atomic_write_start,
-                owner_token=owner_token,
+                lease=lease,
                 claim_lost=claim_lost,
+            ),
+            name=f"approval-resume-execution:{approval_id}",
+        )
+        lease_wait = asyncio.create_task(
+            claim_lost.wait(),
+            name=f"approval-resume-lease-loss:{approval_id}",
+        )
+        try:
+            await asyncio.wait(
+                {execution, lease_wait},
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if claim_lost.is_set():
+                if not execution.done():
+                    execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
+                raise ApprovalResumeError(
+                    "approval_resume_claim_lost",
+                    "Approval Resume Lease 已丢失，已取消旧 Worker",
+                )
+            return await execution
         finally:
+            for task in (execution, lease_wait):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(execution, lease_wait, return_exceptions=True)
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
-            await self.store.release_claim(
-                "approval_resume",
-                approval_id,
-                owner_token,
-            )
+            await self.store.release_fenced_claim(lease)
 
     async def _advance_and_resume_claimed(
         self,
@@ -458,10 +528,10 @@ class ApprovalResumeCoordinator:
         *,
         approver: VerifiedIdentity | None,
         consumer: VerifiedIdentity | None,
-        resume: Callable[[dict[str, Any]], Awaitable[Any]],
+        resume: ResumeCallback,
         allow_grant: bool,
         atomic_write_start: bool,
-        owner_token: str,
+        lease: ClaimLease,
         claim_lost: asyncio.Event,
     ) -> Any:
         completed = await self._completed_result(approval_id)
@@ -481,9 +551,19 @@ class ApprovalResumeCoordinator:
                     "approval_still_waiting",
                     "Approval 仍在等待人工批准",
                 )
-            approval = await self.approvals.grant(approval_id, approver)
+            approval = await self.approvals.grant(
+                approval_id,
+                approver,
+                fenced_claim=lease,
+                renew_lease_seconds=self.claim_lease_seconds,
+            )
         if approval.state in {"rejected", "expired"}:
-            await self._append_cancelled_if_missing(pending, approval.state)
+            await self._append_cancelled_if_missing(
+                pending,
+                approval.state,
+                lease=lease,
+                claim_lost=claim_lost,
+            )
             raise ApprovalResumeError(
                 "approval_not_resumable",
                 f"Approval 状态 {approval.state} 不能恢复",
@@ -494,29 +574,65 @@ class ApprovalResumeCoordinator:
                 f"Approval 状态 {approval.state} 不能开始 Resume",
             )
 
-        await self._assert_claim(approval_id, owner_token, claim_lost)
+        await self._assert_claim(lease, claim_lost)
         preconsumed = approval.state == "consumed"
+        if await self._has_resume_started(pending):
+            await self._append_resume_transition(
+                pending,
+                "approval_resume_reentered",
+                {
+                    "approvalId": approval_id,
+                    "fencingToken": lease.fencing_token,
+                },
+                lease=lease,
+                claim_lost=claim_lost,
+            )
+        if (
+            self.store.supports_cross_process_claims
+            and not _callback_accepts_keyword(resume, "fenced_claim")
+        ):
+            raise ApprovalResumeError(
+                "approval_resume_fenced_callback_required",
+                "跨进程 Approval Resume Callback 必须接收完整 Fenced Claim",
+            )
         try:
-            result = await resume(pending.resume_payload)
+            result = await invoke_fenced_callback(
+                resume,
+                pending.resume_payload,
+                fencing_token=lease.fencing_token,
+                fenced_claim=lease,
+            )
+            # Callback 返回是第一个迟到提交边界；先核对精确 generation，
+            # 再读取/验证其持久化结果，避免旧 Worker 被新租约接管后收敛终态。
+            await self._assert_claim(lease, claim_lost)
             await self._validate_atomic_write_claim(
                 pending,
                 preconsumed=preconsumed,
             )
             await self._validate_resume_completion(pending)
         except Exception as error:
-            if await self._has_resume_started(pending):
+            if (
+                await self._has_resume_started(pending)
+                and not is_outcome_unknown_error(error)
+            ):
                 await self._assert_claim(
-                    approval_id,
-                    owner_token,
+                    lease,
                     claim_lost,
                 )
                 await self._append_resume_transition(
                     pending,
                     "approval_resume_failed",
-                    {"approvalId": approval_id, "error": str(error)},
+                    {
+                        "approvalId": approval_id,
+                        "errorCode": "approval_resume_execution_failed",
+                        "error": "Approval Resume 执行失败",
+                        "fencingToken": lease.fencing_token,
+                    },
+                    lease=lease,
+                    claim_lost=claim_lost,
                 )
             raise
-        await self._assert_claim(approval_id, owner_token, claim_lost)
+        await self._assert_claim(lease, claim_lost)
         snapshot, stored = _snapshot_result(result)
         await self._append_resume_transition(
             pending,
@@ -525,7 +641,10 @@ class ApprovalResumeCoordinator:
                 "approvalId": approval_id,
                 "result": snapshot,
                 "resultStored": stored,
+                "fencingToken": lease.fencing_token,
             },
+            lease=lease,
+            claim_lost=claim_lost,
         )
         return result
 
@@ -561,7 +680,7 @@ class ApprovalResumeCoordinator:
         except DurableActionEnvelopeError as error:
             raise ApprovalResumeError(
                 "approval_resume_envelope_invalid",
-                str(error),
+                "Approval Resume Envelope 无效",
             ) from error
         if envelope != payload_envelope:
             raise ApprovalResumeError(
@@ -613,11 +732,16 @@ class ApprovalResumeCoordinator:
         self,
         pending: PendingApprovalResume,
         reason: str,
+        *,
+        lease: ClaimLease,
+        claim_lost: asyncio.Event,
     ) -> None:
         await self._append_resume_transition(
             pending,
             "approval_resume_cancelled",
             {"approvalId": pending.approval.approval_id, "reason": reason},
+            lease=lease,
+            claim_lost=claim_lost,
         )
 
     async def _load_scope(self) -> list[OperationEvent]:
@@ -628,6 +752,9 @@ class ApprovalResumeCoordinator:
         pending: PendingApprovalResume,
         event_type: str,
         data: dict[str, Any],
+        *,
+        lease: ClaimLease,
+        claim_lost: asyncio.Event,
     ) -> None:
         approval_id = pending.approval.approval_id
         for _ in range(20):
@@ -635,6 +762,11 @@ class ApprovalResumeCoordinator:
             if any(
                 event.type == event_type
                 and event.data.get("approvalId") == approval_id
+                and (
+                    event_type != "approval_resume_reentered"
+                    or event.data.get("fencingToken")
+                    == data.get("fencingToken")
+                )
                 for event in events
             ):
                 return
@@ -659,12 +791,21 @@ class ApprovalResumeCoordinator:
             specs = [(event_type, data)]
             replay_operation_with_specs(events, specs)
             try:
-                await self.store.append_batch(
+                await self.store.append_batch_if_fenced_claim(
                     pending.approval.session_id,
                     pending.approval.operation_id,
                     specs,
+                    lease,
+                    renew_lease_seconds=self.claim_lease_seconds,
                     expected_last_sequence=operation_last_sequence(events),
+                    expected_claim_entity_id=approval_id,
                 )
+            except OperationStoreFencedClaimLostError as error:
+                claim_lost.set()
+                raise ApprovalResumeError(
+                    "approval_resume_claim_lost",
+                    "Approval Resume Lease 已丢失，禁止提交状态",
+                ) from error
             except OperationStoreConflictError:
                 continue
             return
@@ -827,17 +968,14 @@ class ApprovalResumeCoordinator:
 
     async def _renew_claim(
         self,
-        approval_id: str,
-        owner_token: str,
+        lease: ClaimLease,
         claim_lost: asyncio.Event,
     ) -> None:
         while True:
             await asyncio.sleep(self.claim_renew_interval_seconds)
             try:
-                renewed = await self.store.try_acquire_claim(
-                    "approval_resume",
-                    approval_id,
-                    owner_token,
+                renewed = await self.store.renew_fenced_claim(
+                    lease,
                     lease_seconds=self.claim_lease_seconds,
                 )
             except Exception:
@@ -849,14 +987,11 @@ class ApprovalResumeCoordinator:
 
     async def _assert_claim(
         self,
-        approval_id: str,
-        owner_token: str,
+        lease: ClaimLease,
         claim_lost: asyncio.Event,
     ) -> None:
-        if claim_lost.is_set() or not await self.store.try_acquire_claim(
-            "approval_resume",
-            approval_id,
-            owner_token,
+        if claim_lost.is_set() or not await self.store.renew_fenced_claim(
+            lease,
             lease_seconds=self.claim_lease_seconds,
         ):
             claim_lost.set()
@@ -871,6 +1006,64 @@ class ApprovalResumeCoordinator:
                 "approval_atomic_store_required",
                 "Approval/Write/Resume 必须使用支持原子事务的 Operation Store",
             )
+
+
+async def invoke_fenced_callback(
+    callback: Callable[..., Any],
+    *args: Any,
+    fencing_token: int,
+    fenced_claim: ClaimLease | None = None,
+) -> Any:
+    """Invoke the additive fenced callback API without breaking old handlers."""
+
+    parameters: Mapping[str, inspect.Parameter]
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    kwargs: dict[str, Any] = {}
+    for name, value in (
+        ("fencing_token", fencing_token),
+        ("fenced_claim", fenced_claim),
+    ):
+        explicit = parameters.get(name)
+        if accepts_kwargs or (
+            explicit is not None
+            and explicit.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        ):
+            kwargs[name] = value
+    value = callback(*args, **kwargs)
+    return await cast(Awaitable[Any], value) if inspect.isawaitable(value) else value
+
+
+def _callback_accepts_keyword(callback: Callable[..., Any], name: str) -> bool:
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return False
+    explicit = parameters.get(name)
+    return bool(
+        (
+            explicit is not None
+            and explicit.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        )
+        or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
 
 
 def _validate_requestable_action(

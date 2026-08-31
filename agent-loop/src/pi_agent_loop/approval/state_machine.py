@@ -9,13 +9,19 @@ from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
-from ..security import VerifiedIdentity
+from ..security.identity import (
+    VerifiedIdentity,
+    VerifiedIdentityValidator,
+    validate_local_identity_provenance,
+)
 from ..session.operation_events import OperationEvent
 from ..session.operation_state import replay_operation, replay_operation_with_specs
 from ..session.operation_store import (
+    ClaimLease,
     OperationEventStore,
     OperationStoreConflictError,
     OperationStoreDeadlineExceeded,
+    OperationStoreFencedClaimLostError,
     operation_last_sequence,
 )
 
@@ -48,9 +54,47 @@ class ApprovalService:
         store: OperationEventStore,
         *,
         session_id: str | None = None,
+        identity_validator: VerifiedIdentityValidator | None = None,
     ) -> None:
         self.store = store
         self.session_id = session_id
+        self._identity_validator = (
+            identity_validator
+            if identity_validator is not None
+            else validate_local_identity_provenance
+        )
+
+    def assert_trusted_identity(
+        self,
+        identity: object,
+        *,
+        purpose: str = "Approval identity",
+    ) -> VerifiedIdentity:
+        """Validate an exact identity value at the Approval trust boundary.
+
+        The secure default accepts only identities sealed by the bundled verifier.
+        Production adapters may inject a validator that verifies their own OIDC/IAM
+        proof, while subclasses and duck objects remain categorically rejected.
+        """
+
+        if type(identity) is not VerifiedIdentity:
+            raise ApprovalError(
+                "verified_identity_required",
+                f"{purpose} 必须是运行时验证的 VerifiedIdentity",
+            )
+        try:
+            trusted = self._identity_validator(identity)
+        except Exception as error:
+            raise ApprovalError(
+                "identity_provenance_invalid",
+                f"{purpose} 的身份来源无法验证",
+            ) from error
+        if trusted is not True:
+            raise ApprovalError(
+                "identity_provenance_invalid",
+                f"{purpose} 的身份来源无法验证",
+            )
+        return identity
 
     async def request(
         self,
@@ -63,6 +107,10 @@ class ApprovalService:
         required_role: str,
         ttl_seconds: float = 300,
     ) -> ApprovalRecord:
+        requester = self.assert_trusted_identity(
+            requester,
+            purpose="Approval requester",
+        )
         if self.session_id is not None and session_id != self.session_id:
             raise ApprovalError(
                 "approval_session_out_of_scope",
@@ -105,7 +153,13 @@ class ApprovalService:
         approver: VerifiedIdentity,
         *,
         allow_self_approval: bool = False,
+        fenced_claim: ClaimLease | None = None,
+        renew_lease_seconds: float = 300,
     ) -> ApprovalRecord:
+        approver = self.assert_trusted_identity(
+            approver,
+            purpose="Approval approver",
+        )
         record = await self.get(approval_id)
         if record.required_role not in approver.roles:
             raise ApprovalError("approval_role_missing", "审批人缺少所需角色")
@@ -129,6 +183,8 @@ class ApprovalService:
             invalid_code="approval_not_waiting",
             invalid_message="Approval 已不在等待状态",
             deadline_ms=record.expires_at,
+            fenced_claim=fenced_claim,
+            renew_lease_seconds=renew_lease_seconds,
         )
 
     async def reject(
@@ -137,7 +193,13 @@ class ApprovalService:
         approver: VerifiedIdentity,
         *,
         reason: str,
+        fenced_claim: ClaimLease | None = None,
+        renew_lease_seconds: float = 300,
     ) -> ApprovalRecord:
+        approver = self.assert_trusted_identity(
+            approver,
+            purpose="Approval approver",
+        )
         record = await self.get(approval_id)
         if record.required_role not in approver.roles:
             raise ApprovalError("approval_role_missing", "审批人缺少所需角色")
@@ -154,6 +216,8 @@ class ApprovalService:
             invalid_code="approval_not_waiting",
             invalid_message="Approval 已不在等待状态",
             deadline_ms=record.expires_at,
+            fenced_claim=fenced_claim,
+            renew_lease_seconds=renew_lease_seconds,
         )
 
     async def consume(
@@ -162,7 +226,13 @@ class ApprovalService:
         *,
         action: dict[str, Any],
         consumer: VerifiedIdentity,
+        fenced_claim: ClaimLease | None = None,
+        renew_lease_seconds: float = 300,
     ) -> ApprovalRecord:
+        consumer = self.assert_trusted_identity(
+            consumer,
+            purpose="Approval consumer",
+        )
         record = await self.get(approval_id)
         if record.action_hash != action_digest(action):
             raise ApprovalError(
@@ -180,6 +250,9 @@ class ApprovalService:
             required_state="approved",
             invalid_code="approval_not_approved",
             invalid_message="Approval 尚未批准或已消费",
+            deadline_ms=record.expires_at,
+            fenced_claim=fenced_claim,
+            renew_lease_seconds=renew_lease_seconds,
         )
 
     async def get(self, approval_id: str) -> ApprovalRecord:
@@ -245,6 +318,8 @@ class ApprovalService:
         invalid_code: str,
         invalid_message: str,
         deadline_ms: int | None = None,
+        fenced_claim: ClaimLease | None = None,
+        renew_lease_seconds: float = 300,
     ) -> ApprovalRecord:
         for _ in range(_MAX_CONFLICT_RETRIES):
             events = await self.store.load(
@@ -257,19 +332,36 @@ class ApprovalService:
             specs = [(event_type, data)]
             replay_operation_with_specs(events, specs)
             try:
-                await self.store.append_batch(
-                    current.session_id,
-                    current.operation_id,
-                    specs,
-                    expected_last_sequence=operation_last_sequence(events),
-                    deadline_ms=deadline_ms,
-                )
+                if fenced_claim is None:
+                    await self.store.append_batch(
+                        current.session_id,
+                        current.operation_id,
+                        specs,
+                        expected_last_sequence=operation_last_sequence(events),
+                        deadline_ms=deadline_ms,
+                    )
+                else:
+                    await self.store.append_batch_if_fenced_claim(
+                        current.session_id,
+                        current.operation_id,
+                        specs,
+                        fenced_claim,
+                        renew_lease_seconds=renew_lease_seconds,
+                        expected_last_sequence=operation_last_sequence(events),
+                        deadline_ms=deadline_ms,
+                        expected_claim_entity_id=current.approval_id,
+                    )
             except OperationStoreDeadlineExceeded:
                 await self._expire(current)
                 raise ApprovalError(
                     "approval_expired",
                     "Approval 已过期，不能继续状态转换",
                 )
+            except OperationStoreFencedClaimLostError as error:
+                raise ApprovalError(
+                    "approval_resume_claim_lost",
+                    "Approval Resume Lease 已丢失，禁止状态转换",
+                ) from error
             except OperationStoreConflictError:
                 continue
             return _replay_approval(

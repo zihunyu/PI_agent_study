@@ -60,43 +60,36 @@ Tool Call
 
 ## 3. 文件放在哪里
 
-每个稳定工具独立文件：
+先区分工具归属。只有领域无关的内置能力或明确标注、可删除的虚构教学 Tool 才能放在
+脚手架核心，例如：
 
 ```text
 src/pi_agent_loop/tools/<tool_name>.py
-```
-
-例如：
-
-```text
 src/pi_agent_loop/tools/add.py
 src/pi_agent_loop/tools/multiply.py
 src/pi_agent_loop/tools/divide.py
-src/pi_agent_loop/tools/get_order_status.py
 ```
 
-共享校验器放在：
+真实项目的 Tool、校验器和工厂必须放在独立业务仓库或独立 Python 包：
 
 ```text
-src/pi_agent_loop/tools/validators.py
+my_business/tools/<tool_name>.py
+my_business/tools/validators.py
+my_business/tools/__init__.py
 ```
 
-工具集合和公开导出放在：
+真实业务测试也跟随业务包：
 
 ```text
-src/pi_agent_loop/tools/__init__.py
+my_business/tests/test_<domain>_tools.py
 ```
 
-包顶层公开导出放在：
+业务入口显式导入并注册，不允许把真实业务模块写入或反向导入到
+`pi_agent_loop.__init__`：
 
-```text
-src/pi_agent_loop/__init__.py
-```
-
-测试放在：
-
-```text
-tests/test_<domain>_tools.py
+```python
+from my_business.tools import create_tool_bundle
+from pi_agent_loop import ToolRegistry
 ```
 
 ---
@@ -445,6 +438,23 @@ raise RetryableToolError(
 
 参数错误、权限拒绝、Approval 拒绝、业务校验失败和用户取消不得标记为 Retryable。
 
+副作用 Tool 一旦进入 Handler，Runtime 会把未分类异常保守地视为
+`outcome_unknown`，避免调用方把“外部已提交但响应丢失”误当成普通失败后重放。
+只有 Adapter 能证明外部系统尚未收到或提交操作时，才可以显式抛出：
+
+```python
+from pi_agent_loop import DefinitelyNotCommittedToolError
+
+raise DefinitelyNotCommittedToolError(
+    "internal diagnostic only",
+    code="upstream_rejected_before_commit",
+    public_message="操作尚未提交，请稍后重试",
+)
+```
+
+该异常是严格的负提交证明，不得用于 Timeout、连接中断、响应解析失败或任何无法
+排除已提交的情况；原始异常文本不会自动进入模型、日志或持久事件。
+
 写工具默认不配置自动 Retry。只有服务端具备 Idempotency Key 和结果核对机制时，才能单独设计。
 
 ### 12.2 崩溃恢复 Replay Policy
@@ -459,6 +469,18 @@ replay_policy="never"  # 写操作或结果不确定，必须先 Reconcile
 默认是 `never`。只有经过幂等性评估的工具才能设置 `safe`。
 
 `DurableOperationRecorder` 会在工具实际进入函数前记录 `tool_dispatch_started`；恢复时根据 `replay_policy` 选择重放或状态核对。
+
+最终 Replay Policy 只能收紧，不能放宽。Tool 注册信息、可信 Intent Policy、Workflow
+和 Plan Step 任意一层声明 `never`，执行和恢复都必须按 `never` 处理；不得让 Router、
+模型输出、调用参数或 Recovery Callback 把它覆盖成 `safe`。无法确认时使用 `never`。
+
+`AgentTool` 是不可变安全配置。`ToolDispatchRuntime` 在注册时还会封存 replay、审批、
+Retry、Timeout、资源锁、Fencing、实现版本及 Handler 身份，并生成
+`ToolSecurityContract` 摘要。禁止用同名新实例覆盖已注册 Tool；Prepared Call 在真正
+派发前也会重新核对 Runtime 身份、注册代次和合同摘要。Durable Operation 会持久化该
+摘要；恢复时，当前 Tool 与原合同不一致，或旧 `safe` 事件缺少摘要，都必须转入人工
+处理，不能继续安全重放。Tool 的安全语义或实现发生合法升级时，应升级
+`implementation_version` / `security_policy_version`，并显式迁移 Session 配置。
 
 ---
 
@@ -505,6 +527,27 @@ Rollback/Compensation
 ```
 
 Approval 完成前不能执行写工具。
+
+写工具被 Plan 调用时也不能走裸 `plan_step_executor`。它必须经
+`plan_tool_bindings → ToolDispatchRuntime → Approval → WriteOperationService`，复用
+相同的 Action Hash、一次性 Receipt、Idempotency 和 `outcome_unknown`/Reconciliation
+语义。外部副作用可能已经发生但成功事件落盘失败时，不得返回普通失败并自动重试。
+
+多 Worker 场景下，写 Tool Context 必须携带精确的 `fencing_scope` 和单调
+`fencing_token`。业务数据库/API 应在同一事务或条件更新中拒绝旧 token；仅在框架内
+检查 Lease 或 Heartbeat 不能阻止已经失去所有权的 Worker 继续提交副作用。
+
+Tool 还要在自身元数据中声明审批和版本边界：
+
+```python
+requires_approval=True
+implementation_version="2"      # execute/参数语义变化时升级
+security_policy_version="3"     # 权限、脱敏、审批边界变化时升级
+```
+
+Host 会对 Tool、Capability 和 Intent 的审批声明取并集，任何一层要求审批都
+不能被 Router 关闭。受管 Session 的配置哈希包含上述版本；升级后必须新建
+Session，或在没有未完成 Operation 时显式执行配置迁移。
 
 ---
 
@@ -599,22 +642,29 @@ capability = "orders.read_current"
 
 ## 17. 公开导出
 
-新增工具后更新：
+新增领域无关的核心 Tool 时，可以按需更新：
 
 ```text
 src/pi_agent_loop/tools/__init__.py
 src/pi_agent_loop/__init__.py
 ```
 
-并更新 `__all__`。
+并更新 `__all__`。可删除的教学 Tool 应优先使用按需加载，确保删除样例后
+`import pi_agent_loop` 仍成功。
 
-用户应能够：
+例如核心教学工具可以兼容：
 
 ```python
 from pi_agent_loop import create_divide_tool
 ```
 
-不要要求用户导入内部私有执行函数。
+真实业务 Tool 不得加入上述两个核心导出文件。调用方应从自己的业务包导入：
+
+```python
+from my_business.tools import create_order_tool_bundle
+```
+
+无论哪一种，都不要要求用户导入内部私有执行函数。
 
 ---
 
@@ -680,7 +730,7 @@ Approval Gate
 
 ## 20. 文档和示例
 
-新增工具后至少更新：
+新增工具后至少更新其所属包的文档和示例：
 
 ```text
 README 工具列表
@@ -691,12 +741,14 @@ Capability 映射
 测试数量
 ```
 
-如果是业务工具，还要更新：
+如果是真实业务工具，以下文件也必须位于业务仓库或业务包中，而不是本脚手架：
 
 ```text
-BUSINESS_REQUIREMENTS.md
-config/business.toml.example
+my_business/BUSINESS_REQUIREMENTS.md
+my_business/config/business.toml.example
 ```
+
+只有领域无关的核心能力或虚构教学样例，才更新脚手架自己的 README 和示例。
 
 ---
 
@@ -705,7 +757,11 @@ config/business.toml.example
 ```python
 from __future__ import annotations
 
-from ..types import AgentTool, AgentToolResult
+# 真实业务包从脚手架公开 API 导入；不要依赖 pi_agent_loop 内部相对路径。
+from pi_agent_loop import AgentTool, AgentToolResult
+
+# 仅当该文件确实属于 src/pi_agent_loop 内的通用/教学 Tool 时，才可以使用：
+# from ..types import AgentTool, AgentToolResult
 
 
 def validate(arguments):
@@ -780,9 +836,9 @@ AI 每次新增工具必须按顺序执行：
 9. 实现 execute
 10. 配置取消和 Timeout
 11. 注册到 ToolRegistry/CapabilityRegistry
-12. 更新公开导出
-13. 更新 business.toml（业务工具）
-14. 更新 README
+12. 更新所属包的公开导出（真实业务不得修改 pi_agent_loop 根导出）
+13. 更新业务包自己的 business.toml（业务工具）
+14. 更新所属包自己的 README
 15. 运行全部测试
 16. 检查 Git 密钥隔离
 17. 汇报 Mock 与真实接口边界
@@ -812,7 +868,7 @@ AI 每次新增工具必须按顺序执行：
 - [ ] 错误脱敏；
 - [ ] ToolRegistry 注册；
 - [ ] CapabilityRegistry 注册（业务工具）；
-- [ ] 包公开导出；
+- [ ] 所属包公开导出（真实业务未污染 `pi_agent_loop` 根导出）；
 - [ ] 单元测试；
 - [ ] Agent 集成测试；
 - [ ] Timeout/取消测试；
@@ -820,7 +876,7 @@ AI 每次新增工具必须按顺序执行：
 - [ ] Update Listener 失败后子令牌仍 Detach；
 - [ ] 取消/跳过后全部 Tool Call 都有 Synthetic ToolResult；
 - [ ] Transcript Closure 校验通过；
-- [ ] README 更新；
-- [ ] BUSINESS_REQUIREMENTS 更新（业务工具）；
+- [ ] 所属包 README 更新；
+- [ ] 业务包自己的 BUSINESS_REQUIREMENTS 更新（业务工具）；
 - [ ] 全部测试通过；
 - [ ] 无真实秘密进入 Git。

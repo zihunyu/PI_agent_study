@@ -7,6 +7,7 @@ import hashlib
 import json
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from pi_agent_loop import Agent, Model, ScriptedProvider, assistant_message, user_message
 from pi_agent_loop.retry.compaction import (
@@ -222,6 +223,53 @@ class P2ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("approvalLedger", replacement.summary)
         self.assertIn("constraintLedger", replacement.summary)
+
+    async def test_非订单领域事实通过通用domainFacts保留(self) -> None:
+        facts = {
+            "deployment_id": "deploy-7",
+            "environment": "staging",
+            "health": "degraded",
+        }
+        source = [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "运行记录" * 800}],
+                "domainFacts": facts,
+            },
+            *[
+                assistant_message(
+                    model=self.model,
+                    content=[{"type": "text", "text": "普通消息" * 120}],
+                )
+                for _ in range(6)
+            ],
+            user_message("继续诊断"),
+        ]
+
+        replacement = await TokenAwareStructuredCompactor(
+            320,
+            keep_recent_messages=1,
+        )(source)
+        replacement.verify(source)
+
+        self.assertEqual(
+            replacement.summary["factLedger"],
+            [
+                {
+                    "sourceIndex": 0,
+                    "fields": {"domainFacts": facts},
+                    "contentFacts": [],
+                }
+            ],
+        )
+        source_code = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "pi_agent_loop"
+            / "retry"
+            / "compaction.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("_BUSINESS_FACT_TEXT_MARKERS", source_code)
 
     async def test_压缩后仍超预算时不会发起第二次模型请求(self) -> None:
         overflow = assistant_message(

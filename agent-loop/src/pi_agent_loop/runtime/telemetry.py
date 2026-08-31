@@ -7,6 +7,8 @@ Prometheus, an APM product or their existing logging stack.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
 import math
 import threading
@@ -16,8 +18,16 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+from ..messages import is_sensitive_key, redact_sensitive_text
+
 TelemetrySink = Callable[[dict[str, Any]], Any]
 MetricKind = Literal["counter", "gauge", "histogram"]
+
+DEFAULT_MAX_METRIC_SERIES_PER_KIND = 4_096
+DEFAULT_MAX_METRIC_LABELS = 16
+DEFAULT_MAX_METRIC_LABEL_LENGTH = 256
+DEFAULT_MAX_SPAN_EVENTS = 256
+DEFAULT_EXPORT_TIMEOUT_SECONDS = 1.0
 
 _SENSITIVE_PARTS = (
     "authorization",
@@ -31,7 +41,12 @@ _SENSITIVE_PARTS = (
 )
 
 
-async def _maybe_await(value: Any) -> Any:
+async def _invoke_sink(sink: TelemetrySink, payload: dict[str, Any]) -> Any:
+    """Invoke arbitrary sinks without letting synchronous code block the loop."""
+
+    if inspect.iscoroutinefunction(sink):
+        return await cast(Callable[[dict[str, Any]], Awaitable[Any]], sink)(payload)
+    value = await asyncio.to_thread(sink, payload)
     if inspect.isawaitable(value):
         return await cast(Awaitable[Any], value)
     return value
@@ -45,23 +60,50 @@ def redact_telemetry_fields(value: Any) -> Any:
         for raw_key, item in value.items():
             key = str(raw_key)
             normalized = key.casefold().replace("-", "_")
-            if any(part in normalized for part in _SENSITIVE_PARTS):
+            if is_sensitive_key(key) or any(
+                part in normalized for part in _SENSITIVE_PARTS
+            ):
                 output[key] = "[REDACTED]"
             else:
                 output[key] = redact_telemetry_fields(item)
         return output
     if isinstance(value, (list, tuple)):
         return [redact_telemetry_fields(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str):
+        return redact_sensitive_text(value, replacement="[REDACTED]")
+    if isinstance(value, (int, float, bool)) or value is None:
         return value
     # Avoid invoking arbitrary repr implementations that may expose credentials.
     return f"<{type(value).__name__}>"
 
 
-def _labels_key(labels: Mapping[str, Any] | None) -> tuple[tuple[str, str], ...]:
+def _labels_key(
+    labels: Mapping[str, Any] | None,
+    *,
+    max_labels: int,
+    max_label_length: int,
+) -> tuple[tuple[str, str], ...]:
     if not labels:
         return ()
-    return tuple(sorted((str(key), str(value)) for key, value in labels.items()))
+    pairs = sorted(
+        (
+            str(key)[:max_label_length],
+            str(value)[:max_label_length],
+        )
+        for key, value in labels.items()
+    )
+    if len(pairs) > max_labels:
+        # Keep memory bounded without making observability input capable of
+        # failing the workload.  The marker also makes the lossy projection
+        # visible to exporters.  A bounded digest prevents different omitted
+        # label sets from silently collapsing into the same admitted series.
+        omitted_digest = hashlib.sha256(repr(pairs).encode("utf-8")).hexdigest()[
+            : min(16, max_label_length)
+        ]
+        pairs = pairs[: max_labels - 1] + [
+            ("labels_truncated"[:max_label_length], omitted_digest)
+        ]
+    return tuple(pairs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,13 +131,63 @@ class _Histogram:
 class MetricRegistry:
     """Thread-safe counters, gauges and lightweight histogram summaries."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_series_per_kind: int = DEFAULT_MAX_METRIC_SERIES_PER_KIND,
+        max_labels_per_series: int = DEFAULT_MAX_METRIC_LABELS,
+        max_label_length: int = DEFAULT_MAX_METRIC_LABEL_LENGTH,
+    ) -> None:
+        self.max_series_per_kind = _positive_int(
+            max_series_per_kind,
+            "max_series_per_kind",
+        )
+        self.max_labels_per_series = _positive_int(
+            max_labels_per_series,
+            "max_labels_per_series",
+        )
+        self.max_label_length = _positive_int(
+            max_label_length,
+            "max_label_length",
+        )
         self._lock = threading.Lock()
         self._counters: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
         self._gauges: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
         self._histograms: dict[
             tuple[str, tuple[tuple[str, str], ...]], _Histogram
         ] = {}
+        self._dropped_series: dict[MetricKind, int] = {
+            "counter": 0,
+            "gauge": 0,
+            "histogram": 0,
+        }
+
+    def _key(
+        self,
+        name: str,
+        labels: Mapping[str, Any] | None,
+    ) -> tuple[str, tuple[tuple[str, str], ...]]:
+        return (
+            _metric_name(name),
+            _labels_key(
+                labels,
+                max_labels=self.max_labels_per_series,
+                max_label_length=self.max_label_length,
+            ),
+        )
+
+    def _admit_series(
+        self,
+        values: Mapping[tuple[str, tuple[tuple[str, str], ...]], Any],
+        key: tuple[str, tuple[tuple[str, str], ...]],
+        kind: MetricKind,
+    ) -> bool:
+        if key in values:
+            return True
+        if len(values) < self.max_series_per_kind:
+            return True
+        self._dropped_series[kind] += 1
+        return False
 
     def increment(
         self,
@@ -107,8 +199,10 @@ class MetricRegistry:
         numeric = _finite(value, "counter value")
         if numeric < 0:
             raise ValueError("counter value cannot be negative")
-        key = (_metric_name(name), _labels_key(labels))
+        key = self._key(name, labels)
         with self._lock:
+            if not self._admit_series(self._counters, key, "counter"):
+                return
             self._counters[key] = self._counters.get(key, 0.0) + numeric
 
     def set_gauge(
@@ -118,8 +212,10 @@ class MetricRegistry:
         *,
         labels: Mapping[str, Any] | None = None,
     ) -> None:
-        key = (_metric_name(name), _labels_key(labels))
+        key = self._key(name, labels)
         with self._lock:
+            if not self._admit_series(self._gauges, key, "gauge"):
+                return
             self._gauges[key] = _finite(value, "gauge value")
 
     def observe(
@@ -129,9 +225,11 @@ class MetricRegistry:
         *,
         labels: Mapping[str, Any] | None = None,
     ) -> None:
-        key = (_metric_name(name), _labels_key(labels))
+        key = self._key(name, labels)
         numeric = _finite(value, "histogram value")
         with self._lock:
+            if not self._admit_series(self._histograms, key, "histogram"):
+                return
             histogram = self._histograms.setdefault(key, _Histogram())
             histogram.observe(numeric)
 
@@ -148,8 +246,20 @@ class MetricRegistry:
                 )
                 for key, value in self._histograms.items()
             }
+            dropped_series = dict(self._dropped_series)
+        counter_rows = _metric_rows(counters, "value")
+        counter_rows.extend(
+            {
+                "name": "telemetry_metric_series_dropped_total",
+                "labels": {"kind": kind},
+                "value": float(count),
+            }
+            for kind, count in sorted(dropped_series.items())
+            if count
+        )
+        counter_rows.sort(key=lambda row: (row["name"], sorted(row["labels"].items())))
         return {
-            "counters": _metric_rows(counters, "value"),
+            "counters": counter_rows,
             "gauges": _metric_rows(gauges, "value"),
             "histograms": [
                 {
@@ -190,6 +300,19 @@ def _finite(value: float, label: str) -> float:
     return numeric
 
 
+def _positive_int(value: int, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _positive_float(value: float, label: str) -> float:
+    numeric = _finite(value, label)
+    if numeric <= 0:
+        raise ValueError(f"{label} must be positive")
+    return numeric
+
+
 @dataclass(slots=True)
 class TelemetrySpan:
     """One trace span. Call ``finish`` exactly once or use ``async with``."""
@@ -203,10 +326,15 @@ class TelemetrySpan:
     started_at: float = field(default_factory=time.monotonic)
     started_timestamp_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     events: list[dict[str, Any]] = field(default_factory=list)
+    max_events: int = DEFAULT_MAX_SPAN_EVENTS
+    _dropped_events: int = 0
     _finished: bool = False
 
     def add_event(self, name: str, **attributes: Any) -> None:
         if self._finished:
+            return
+        if len(self.events) >= self.max_events:
+            self._dropped_events += 1
             return
         self.events.append(
             {
@@ -241,6 +369,7 @@ class TelemetrySpan:
             "status": status,
             "attributes": redact_telemetry_fields(final_attributes),
             "events": list(self.events),
+            "droppedEvents": self._dropped_events,
         }
         if error is not None:
             payload["error"] = {
@@ -271,11 +400,18 @@ class Telemetry:
         span_sink: TelemetrySink | None = None,
         log_sink: TelemetrySink | None = None,
         alert_hooks: tuple[TelemetrySink, ...] | list[TelemetrySink] = (),
+        export_timeout_seconds: float = DEFAULT_EXPORT_TIMEOUT_SECONDS,
+        max_span_events: int = DEFAULT_MAX_SPAN_EVENTS,
     ) -> None:
         self.metrics = metrics or MetricRegistry()
         self.span_sink = span_sink
         self.log_sink = log_sink
         self.alert_hooks = tuple(alert_hooks)
+        self.export_timeout_seconds = _positive_float(
+            export_timeout_seconds,
+            "export_timeout_seconds",
+        )
+        self.max_span_events = _positive_int(max_span_events, "max_span_events")
 
     def start_span(
         self,
@@ -292,6 +428,7 @@ class Telemetry:
             span_id=uuid4().hex[:16],
             parent_span_id=parent_span_id,
             attributes=redact_telemetry_fields(dict(attributes or {})),
+            max_events=self.max_span_events,
         )
 
     async def log(
@@ -425,10 +562,33 @@ class Telemetry:
         if sink is None:
             return
         try:
-            await _maybe_await(sink(redact_telemetry_fields(payload)))
-        except Exception:
+            async with asyncio.timeout(self.export_timeout_seconds):
+                await _invoke_sink(sink, redact_telemetry_fields(payload))
+        except TimeoutError:
+            self.metrics.increment(
+                "telemetry_export_timeouts_total",
+                labels={"channel": str(payload.get("type", "unknown"))},
+            )
+            self.metrics.increment(
+                "telemetry_export_failures_total",
+                labels={
+                    "channel": str(payload.get("type", "unknown")),
+                    "error_type": "TimeoutError",
+                },
+            )
+            return
+        except Exception as error:
             # Telemetry is deliberately failure-isolated from the workload. A
-            # durable state sink belongs at the runtime boundary, not here.
+            # durable state sink belongs at the runtime boundary, not here. Keep
+            # a local, dependency-free signal so exporter failures do not become
+            # an invisible observability black hole.
+            self.metrics.increment(
+                "telemetry_export_failures_total",
+                labels={
+                    "channel": str(payload.get("type", "unknown")),
+                    "error_type": type(error).__name__,
+                },
+            )
             return
 
 

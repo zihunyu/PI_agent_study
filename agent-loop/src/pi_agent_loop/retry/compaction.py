@@ -759,30 +759,22 @@ _FACT_FIELD_NAMES = frozenset(
     {
         "businessfact",
         "businessfacts",
+        "contextfact",
+        "contextfacts",
+        "criticalfact",
+        "criticalfacts",
+        "domainfact",
+        "domainfacts",
+        "entitysnapshot",
+        "entitystate",
         "fact",
         "facts",
         "entityversion",
         "entityversions",
+        "statefact",
+        "statefacts",
+        "stateversion",
     }
-)
-_BUSINESS_FACT_TEXT_MARKERS = (
-    "order",
-    "payment",
-    "paid",
-    "refund",
-    "shipment",
-    "delivery",
-    "address",
-    "status",
-    "订单",
-    "付款",
-    "支付",
-    "退款",
-    "发货",
-    "收货",
-    "地址",
-    "状态",
-    "位置",
 )
 
 
@@ -792,10 +784,11 @@ def _structured_ledgers(
 ) -> dict[str, list[dict[str, Any]]]:
     """Derive exact, replay-verifiable safety ledgers from the source context.
 
-    Explicit metadata is preferred.  As a conservative fallback, short dropped
-    user statements and longer user statements carrying common business-state
-    markers are retained verbatim as facts.  If those facts make the replacement
-    too large, the caller fails safe instead of silently discarding them.
+    Explicit, domain-neutral metadata is preferred.  Short dropped user
+    statements remain available verbatim, while long authoritative facts must
+    use a ``*Facts``/``entityState`` field, a typed fact content block, or set
+    ``preserveInCompaction=true``.  The framework deliberately does not infer
+    authoritative facts from domain-specific vocabulary.
     """
 
     approvals: list[dict[str, Any]] = []
@@ -855,7 +848,7 @@ def _structured_ledgers(
             and bool(text)
             and (
                 len(text) <= 256
-                or any(marker in folded for marker in _BUSINESS_FACT_TEXT_MARKERS)
+                or message.get("preserveInCompaction") is True
             )
         )
         if fact_fields or content_facts or preserve_user_text:
@@ -887,7 +880,17 @@ def _content_fact_values(message: dict[str, Any]) -> list[Any]:
         for block in content
         if isinstance(block, dict)
         and str(block.get("type", "")).casefold()
-        in {"fact", "businessfact", "business_fact"}
+        in {
+            "fact",
+            "businessfact",
+            "business_fact",
+            "criticalfact",
+            "critical_fact",
+            "domainfact",
+            "domain_fact",
+            "statefact",
+            "state_fact",
+        }
     ]
 
 
@@ -929,9 +932,16 @@ def _validate_summary_message_records(
             raise ContextCompactionValidationError("结构化摘要的消息记录与原文不一致")
         if "text" in record:
             text = record.get("text")
-            if not isinstance(text, str) or not expected["text"].startswith(text):
+            expected_text = expected.get("text")
+            if (
+                not isinstance(text, str)
+                or not isinstance(expected_text, str)
+                or not expected_text.startswith(text)
+            ):
                 raise ContextCompactionValidationError("结构化摘要文本不是原文前缀")
-            if record.get("truncated") is not (len(expected["text"]) > len(text)):
+            if record.get("truncated") is not (
+                len(expected_text) > len(text)
+            ):
                 raise ContextCompactionValidationError("结构化摘要截断标记无效")
     omitted = all_records[:omitted_count]
     expected_digest = (

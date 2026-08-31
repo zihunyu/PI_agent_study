@@ -27,12 +27,37 @@ from .errors import (
 )
 from .serialize import serialize_chat_request
 from .settings import ProviderProfile
-from .sse import iter_sse_data
-from .translate import OpenAIStreamTranslator
+from .sse import (
+    DEFAULT_MAX_SSE_EVENT_BYTES,
+    DEFAULT_MAX_SSE_EVENTS,
+    DEFAULT_MAX_SSE_LINE_BYTES,
+    DEFAULT_MAX_SSE_TOTAL_BYTES,
+    iter_sse_data,
+)
+from .translate import (
+    DEFAULT_MAX_TOOL_ARGUMENT_BYTES,
+    DEFAULT_MAX_TOOL_CALLS,
+    DEFAULT_MAX_TOTAL_TOOL_ARGUMENT_BYTES,
+    OpenAIStreamTranslator,
+)
+
+
+def _positive_limit(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} 必须是正整数")
+    return value
 
 
 class OpenAICompatibleProvider:
     """把 OpenAI Chat Completions SSE 转成内部 Assistant 事件流。"""
+
+    # Generic Harness lifecycle opt-in; custom providers can expose the same
+    # marker without importing this adapter type.
+    manage_with_host = True
+    # Internal RetryingStreamFn surrounds the actual HTTP attempt, so the
+    # unified ModelCallRuntime must not charge provider.stream as another
+    # physical call on top of these attempts.
+    provides_physical_attempt_admission = True
 
     def __init__(
         self,
@@ -42,17 +67,57 @@ class OpenAICompatibleProvider:
         client: httpx.AsyncClient | None = None,
         owns_client: bool | None = None,
         limits: httpx.Limits | None = None,
+        max_sse_line_bytes: int = DEFAULT_MAX_SSE_LINE_BYTES,
+        max_sse_event_bytes: int = DEFAULT_MAX_SSE_EVENT_BYTES,
+        max_response_bytes: int = DEFAULT_MAX_SSE_TOTAL_BYTES,
+        max_sse_events: int = DEFAULT_MAX_SSE_EVENTS,
+        max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+        max_tool_argument_bytes: int = DEFAULT_MAX_TOOL_ARGUMENT_BYTES,
+        max_total_tool_argument_bytes: int = DEFAULT_MAX_TOTAL_TOOL_ARGUMENT_BYTES,
     ) -> None:
         if client is not None and transport is not None:
             raise ValueError("client and transport cannot be supplied together")
         if client is None and owns_client is False:
-            raise ValueError("an internally created client must be owned by the provider")
+            raise ValueError(
+                "an internally created client must be owned by the provider"
+            )
+        self.max_sse_line_bytes = _positive_limit(
+            "max_sse_line_bytes",
+            max_sse_line_bytes,
+        )
+        self.max_sse_event_bytes = _positive_limit(
+            "max_sse_event_bytes",
+            max_sse_event_bytes,
+        )
+        self.max_response_bytes = _positive_limit(
+            "max_response_bytes",
+            max_response_bytes,
+        )
+        self.max_sse_events = _positive_limit("max_sse_events", max_sse_events)
+        self.max_tool_calls = _positive_limit("max_tool_calls", max_tool_calls)
+        self.max_tool_argument_bytes = _positive_limit(
+            "max_tool_argument_bytes",
+            max_tool_argument_bytes,
+        )
+        self.max_total_tool_argument_bytes = _positive_limit(
+            "max_total_tool_argument_bytes",
+            max_total_tool_argument_bytes,
+        )
+        if self.max_sse_line_bytes > self.max_response_bytes:
+            raise ValueError("max_sse_line_bytes 不能大于 max_response_bytes")
+        if self.max_sse_event_bytes > self.max_response_bytes:
+            raise ValueError("max_sse_event_bytes 不能大于 max_response_bytes")
+        if self.max_tool_argument_bytes > self.max_total_tool_argument_bytes:
+            raise ValueError(
+                "max_tool_argument_bytes 不能大于 max_total_tool_argument_bytes"
+            )
         self.profile = profile
         self._client = client or httpx.AsyncClient(
             transport=transport,
             follow_redirects=False,
             trust_env=False,
-            limits=limits or httpx.Limits(
+            limits=limits
+            or httpx.Limits(
                 max_connections=100,
                 max_keepalive_connections=20,
                 keepalive_expiry=30.0,
@@ -71,6 +136,7 @@ class OpenAICompatibleProvider:
         self._retrying_stream = RetryingStreamFn(
             self._stream_attempt,
             profile.retry_policy,
+            physical_attempt_admission=True,
         )
 
     @property
@@ -156,9 +222,7 @@ class OpenAICompatibleProvider:
         options: dict[str, Any],
     ) -> None:
         cancellation = options.get("cancellation_token")
-        if cancellation is not None and not isinstance(
-            cancellation, CancellationToken
-        ):
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
             cancellation = None
 
         api_key_override = options.get("api_key")
@@ -230,40 +294,58 @@ class OpenAICompatibleProvider:
         }
 
         try:
-            async with self._client.stream(
-                "POST",
-                self.profile.request_url,
-                headers=headers,
-                json=payload,
-                timeout=timeout,
-            ) as response:
-                self._raise_for_status(response.status_code, response.headers)
-                content_type = response.headers.get("content-type", "")
-                if content_type and "text/event-stream" not in content_type:
-                    raise ProviderProtocolError(
-                        "第三方 API 在 stream=true 时未返回 text/event-stream"
-                    )
-
-                translator = OpenAIStreamTranslator(stream, model)
-                translator.start()
-                saw_done = False
-                async for data in iter_sse_data(response.aiter_bytes()):
-                    if data.strip() == "[DONE]":
-                        saw_done = True
-                        translator.finish()
-                        break
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError as error:
+            # httpx read timeouts apply to each I/O operation.  A peer that
+            # trickles one byte before every read timeout can otherwise keep a
+            # model attempt alive forever, so enforce a wall-clock deadline too.
+            async with asyncio.timeout(self.profile.request_timeout_seconds):
+                async with self._client.stream(
+                    "POST",
+                    self.profile.request_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout,
+                ) as response:
+                    self._raise_for_status(response.status_code, response.headers)
+                    content_type = response.headers.get("content-type", "")
+                    if content_type and "text/event-stream" not in content_type:
                         raise ProviderProtocolError(
-                            "SSE data 不是合法 JSON"
-                        ) from error
-                    translator.feed(event)
+                            "第三方 API 在 stream=true 时未返回 text/event-stream"
+                        )
 
-                if not saw_done:
-                    raise ProviderProtocolError(
-                        "SSE 连接在 data: [DONE] 之前结束"
+                    translator = OpenAIStreamTranslator(
+                        stream,
+                        model,
+                        max_tool_calls=self.max_tool_calls,
+                        max_tool_argument_bytes=self.max_tool_argument_bytes,
+                        max_total_tool_argument_bytes=(
+                            self.max_total_tool_argument_bytes
+                        ),
                     )
+                    translator.start()
+                    saw_done = False
+                    async for data in iter_sse_data(
+                        response.aiter_bytes(),
+                        max_line_bytes=self.max_sse_line_bytes,
+                        max_event_bytes=self.max_sse_event_bytes,
+                        max_total_bytes=self.max_response_bytes,
+                        max_events=self.max_sse_events,
+                    ):
+                        if data.strip() == "[DONE]":
+                            saw_done = True
+                            translator.finish()
+                            break
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError as error:
+                            raise ProviderProtocolError(
+                                "SSE data 不是合法 JSON"
+                            ) from error
+                        translator.feed(event)
+
+                    if not saw_done:
+                        raise ProviderProtocolError("SSE 连接在 data: [DONE] 之前结束")
+        except TimeoutError as error:
+            raise ProviderTimeoutError("第三方模型 API 流超过绝对截止时间") from error
         except httpx.TimeoutException as error:
             raise ProviderTimeoutError("第三方模型 API 请求超时") from error
         except httpx.HTTPError as error:

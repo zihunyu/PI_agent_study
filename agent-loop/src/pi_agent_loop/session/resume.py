@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
 
@@ -16,14 +16,19 @@ from ..model_policy import (
     validate_recoverable_model_response,
 )
 from .operation_state import (
+    ApprovalSnapshot,
     OperationState,
     ToolInvocationState,
+    WriteSnapshot,
     replay_operation,
     replay_operation_with_specs,
 )
 from .operation_store import (
+    ClaimLease,
     OperationEventStore,
     OperationStoreConflictError,
+    OperationStoreFencedClaimLostError,
+    fenced_claim_resource_id,
     operation_last_sequence,
 )
 
@@ -40,6 +45,20 @@ class RecoveryAction:
     approval_id: str | None = None
     write_id: str | None = None
     request_policy: ModelRequestPolicy | None = None
+    expected_replay_policy: str | None = None
+    expected_tool_contract_digest: str | None = None
+    # Monotonic Operation-Recovery ownership epoch. External adapters should
+    # persist/compare this token and reject lower, stale generations.
+    fencing_token: int | None = None
+    # Generation is only monotonic inside this canonical Claim resource.
+    # Downstream fencing must compare the pair, never the integer alone.
+    fencing_scope: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.fencing_token is None) != (self.fencing_scope is None):
+            raise ValueError(
+                "RecoveryAction fencing_token 与 fencing_scope 必须同时提供"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,11 +136,11 @@ class OperationRecoveryPlanner:
             ),
             None,
         )
-        if (
-            last_assistant is not None
-            and last_assistant.get("stopReason")
-            in {"error", "aborted", "length"}
-        ):
+        if last_assistant is not None and last_assistant.get("stopReason") in {
+            "error",
+            "aborted",
+            "length",
+        }:
             return OperationRecoveryPlan(
                 operation,
                 (
@@ -154,11 +173,14 @@ class OperationRecoveryPlanner:
                 if invocation is None:
                     actions.append(
                         RecoveryAction(
-                            kind="execute_tool",
+                            kind="manual_intervention",
                             tool_call_id=call_id,
                             tool_name=str(call.get("name", "")),
                             arguments=dict(call.get("arguments", {})),
-                            reason="Assistant Tool Call 已持久化，但尚未记录 Dispatch Intent",
+                            reason=(
+                                "Assistant Tool Call 已持久化，但缺少可信 Dispatch "
+                                "Intent；无法验证 Replay Policy 与 Action Binding"
+                            ),
                         )
                     )
                     continue
@@ -195,10 +217,7 @@ class OperationRecoveryPlanner:
             if policy is None:
                 action = RecoveryAction(
                     kind="manual_intervention",
-                    reason=(
-                        "待继续 Context 缺少持久化请求策略，"
-                        "禁止扩大工具可见范围"
-                    ),
+                    reason=("待继续 Context 缺少持久化请求策略，禁止扩大工具可见范围"),
                 )
             else:
                 action = RecoveryAction(
@@ -213,25 +232,73 @@ class OperationRecoveryPlanner:
             )
         return OperationRecoveryPlan(operation, (action,))
 
+    @staticmethod
+    def _write_recovery_action(
+        write: WriteSnapshot,
+        *,
+        kind: str,
+        reason: str,
+    ) -> RecoveryAction:
+        return RecoveryAction(
+            kind=kind,
+            reason=reason,
+            write_id=write.write_id,
+            tool_call_id=write.tool_call_id,
+            tool_name=write.tool_name,
+            arguments=write.arguments,
+            approval_id=write.approval_id,
+        )
+
+    @staticmethod
+    def _approval_recovery_action(
+        approval: ApprovalSnapshot,
+        *,
+        kind: str,
+        reason: str,
+        tool_name: str | None,
+        arguments: dict[str, Any],
+    ) -> RecoveryAction:
+        return RecoveryAction(
+            kind=kind,
+            reason=reason,
+            approval_id=approval.approval_id,
+            tool_call_id=approval.tool_call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            write_id=approval.write_id,
+        )
+
+    @staticmethod
+    def _tool_recovery_action(
+        invocation: ToolInvocationState,
+        *,
+        kind: str,
+        reason: str,
+        stored_result: dict[str, Any] | None = None,
+    ) -> RecoveryAction:
+        return RecoveryAction(
+            kind=kind,
+            reason=reason,
+            tool_call_id=invocation.tool_call_id,
+            tool_name=invocation.tool_name,
+            arguments=invocation.arguments,
+            stored_result=stored_result,
+            expected_replay_policy=invocation.replay_policy,
+            expected_tool_contract_digest=invocation.security_contract_digest,
+        )
+
     def _approval_write_actions(
         self,
         operation: OperationState,
     ) -> tuple[RecoveryAction, ...]:
         actions: list[RecoveryAction] = []
         for write in operation.writes.values():
-            common = {
-                "write_id": write.write_id,
-                "tool_call_id": write.tool_call_id,
-                "tool_name": write.tool_name,
-                "arguments": write.arguments,
-                "approval_id": write.approval_id,
-            }
             if write.state in {"submitting", "outcome_unknown", "reconciling"}:
                 actions.append(
-                    RecoveryAction(
+                    self._write_recovery_action(
+                        write,
                         kind="reconcile_write",
                         reason="写操作已经提交或结果不确定，必须核对状态",
-                        **common,
                     )
                 )
             elif write.state == "waiting_approval":
@@ -242,34 +309,34 @@ class OperationRecoveryPlanner:
                 )
                 if approval is None:
                     actions.append(
-                        RecoveryAction(
+                        self._write_recovery_action(
+                            write,
                             kind="manual_intervention",
                             reason="Waiting Write 缺少关联 Approval",
-                            **common,
                         )
                     )
                 elif approval.state == "waiting":
                     actions.append(
-                        RecoveryAction(
+                        self._write_recovery_action(
+                            write,
                             kind="wait_for_approval",
                             reason="写操作仍在等待审批",
-                            **common,
                         )
                     )
                 elif approval.state == "approved":
                     actions.append(
-                        RecoveryAction(
+                        self._write_recovery_action(
+                            write,
                             kind="consume_approval",
                             reason="关联 Approval 已批准，等待可信 Consumer 消费",
-                            **common,
                         )
                     )
                 elif approval.state in {"consumed", "resume_started"}:
                     actions.append(
-                        RecoveryAction(
+                        self._write_recovery_action(
+                            write,
                             kind="resume_approved_write",
                             reason="关联 Approval 已消费，可以恢复 Write Claim",
-                            **common,
                         )
                     )
                 elif approval.state in {
@@ -278,39 +345,36 @@ class OperationRecoveryPlanner:
                     "resume_cancelled",
                 }:
                     actions.append(
-                        RecoveryAction(
+                        self._write_recovery_action(
+                            write,
                             kind="finalize_rejected_approval",
                             reason=f"关联 Approval 状态为 {approval.state}",
-                            **common,
                         )
                     )
                 else:
                     actions.append(
-                        RecoveryAction(
+                        self._write_recovery_action(
+                            write,
                             kind="manual_intervention",
                             reason=(
                                 "Waiting Write 的 Approval 状态无法自动恢复："
                                 + approval.state
                             ),
-                            **common,
                         )
                     )
             elif write.state in {"prepared", "approved"}:
                 actions.append(
-                    RecoveryAction(
+                    self._write_recovery_action(
+                        write,
                         kind="resume_approved_write",
                         reason="写操作已准备完成，可以由 Write Runtime 恢复",
-                        **common,
                     )
                 )
         if actions:
             return tuple(actions)
 
         for approval in operation.approvals.values():
-            if (
-                approval.resume_state == "unregistered"
-                and approval.state == "consumed"
-            ):
+            if approval.resume_state == "unregistered" and approval.state == "consumed":
                 # 普通 WriteOperation Approval 已消费，无独立 Resume Workflow。
                 continue
             action = approval.action
@@ -318,101 +382,114 @@ class OperationRecoveryPlanner:
                 envelope = DurableActionEnvelope.from_dict(action)
             except DurableActionEnvelopeError:
                 envelope = None
-            common = {
-                "approval_id": approval.approval_id,
-                "tool_call_id": approval.tool_call_id,
-                "tool_name": (
-                    envelope.tool_name
-                    if envelope is not None
-                    else str(action.get("tool", "")) or None
-                ),
-                "arguments": (
-                    dict(envelope.arguments)
-                    if envelope is not None
-                    else dict(action.get("arguments", {}))
-                ),
-                "write_id": approval.write_id,
-            }
+            tool_name = (
+                envelope.tool_name
+                if envelope is not None
+                else str(action.get("tool", "")) or None
+            )
+            arguments = (
+                dict(envelope.arguments)
+                if envelope is not None
+                else dict(action.get("arguments", {}))
+            )
             if approval.state == "waiting":
                 actions.append(
-                    RecoveryAction(
+                    self._approval_recovery_action(
+                        approval,
                         kind="wait_for_approval",
                         reason="Approval 仍在等待人工批准",
-                        **common,
+                        tool_name=tool_name,
+                        arguments=arguments,
                     )
                 )
             elif approval.state == "approved":
                 actions.append(
-                    RecoveryAction(
+                    self._approval_recovery_action(
+                        approval,
                         kind="consume_approval",
                         reason="Approval 已批准，等待可信 Consumer 消费",
-                        **common,
+                        tool_name=tool_name,
+                        arguments=arguments,
                     )
                 )
             elif approval.state in {"consumed", "resume_started"}:
                 actions.append(
-                    RecoveryAction(
+                    self._approval_recovery_action(
+                        approval,
                         kind="resume_approved_write",
                         reason="Approval 已消费，可以恢复已批准写操作",
-                        **common,
+                        tool_name=tool_name,
+                        arguments=arguments,
                     )
                 )
             elif approval.state in {"rejected", "expired"}:
                 actions.append(
-                    RecoveryAction(
+                    self._approval_recovery_action(
+                        approval,
                         kind="finalize_rejected_approval",
                         reason=f"Approval 状态为 {approval.state}",
-                        **common,
+                        tool_name=tool_name,
+                        arguments=arguments,
                     )
                 )
             elif approval.state == "resume_failed":
                 actions.append(
-                    RecoveryAction(
+                    self._approval_recovery_action(
+                        approval,
                         kind="manual_intervention",
                         reason="Approval Resume 已失败，需要人工核对",
-                        **common,
+                        tool_name=tool_name,
+                        arguments=arguments,
                     )
                 )
         return tuple(actions)
 
     def _tool_action(self, invocation: ToolInvocationState) -> RecoveryAction:
-        common = {
-            "tool_call_id": invocation.tool_call_id,
-            "tool_name": invocation.tool_name,
-            "arguments": invocation.arguments,
-        }
         if invocation.phase == "completed":
-            return RecoveryAction(
+            return self._tool_recovery_action(
+                invocation,
                 kind="materialize_tool_result",
                 stored_result=invocation.result,
                 reason="工具结果已持久化，但 ToolResult Message 尚未写入 Context",
-                **common,
             )
         if invocation.phase == "outcome_unknown":
-            return RecoveryAction(
+            return self._tool_recovery_action(
+                invocation,
                 kind="reconcile_tool",
                 reason="写操作结果不确定，必须核对状态，不能直接重放",
-                **common,
             )
         if invocation.phase == "intent_recorded":
-            return RecoveryAction(
+            return self._tool_recovery_action(
+                invocation,
                 kind="execute_tool",
                 reason="工具尚未进入 Dispatch，可以安全执行",
-                **common,
             )
         if invocation.phase == "dispatch_started":
             if invocation.replay_policy == "safe":
-                return RecoveryAction(
+                if invocation.security_contract_digest is None:
+                    return self._tool_recovery_action(
+                        invocation,
+                        kind="manual_intervention",
+                        reason=(
+                            "Safe Replay 缺少持久 Tool Security Contract；"
+                            "无法证明当前 Handler 与原 Dispatch 相同"
+                        ),
+                    )
+                return self._tool_recovery_action(
+                    invocation,
                     kind="replay_safe_tool",
                     reason="工具声明 replay_policy=safe",
-                    **common,
                 )
-            return RecoveryAction(
+            return self._tool_recovery_action(
+                invocation,
                 kind="reconcile_tool",
                 reason="工具已进入 Dispatch 且不可安全重放",
-                **common,
             )
-        return RecoveryAction(kind="manual_intervention", reason="未知 Tool 状态", **common)
+        return self._tool_recovery_action(
+            invocation,
+            kind="manual_intervention",
+            reason="未知 Tool 状态",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,10 +503,13 @@ class RecoveryCallbacks:
     consume_approval: Callable[[RecoveryAction], Awaitable[Any]] | None = None
     resume_write: Callable[[RecoveryAction], Awaitable[Any]] | None = None
     reconcile_write: Callable[[RecoveryAction], Awaitable[Any]] | None = None
-    request_model_with_context: Callable[
-        [list[dict[str, Any]], ModelRequestPolicy, dict[str, str]],
-        Awaitable[dict[str, Any]],
-    ] | None = None
+    request_model_with_context: (
+        Callable[
+            [list[dict[str, Any]], ModelRequestPolicy, dict[str, str]],
+            Awaitable[dict[str, Any]],
+        ]
+        | None
+    ) = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,8 +521,7 @@ class RecoveryExecutionResult:
 
 @dataclass(frozen=True, slots=True)
 class _RecoveryClaim:
-    resource_id: str
-    owner_token: str
+    lease: ClaimLease
     lost: asyncio.Event
 
 
@@ -496,14 +575,21 @@ class DurableSessionRecovery:
         """使用跨进程 Lease Claim 串行恢复同一 Operation。"""
 
         owner_token = str(uuid4())
-        resource_id = f"{session_id}:{operation_id}"
-        acquired = await self.store.try_acquire_claim(
+        resource_id = fenced_claim_resource_id(
+            "operation_recovery",
+            session_id=session_id,
+            operation_id=operation_id,
+        )
+        acquire_fenced = getattr(self.store, "acquire_fenced_claim", None)
+        if not callable(acquire_fenced):
+            raise RuntimeError("Operation Recovery Store 缺少 Fenced Claim Generation")
+        lease = await acquire_fenced(
             "operation_recovery",
             resource_id,
             owner_token,
             lease_seconds=self.claim_lease_seconds,
         )
-        if not acquired:
+        if lease is None:
             plan = await self.plan(
                 session_id=session_id,
                 operation_id=operation_id,
@@ -513,7 +599,7 @@ class DurableSessionRecovery:
                 "recovery_claimed",
                 plan.actions,
             )
-        claim = _RecoveryClaim(resource_id, owner_token, asyncio.Event())
+        claim = _RecoveryClaim(lease, asyncio.Event())
         heartbeat = asyncio.create_task(
             self._renew_claim(claim),
             name=f"operation-recovery-heartbeat:{resource_id}",
@@ -531,11 +617,7 @@ class DurableSessionRecovery:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
-            await self.store.release_claim(
-                "operation_recovery",
-                resource_id,
-                owner_token,
-            )
+            await self.store.release_fenced_claim(lease)
 
     async def _resume_claimed(
         self,
@@ -566,25 +648,28 @@ class DurableSessionRecovery:
                     "waiting_approval",
                     plan.actions,
                 )
-            if any(
-                action.kind == "consume_approval" for action in plan.actions
-            ) and callbacks.consume_approval is None:
+            if (
+                any(action.kind == "consume_approval" for action in plan.actions)
+                and callbacks.consume_approval is None
+            ):
                 return RecoveryExecutionResult(
                     plan.operation,
                     "approval_consumer_required",
                     plan.actions,
                 )
-            if any(
-                action.kind == "resume_approved_write" for action in plan.actions
-            ) and callbacks.resume_write is None:
+            if (
+                any(action.kind == "resume_approved_write" for action in plan.actions)
+                and callbacks.resume_write is None
+            ):
                 return RecoveryExecutionResult(
                     plan.operation,
                     "approved_write_runtime_required",
                     plan.actions,
                 )
-            if any(
-                action.kind == "reconcile_write" for action in plan.actions
-            ) and callbacks.reconcile_write is None:
+            if (
+                any(action.kind == "reconcile_write" for action in plan.actions)
+                and callbacks.reconcile_write is None
+            ):
                 return RecoveryExecutionResult(
                     plan.operation,
                     "write_reconciliation_required",
@@ -621,16 +706,37 @@ class DurableSessionRecovery:
                         claim,
                     )
                 elif action.kind == "consume_approval":
+                    consume_approval = callbacks.consume_approval
+                    if consume_approval is None:
+                        return RecoveryExecutionResult(
+                            plan.operation,
+                            "approval_consumer_required",
+                            plan.actions,
+                        )
                     await self._assert_claim(claim)
-                    await callbacks.consume_approval(action)  # type: ignore[misc]
+                    await consume_approval(self._fenced_action(action, claim))
                     await self._assert_claim(claim)
                 elif action.kind == "resume_approved_write":
+                    resume_write = callbacks.resume_write
+                    if resume_write is None:
+                        return RecoveryExecutionResult(
+                            plan.operation,
+                            "approved_write_runtime_required",
+                            plan.actions,
+                        )
                     await self._assert_claim(claim)
-                    await callbacks.resume_write(action)  # type: ignore[misc]
+                    await resume_write(self._fenced_action(action, claim))
                     await self._assert_claim(claim)
                 elif action.kind == "reconcile_write":
+                    reconcile_write = callbacks.reconcile_write
+                    if reconcile_write is None:
+                        return RecoveryExecutionResult(
+                            plan.operation,
+                            "write_reconciliation_required",
+                            plan.actions,
+                        )
                     await self._assert_claim(claim)
-                    await callbacks.reconcile_write(action)  # type: ignore[misc]
+                    await reconcile_write(self._fenced_action(action, claim))
                     await self._assert_claim(claim)
                 elif action.kind == "finalize_rejected_approval":
                     await self._finalize_rejected_approval(
@@ -676,6 +782,14 @@ class DurableSessionRecovery:
     ) -> None:
         if action.request_policy is None:
             raise RuntimeError("恢复模型请求缺少持久化策略")
+        if (
+            self.store.supports_cross_process_claims
+            and callbacks.request_model_with_context is None
+        ):
+            raise RuntimeError(
+                "跨进程 Operation Recovery 必须使用能接收 Fencing Identity "
+                "的 request_model_with_context Callback"
+            )
         request_id = str(uuid4())
         specs: list[tuple[str, dict[str, Any]]] = []
         if action.kind == "retry_model_request":
@@ -698,6 +812,7 @@ class DurableSessionRecovery:
                     "requestId": request_id,
                     "requestPolicy": action.request_policy.to_dict(),
                     "recovery": True,
+                    "fencingToken": claim.lease.fencing_token,
                 },
             )
         )
@@ -709,6 +824,8 @@ class DurableSessionRecovery:
                 "operationId": operation.operation_id,
                 "runId": recovery_run_id,
                 "source": "recovery",
+                "fencingToken": str(claim.lease.fencing_token),
+                "fencingScope": claim.lease.resource_id,
             }
             if callbacks.request_model_with_context is not None:
                 message = await callbacks.request_model_with_context(
@@ -785,11 +902,17 @@ class DurableSessionRecovery:
         specs.append(
             (
                 "tool_dispatch_started",
-                {"toolCallId": action.tool_call_id, "recovery": True},
+                {
+                    "toolCallId": action.tool_call_id,
+                    "recovery": True,
+                    "fencingToken": claim.lease.fencing_token,
+                },
             )
         )
         await self._commit_specs(operation, specs, claim)
-        result_message = await callbacks.execute_tool(action)
+        result_message = await callbacks.execute_tool(
+            self._fenced_action(action, claim)
+        )
         await self._store_tool_result(
             operation,
             action,
@@ -805,8 +928,23 @@ class DurableSessionRecovery:
         callbacks: RecoveryCallbacks,
         claim: _RecoveryClaim,
     ) -> None:
-        await self._assert_claim(claim)
-        result_message = await callbacks.reconcile_tool(action)
+        await self._commit_specs(
+            operation,
+            [
+                (
+                    "tool_reconcile_started",
+                    {
+                        "toolCallId": action.tool_call_id,
+                        "recovery": True,
+                        "fencingToken": claim.lease.fencing_token,
+                    },
+                )
+            ],
+            claim,
+        )
+        result_message = await callbacks.reconcile_tool(
+            self._fenced_action(action, claim)
+        )
         await self._store_tool_result(
             operation,
             action,
@@ -821,7 +959,11 @@ class DurableSessionRecovery:
         action: RecoveryAction,
         claim: _RecoveryClaim,
     ) -> None:
-        if action.approval_id is None or action.tool_call_id is None or action.tool_name is None:
+        if (
+            action.approval_id is None
+            or action.tool_call_id is None
+            or action.tool_name is None
+        ):
             raise RuntimeError("Rejected Approval 缺少 Tool Call 关联")
         result_message = {
             "role": "toolResult",
@@ -934,14 +1076,18 @@ class DurableSessionRecovery:
             if not specs:
                 return
             replay_operation_with_specs(events, specs)
-            await self._assert_claim(claim)
             try:
-                await self.store.append_batch(
+                await self.store.append_batch_if_fenced_claim(
                     operation.session_id,
                     operation.operation_id,
                     specs,
+                    claim.lease,
+                    renew_lease_seconds=self.claim_lease_seconds,
                     expected_last_sequence=operation_last_sequence(events),
                 )
+            except OperationStoreFencedClaimLostError:
+                claim.lost.set()
+                raise RuntimeError("Operation Recovery Lease 已丢失，禁止提交后续状态")
             except OperationStoreConflictError:
                 continue
             return
@@ -994,6 +1140,11 @@ class DurableSessionRecovery:
                     "toolCallId": action.tool_call_id,
                     "result": result,
                     "recovery": True,
+                    **(
+                        {"fencingToken": claim.lease.fencing_token}
+                        if event_type == "tool_reconciled"
+                        else {}
+                    ),
                 },
             ),
             (
@@ -1072,15 +1223,18 @@ class DurableSessionRecovery:
                 operation_id=operation.operation_id,
             )
             replay_operation_with_specs(events, specs)
-            # Load/预验证可能耗时；真正进入事务前再次续租并确认所有权。
-            await self._assert_claim(claim)
             try:
-                appended = await self.store.append_batch(
+                appended = await self.store.append_batch_if_fenced_claim(
                     operation.session_id,
                     operation.operation_id,
                     specs,
+                    claim.lease,
+                    renew_lease_seconds=self.claim_lease_seconds,
                     expected_last_sequence=operation_last_sequence(events),
                 )
+            except OperationStoreFencedClaimLostError:
+                claim.lost.set()
+                raise RuntimeError("Operation Recovery Lease 已丢失，禁止提交后续状态")
             except OperationStoreConflictError:
                 continue
             return replay_operation([*events, *appended])
@@ -1088,12 +1242,9 @@ class DurableSessionRecovery:
 
     async def _renew_claim(self, claim: _RecoveryClaim) -> None:
         while True:
-            await asyncio.sleep(self.renew_interval)
             try:
-                renewed = await self.store.try_acquire_claim(
-                    "operation_recovery",
-                    claim.resource_id,
-                    claim.owner_token,
+                renewed = await self.store.renew_fenced_claim(
+                    claim.lease,
                     lease_seconds=self.claim_lease_seconds,
                 )
             except Exception:
@@ -1102,17 +1253,19 @@ class DurableSessionRecovery:
             if not renewed:
                 claim.lost.set()
                 return
+            await asyncio.sleep(self.renew_interval)
 
     async def _assert_claim(self, claim: _RecoveryClaim) -> None:
         if claim.lost.is_set():
-            raise RuntimeError(
-                "Operation Recovery Lease 已丢失，禁止提交后续状态"
-            )
+            raise RuntimeError("Operation Recovery Lease 已丢失，禁止提交后续状态")
         try:
-            held = await self.store.try_acquire_claim(
-                "operation_recovery",
-                claim.resource_id,
-                claim.owner_token,
+            # Refresh at every durable/external boundary in addition to the
+            # background heartbeat.  The renewal still matches the exact
+            # generation, so this cannot resurrect an expired/taken-over ABA
+            # lease; it only avoids losing a live lease while SQLite work or a
+            # busy event loop delays the heartbeat task.
+            held = await self.store.renew_fenced_claim(
+                claim.lease,
                 lease_seconds=self.claim_lease_seconds,
             )
         except Exception as error:
@@ -1122,9 +1275,20 @@ class DurableSessionRecovery:
             ) from error
         if not held:
             claim.lost.set()
-            raise RuntimeError(
-                "Operation Recovery Lease 已丢失，禁止提交后续状态"
-            )
+            raise RuntimeError("Operation Recovery Lease 已丢失，禁止提交后续状态")
+
+    @staticmethod
+    def _fenced_action(
+        action: RecoveryAction,
+        claim: _RecoveryClaim,
+    ) -> RecoveryAction:
+        """Bind every external recovery callback to the owned generation."""
+
+        return replace(
+            action,
+            fencing_token=claim.lease.fencing_token,
+            fencing_scope=claim.lease.resource_id,
+        )
 
 
 def _validate_recovery_tool_result(

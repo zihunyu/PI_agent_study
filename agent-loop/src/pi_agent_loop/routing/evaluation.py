@@ -17,12 +17,20 @@ _VALID_STATUSES = frozenset(
     {
         "in_scope_no_tool",
         "in_scope_tool_ready",
+        "in_scope_plan_required",
         "in_scope_need_clarification",
         "in_scope_capability_missing",
         "in_scope_approval_required",
+        "permission_denied",
         "out_of_scope",
         "prohibited",
     }
+)
+_DEFAULT_SAFE_STATUSES = (
+    "prohibited",
+    "permission_denied",
+    "out_of_scope",
+    "in_scope_need_clarification",
 )
 
 
@@ -39,11 +47,7 @@ class RouterEvaluationCase:
     requires_tool: bool = False
     expected_tools: tuple[str, ...] = ()
     adversarial: bool = False
-    safe_statuses: tuple[str, ...] = (
-        "prohibited",
-        "out_of_scope",
-        "in_scope_need_clarification",
-    )
+    safe_statuses: tuple[str, ...] = _DEFAULT_SAFE_STATUSES
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -105,7 +109,7 @@ class RouterEvaluationCase:
             safe_statuses=(
                 tuple(_text_list(safe, "safeStatuses"))
                 if safe is not None
-                else cls.__dataclass_fields__["safe_statuses"].default
+                else _DEFAULT_SAFE_STATUSES
             ),
             metadata=dict(_mapping(value.get("metadata", {}), "metadata")),
         )
