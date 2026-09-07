@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import inspect
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .cancellation import CancellationToken
+from ._context_transform import ContextTransformState, run_context_transform
 from .safety import ContentSafetyPipeline
 from .types import AfterToolCallContext, AfterToolCallResult, AgentToolResult, UNSET
 
@@ -31,6 +31,9 @@ class ExecutionPolicy:
     transform_context: Callable[..., Any] | None = None
     version: str = "1"
     transform_timeout_seconds: float = 30.0
+    _transform_state: ContextTransformState = field(
+        default_factory=ContextTransformState, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         import math
@@ -62,29 +65,20 @@ class ExecutionPolicy:
         callback = self.transform_context
         if callback is None:
             return copy.deepcopy(messages)
-        arguments: tuple[Any, ...] = (copy.deepcopy(messages), cancellation, context)
+        child = cancellation.create_child()
         try:
-            inspect.signature(callback).bind(*arguments)
-        except TypeError:
-            arguments = arguments[:2]
-
-        async def invoke() -> Any:
-            async with asyncio.timeout(self.transform_timeout_seconds):
-                return await _maybe_await(callback(*arguments))
-
-        work = asyncio.create_task(invoke(), name="pi-context-transform")
-        waiter = asyncio.create_task(
-            cancellation.wait(), name="pi-context-cancellation"
-        )
-        try:
-            await asyncio.wait({work, waiter}, return_when=asyncio.FIRST_COMPLETED)
-            cancellation.throw_if_cancelled()
-            result = await work
+            arguments: tuple[Any, ...] = (copy.deepcopy(messages), child, context)
+            try:
+                inspect.signature(callback).bind(*arguments)
+            except TypeError:
+                arguments = arguments[:2]
+            result = await run_context_transform(
+                callback, arguments, child,
+                timeout=self.transform_timeout_seconds,
+                state=self._transform_state,
+            )
         finally:
-            for task in (work, waiter):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(work, waiter, return_exceptions=True)
+            child.detach()
         if not isinstance(result, list) or any(
             not isinstance(item, dict) for item in result
         ):

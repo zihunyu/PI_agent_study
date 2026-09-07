@@ -61,14 +61,22 @@ class BusinessBundle:
         for name, policy in self.plan_policies.items():
             if name not in intents or policy.intent != name:
                 raise ValueError("unknown/mismatched plan intent")
-            entry = self.capabilities.entries_by_names(
-                (self.plan_tool_bindings[name],)
-            )[0]
-            if not set(policy.capabilities).issubset(entry.capabilities):
+            try:
+                entry = self.capabilities.entries_by_names(
+                    (self.plan_tool_bindings[name],)
+                )[0]
+            except KeyError:
+                raise ValueError(f"missing plan tool for {name}") from None
+            intent = intents[name]
+            if (
+                not set(policy.capabilities).issubset(entry.capabilities)
+                or not set(intent.required_capabilities).issubset(policy.capabilities)
+            ):
                 raise ValueError("plan binding capability conflict")
             if (
                 policy.replay_policy != entry.tool.replay_policy
                 or policy.write != entry.has_side_effect
+                or (intent.has_side_effect and not entry.has_side_effect)
             ):
                 raise ValueError("plan binding replay/side-effect contract conflict")
             if (
@@ -77,8 +85,14 @@ class BusinessBundle:
                 or intents[name].risk in {"high", "critical"}
             ) and not policy.requires_approval:
                 raise ValueError("plan binding cannot lower approval policy")
-            if policy.parameter_contract != _contract_for(entry.tool):
+            contract = _contract_for(entry.tool)
+            if (
+                policy.parameter_contract != contract
+                or set(intent.required_fields) != set(dict(contract.required))
+                or not set(intent.optional_fields).issubset(dict(contract.optional))
+            ):
                 raise ValueError("plan binding parameter contract conflict")
+        _validate_plan_dependencies(self.plan_policies)
 
     def create_router(self, *, model: Model, stream_fn: StreamFn) -> HybridModelRouter:
         return HybridModelRouter(
@@ -310,6 +324,17 @@ def load_business_bundle(
         if policy.write != entry.has_side_effect:
             raise ValueError(f"plan/tool side-effect conflict for {name}")
         policies[name], bindings[name] = policy, tool_name
+    return BusinessBundle(
+        tuple(registry.all_tools()),
+        registry,
+        config,
+        MappingProxyType(policies),
+        MappingProxyType(bindings),
+    )
+
+
+def _validate_plan_dependencies(policies: Mapping[str, IntentPlanPolicy]) -> None:
+    """Validate every trusted reference identically for TOML and Python bundles."""
     for policy in policies.values():
         if not set(policy.required_predecessor_intents).issubset(policies):
             raise ValueError(f"unknown predecessor for {policy.intent}")
@@ -318,6 +343,10 @@ def load_business_bundle(
             for binding in policy.argument_bindings
         ):
             raise ValueError(f"unknown argument binding source for {policy.intent}")
+        for condition in policy.preconditions:
+            references = (condition.left, condition.expected_from)
+            if any(ref is not None and ref.intent not in policies for ref in references):
+                raise ValueError(f"unknown precondition source for {policy.intent}")
     dependencies = {}
     for name, policy in policies.items():
         fields = (
@@ -330,6 +359,11 @@ def load_business_bundle(
             raise ValueError(f"unknown argument binding target for {name}")
         dependencies[name] = set(policy.required_predecessor_intents) | {
             binding.source.intent for binding in policy.argument_bindings
+        } | {
+            ref.intent
+            for condition in policy.preconditions
+            for ref in (condition.left, condition.expected_from)
+            if ref is not None
         }
     visited: set[str] = set()
     active: set[str] = set()
@@ -346,10 +380,3 @@ def load_business_bundle(
 
     for name in dependencies:
         visit(name)
-    return BusinessBundle(
-        tuple(registry.all_tools()),
-        registry,
-        config,
-        MappingProxyType(policies),
-        MappingProxyType(bindings),
-    )

@@ -131,6 +131,8 @@ jobs:
             --output-file=reports/licenses.json
       - name: Build distributions without an isolated dependency resolver
         run: python -m build --no-isolation
+      - name: Regress the declared minimum build backend and packaged example
+        run: python scripts/check_minimum_build.py
       - name: Check generic public APIs and packaged offline business example
         run: python scripts/check_generic_distribution.py dist
       - name: Check distribution metadata

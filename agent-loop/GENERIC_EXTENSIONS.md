@@ -27,7 +27,9 @@ policy = ExecutionPolicy(
 
 Host 的普通请求、路由、业务包 Planner 和 `model_runtime.request` 恢复共用 Runtime；内部 Agent 不重复注入。上下文转换只影响当前模型请求，不写回历史，所以恢复时由当前可信回调重新构造。`version` 进入受管会话配置摘要，旧配置无策略时保持原摘要。
 
-自定义 Planner / Validator / Replanner / Synthesizer 如需要模型，应调用共享 Runtime，或提供 `bind_runtime(*, stream_fn)` 返回独立实例。规则回调继续有效。任意 Python 回调自行持有并调用的外部客户端不可能被框架自动拦截；适配器必须遵守注入的 Runtime 合同。审核服务和异步转换回调应响应取消，转换有 `transform_timeout_seconds` 上限；旧同步转换回调应保持短小、避免阻塞 I/O。
+自定义 Planner / Validator / Replanner / Synthesizer 如需要模型，应调用共享 Runtime，或提供 `bind_runtime(*, stream_fn)` 返回独立实例。规则回调继续有效。任意 Python 回调自行持有并调用的外部客户端不可能被框架自动拦截；适配器必须遵守注入的 Runtime 合同。Runtime 的重试和上下文压缩在最终输入审核之外装配，每次重新进入 Provider 边界都审核当前输入；上下文转换每个逻辑请求仅执行一次。
+
+审核服务和异步转换回调应响应取消。`transform_timeout_seconds` 限制请求等待时间，取消清理最多额外等待 50ms；超时后拒绝晚到结果。旧同步转换回调在独立守护线程中运行，支持返回消息列表或 awaitable，不能依赖事件循环线程身份；需要事件循环的实现应改成异步回调。回调收到独立的子取消令牌，超时不会取消其他请求。若回调忽略取消，策略会跟踪其实际完成，并在此期间拒绝新的转换调用，避免重复堆积任务。Python 不能强制终止同进程内任意代码；必须响应取消且避免在异步回调中执行阻塞代码，需要强制终止的外部工作应由业务方在可终止的进程或服务中隔离。
 
 ## Journal 与事务参与者
 
@@ -64,3 +66,11 @@ Python 使用 `GenerationOptions(max_completion_tokens=1024, temperature=0.2, in
 未设置字段不发送。不按模型名称猜支持情况，不支持任意请求体覆盖。参数在 HTTP 派发前校验，重试使用同一有效配置；已设置的输出 Token 上限还会被当前预算进一步收紧。总预算仍包括输入、输出和服务计费用量，因此仅靠 HTTP 输出上限不能替代可信 Usage Meter。
 
 `usageObserved` 区分有效零用量和缺失/不完整 usage；usage-only 流片段会纳入最终结果。缺失用量不会被受管 Admission 当作可靠零费用。真实服务协议差异、价格和安全服务依旧由部署方配置，本轮测试使用 Mock HTTP 和离线 Provider。
+
+内置 Provider 同时收到输入、输出和总 Token 数时，要求总数与两项之和一致。矛盾用量按协议错误处理并标记为未知；通用 Runtime 也拒绝把小于输入/输出小计的总量作为可靠计量，保留预算预留并阻止后续尝试。
+
+## 配置与构建回归
+
+TOML Loader 与直接构造的 `BusinessBundle` 共用最终校验，包括 Intent 必需能力、工具参数合同、前置条件的两侧引用以及所有计划依赖的循环检查。新增依赖配置应在装配时失败，而非等到规划模型调用后才发现缺失引用。
+
+最低构建器为 `setuptools>=84.0.0`，与当前 CI 锁定版本一致。`python scripts/check_minimum_build.py` 要求使用恰好等于最低声明的版本，离线构建 wheel / sdist 并验证元数据、公开接口和示例；CI 保留此检查，防止仅在较新构建器上通过而最低版本失效。

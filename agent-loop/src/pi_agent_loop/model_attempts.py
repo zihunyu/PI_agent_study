@@ -233,7 +233,14 @@ def model_attempt_usage_known(message: Mapping[str, Any]) -> bool:
         if "totalTokens" in usage
         else [usage.get("input"), usage.get("output")]
     )
-    return all(type(value) is int and value >= 0 for value in values)
+    if not all(type(value) is int and value >= 0 for value in values):
+        return False
+    # Generic adapters may include additional billed categories in totalTokens,
+    # but the total must never be smaller than the known input/output subtotal.
+    components = [usage[name] for name in ("input", "output") if name in usage]
+    if any(type(value) is not int or value < 0 for value in components):
+        return False
+    return "totalTokens" not in usage or usage["totalTokens"] >= sum(components)
 
 
 def model_attempt_usage(message: Mapping[str, Any]) -> tuple[int, float]:
@@ -241,15 +248,9 @@ def model_attempt_usage(message: Mapping[str, Any]) -> tuple[int, float]:
     if not isinstance(usage, Mapping):
         return 0, 0.0
     total = usage.get("totalTokens")
-    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-        token_values = tuple(usage.get(name, 0) for name in ("input", "output"))
-        total = sum(
-            value
-            for value in token_values
-            if isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 0
-        )
+    token_values = tuple(usage.get(name, 0) for name in ("input", "output"))
+    subtotal = sum(value for value in token_values if type(value) is int and value >= 0)
+    total = max(total, subtotal) if type(total) is int and total >= 0 else subtotal
     cost_value = usage.get("cost")
     cost = cost_value.get("total", 0.0) if isinstance(cost_value, Mapping) else 0.0
     if (

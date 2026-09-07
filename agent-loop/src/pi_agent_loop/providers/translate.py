@@ -362,4 +362,10 @@ def _translate_usage(value: Any) -> dict[str, Any]:
     usage["input"] = token("prompt_tokens")
     usage["output"] = token("completion_tokens")
     usage["totalTokens"] = token("total_tokens") if "total_tokens" in value else usage["input"] + usage["output"]
+    if (
+        "prompt_tokens" in value
+        and "completion_tokens" in value
+        and usage["totalTokens"] != usage["input"] + usage["output"]
+    ):
+        raise ProviderProtocolError("usage.total_tokens 与输入/输出 Token 总和不一致")
     return usage

@@ -129,6 +129,27 @@ class ModelCallRuntime:
             if self.upstream_provides_physical_attempt_admission
             else self._admitted_upstream_stream
         )
+        # Inspect the actual context at the Provider boundary, inside Runtime
+        # retry/compaction wrappers. Context transformation remains once per
+        # logical request; compaction must not reuse a verdict on older input.
+        if execution_policy is not None and execution_policy.content_safety is not None:
+            dispatch = effective
+
+            async def inspected_stream(
+                model: Model, context: dict[str, Any], options: dict[str, Any]
+            ) -> Any:
+                token = options.get("cancellation_token") or CancellationToken()
+                scope = current_model_attempt_admission_scope()
+                phase = scope.stage if scope is not None else str(options.get("_execution_phase", "agent"))
+                messages = await execution_policy.inspect_input(
+                    context.get("messages", []), token,
+                    ExecutionContext(phase, self.tenant_id, self.session_id),
+                )
+                token.throw_if_cancelled()
+                value = dispatch(model, {**context, "messages": messages}, options)
+                return await value if inspect.isawaitable(value) else value
+
+            effective = inspected_stream
         if retry_policy is not None:
             effective = retry_model_stream(
                 effective,
@@ -653,14 +674,14 @@ class ModelCallRuntime:
         options: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         token = options.get("cancellation_token") or CancellationToken()
-        phase = str(options.pop("_execution_phase", "agent"))
+        phase = str(options.get("_execution_phase", "agent"))
         scope = current_model_attempt_admission_scope()
         if scope is not None:
             phase = scope.stage
         execution_context = ExecutionContext(phase, self.tenant_id, self.session_id)
         if self.execution_policy is not None:
             messages = await self.execution_policy.transform(context.get("messages", []), token, execution_context)
-            context = {**context, "messages": await self.execution_policy.inspect_input(messages, token, execution_context)}
+            context = {**context, "messages": messages}
         buffer_output = self.execution_policy is not None and self.execution_policy.content_safety is not None
         value = self.effective_stream_fn(model, context, options)
         upstream = (

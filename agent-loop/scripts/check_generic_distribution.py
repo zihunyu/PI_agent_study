@@ -38,6 +38,8 @@ def main() -> None:
             (example_dir / filename).write_bytes(archive.read(matches[0]))
     with tarfile.open(sources[0], "r:gz") as archive:
         names = archive.getnames()
+        for script_name in ("check_generic_distribution.py", "check_minimum_build.py"):
+            assert any(name.endswith(f"scripts/{script_name}") for name in names), script_name
         for filename in required:
             assert any(
                 name.endswith(f"examples/business_package/{filename}") for name in names
