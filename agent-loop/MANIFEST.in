@@ -1,0 +1,3 @@
+include GENERIC_EXTENSIONS.md
+include scripts/check_generic_distribution.py
+recursive-include examples/business_package *.py *.toml *.md

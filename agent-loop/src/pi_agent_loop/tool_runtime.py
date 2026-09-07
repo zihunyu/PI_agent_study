@@ -1192,6 +1192,7 @@ class ToolDispatchRuntime:
         max_update_tasks: int = 64,
         telemetry: Telemetry | None = None,
         default_tenant_id: str | None = None,
+        suppress_unreviewed_updates: bool = False,
     ) -> None:
         if default_tool_timeout_seconds is not None and default_tool_timeout_seconds <= 0:
             raise ValueError("default_tool_timeout_seconds 必须大于 0")
@@ -1203,6 +1204,9 @@ class ToolDispatchRuntime:
             not isinstance(default_tenant_id, str) or not default_tenant_id.strip()
         ):
             raise ValueError("default_tenant_id 必须是非空字符串或 None")
+        if type(suppress_unreviewed_updates) is not bool:
+            raise TypeError("suppress_unreviewed_updates must be boolean")
+        self.suppress_unreviewed_updates = suppress_unreviewed_updates
         self.tools: dict[str, AgentTool] = {}
         self._registrations: dict[str, _RegisteredTool] = {}
         self._registration_id = str(uuid4())
@@ -2054,6 +2058,15 @@ class ToolDispatchRuntime:
 
         def on_update(partial: AgentToolResult) -> None:
             nonlocal coalesced_update
+            # Partial results are not authoritative output and have not crossed
+            # the safety/after-hook boundary. Publish only the reviewed final
+            # result when the Host/Agent enabled content inspection.
+            if self.suppress_unreviewed_updates:
+                self.telemetry.metrics.increment(
+                    "tool_updates_dropped_total",
+                    labels={"tool": tool.name, "reason": "unreviewed"},
+                )
+                return
             if not accepting_updates:
                 self.telemetry.metrics.increment(
                     "tool_updates_dropped_total",

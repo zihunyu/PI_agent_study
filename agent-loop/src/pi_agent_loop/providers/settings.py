@@ -13,6 +13,8 @@ from ..retry.circuit_breaker import CircuitBreakerPolicy
 from ..retry.types import ModelRetryPolicy
 from .errors import ProviderConfigError
 
+from .generation import GenerationOptions
+
 _SUPPORTED_PROTOCOL = "openai_chat_completions"
 _SUPPORTED_ENDPOINT = "/chat/completions"
 _PLACEHOLDERS = {
@@ -31,8 +33,9 @@ _PROFILE_FIELDS = {
     "request_timeout_seconds",
     "allow_insecure_http",
     "retry",
+    "generation",
 }
-_REQUIRED_PROFILE_FIELDS = set(_PROFILE_FIELDS) - {"retry"}
+_REQUIRED_PROFILE_FIELDS = set(_PROFILE_FIELDS) - {"retry", "generation"}
 _RETRY_FIELDS = {
     "enabled",
     "max_retries",
@@ -67,6 +70,11 @@ class ProviderProfile:
     request_timeout_seconds: float
     allow_insecure_http: bool
     retry_policy: ModelRetryPolicy = field(default_factory=ModelRetryPolicy)
+    generation: GenerationOptions = field(default_factory=GenerationOptions)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.generation, GenerationOptions):
+            raise ProviderConfigError("generation must be GenerationOptions")
 
     @property
     def request_url(self) -> str:
@@ -306,6 +314,7 @@ def _parse_profile(name: str, raw: Any) -> ProviderProfile:
         ),
         allow_insecure_http=allow_insecure_http,
         retry_policy=_parse_retry_policy(data.get("retry"), name),
+        generation=GenerationOptions.from_mapping(data.get("generation", {})),
     )
 
 

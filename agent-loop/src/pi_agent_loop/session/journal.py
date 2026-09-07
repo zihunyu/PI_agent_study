@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 from cryptography.exceptions import InvalidTag
@@ -340,8 +340,227 @@ class ProjectionReplay:
     applied_events: int
 
 
+@dataclass(frozen=True, slots=True)
+class SessionJournalCapabilities:
+    backend_name: str
+    atomic_multi_stream_append: bool
+    atomic_fenced_append: bool
+    supports_cross_process: bool
+    supports_multi_host: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.backend_name, str) or not self.backend_name.strip():
+            raise ValueError("Journal backend_name must be non-empty")
+        for name in (
+            "atomic_multi_stream_append",
+            "atomic_fenced_append",
+            "supports_cross_process",
+            "supports_multi_host",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"Journal {name} must be boolean")
+        if self.supports_multi_host and not self.supports_cross_process:
+            raise ValueError("multi-host Journal must support cross-process access")
+
+
+@runtime_checkable
+class SessionEventJournal(Protocol):
+    """Transactional journal contract; CAS and fencing are part of the append transaction.
+
+    All stream heads are checked and all specs committed together, or none are.
+    Claim generations are monotonic; expired/old owners cannot append or renew.
+    Scope/authorization, immutable event identity, deduplication and authenticated
+    payload storage remain backend responsibilities. Capabilities describe the
+    deployed topology, not merely the availability of method names.
+    """
+
+    @property
+    def capabilities(self) -> SessionJournalCapabilities: ...
+
+    async def append_events(
+        self,
+        principal: JournalPrincipal,
+        specs: list[SessionEventSpec],
+        *,
+        expected_last_sequence: int | None = None,
+        expected_stream_sequences: Mapping[SessionStreamKey, int] | None = None,
+        deadline_ms: int | None = None,
+    ) -> list[SessionEvent]: ...
+
+    async def append_events_if_fenced_claim(
+        self,
+        principal: JournalPrincipal,
+        specs: list[SessionEventSpec],
+        lease: ClaimLease,
+        *,
+        renew_lease_seconds: float,
+        expected_last_sequence: int | None = None,
+        expected_stream_sequences: Mapping[SessionStreamKey, int] | None = None,
+        deadline_ms: int | None = None,
+    ) -> list[SessionEvent]: ...
+
+    async def load_events(
+        self,
+        principal: JournalPrincipal,
+        *,
+        session_id: str | None = None,
+        operation_id: str | None = None,
+        run_id: str | None = None,
+        journal_kind: JournalKind | None = None,
+        after_sequence: int | None = None,
+        include_expired: bool = False,
+        migration_registry: EventMigrationRegistry | None = None,
+        target_schema_version: int | None = None,
+    ) -> list[SessionEvent]: ...
+
+    async def export_session(
+        self, principal: JournalPrincipal, session_id: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def delete_session(
+        self, principal: JournalPrincipal, session_id: str
+    ) -> int: ...
+
+    async def purge_expired(
+        self, principal: JournalPrincipal, *, now_ms: int | None = None
+    ) -> int: ...
+
+    async def load_audit_events(
+        self, principal: JournalPrincipal
+    ) -> list[SessionEvent]: ...
+
+    async def verify_integrity(
+        self, principal: JournalPrincipal
+    ) -> tuple[int, int]: ...
+
+    async def rotate_encryption_keys(
+        self, principal: JournalPrincipal
+    ) -> tuple[int, int]: ...
+
+    async def run_event_migrations(
+        self,
+        principal: JournalPrincipal,
+        registry: EventMigrationRegistry,
+        *,
+        target_version: int | None = None,
+        session_id: str | None = None,
+    ) -> list[SessionEvent]: ...
+
+    async def save_snapshot(
+        self,
+        principal: JournalPrincipal,
+        *,
+        session_id: str,
+        projection_name: str,
+        last_sequence: int,
+        state: Any,
+        state_version: int,
+        event_schema_version: int | None = None,
+        retention_seconds: int | None = None,
+    ) -> SessionSnapshot: ...
+
+    async def load_snapshot(
+        self,
+        principal: JournalPrincipal,
+        *,
+        session_id: str,
+        projection_name: str,
+        state_registry: StateMigrationRegistry | None = None,
+        target_state_version: int | None = None,
+    ) -> SessionSnapshot | None: ...
+
+    async def migrate_snapshot(
+        self,
+        principal: JournalPrincipal,
+        *,
+        session_id: str,
+        projection_name: str,
+        registry: StateMigrationRegistry,
+        target_state_version: int,
+    ) -> SessionSnapshot: ...
+
+    async def replay_projection(
+        self,
+        principal: JournalPrincipal,
+        *,
+        session_id: str,
+        projection_name: str,
+        initial_state: Any,
+        reducer: Callable[[Any, SessionEvent], Any],
+        journal_kind: JournalKind | None = None,
+        state_registry: StateMigrationRegistry | None = None,
+        target_state_version: int | None = None,
+        event_registry: EventMigrationRegistry | None = None,
+        target_event_schema_version: int | None = None,
+    ) -> ProjectionReplay: ...
+
+    async def try_acquire_claim(
+        self,
+        principal: JournalPrincipal,
+        claim_type: str,
+        resource_id: str,
+        owner_token: str,
+        *,
+        lease_seconds: float = 300,
+    ) -> bool: ...
+
+    async def acquire_fenced_claim(
+        self,
+        principal: JournalPrincipal,
+        claim_type: str,
+        resource_id: str,
+        owner_token: str,
+        *,
+        lease_seconds: float = 300,
+    ) -> ClaimLease | None: ...
+
+    async def renew_fenced_claim(
+        self,
+        principal: JournalPrincipal,
+        lease: ClaimLease,
+        *,
+        lease_seconds: float = 300,
+    ) -> bool: ...
+
+    async def verify_fenced_claim(
+        self, principal: JournalPrincipal, lease: ClaimLease
+    ) -> bool: ...
+
+    async def release_fenced_claim(
+        self, principal: JournalPrincipal, lease: ClaimLease
+    ) -> None: ...
+
+    async def release_claim(
+        self,
+        principal: JournalPrincipal,
+        claim_type: str,
+        resource_id: str,
+        owner_token: str,
+    ) -> None: ...
+
+
+def validate_session_event_journal(
+    journal: Any, *, require_multi_host: bool = False
+) -> SessionEventJournal:
+    if not isinstance(journal, SessionEventJournal):
+        raise TypeError("Journal must implement SessionEventJournal")
+    capabilities = journal.capabilities
+    if not isinstance(capabilities, SessionJournalCapabilities) or not (
+        capabilities.atomic_multi_stream_append
+        and capabilities.atomic_fenced_append
+        and capabilities.supports_cross_process
+        and (not require_multi_host or capabilities.supports_multi_host)
+    ):
+        raise ValueError(
+            "Journal lacks atomic multi-stream, CAS, fencing or requested topology guarantees"
+        )
+    return journal
+
+
 class SQLiteSessionEventJournal:
     """统一 Session Journal、Snapshot Store 和数据治理边界。"""
+
+    capabilities = SessionJournalCapabilities("sqlite-session-journal", True, True, True, False)
 
     def __init__(
         self,
@@ -458,6 +677,11 @@ class SQLiteSessionEventJournal:
             migration_registry,
             target_schema_version,
         )
+
+    def load_events_sync(self, principal: JournalPrincipal, *, session_id: str | None=None, operation_id: str | None=None, run_id: str | None=None, journal_kind: JournalKind | None=None, after_sequence: int | None=None, include_expired: bool=False, migration_registry: EventMigrationRegistry | None=None, target_schema_version: int | None=None) -> list[SessionEvent]:
+        """Legacy synchronous adapter; prefer await load_events in async code."""
+        self.access_policy.authorize(principal, "read")
+        return self._load_events_sync(principal, session_id, operation_id, run_id, journal_kind, after_sequence, include_expired, migration_registry, target_schema_version)
 
     async def export_session(
         self,
@@ -2893,3 +3117,20 @@ def _validate_claim(
 
 def _optional_text(value: Any) -> str | None:
     return str(value) if value is not None and str(value) else None
+
+
+@runtime_checkable
+class SynchronousSessionEventJournal(Protocol):
+    def load_events_sync(
+        self,
+        principal: JournalPrincipal,
+        *,
+        session_id: str | None = None,
+        operation_id: str | None = None,
+        run_id: str | None = None,
+        journal_kind: JournalKind | None = None,
+        after_sequence: int | None = None,
+        include_expired: bool = False,
+        migration_registry: EventMigrationRegistry | None = None,
+        target_schema_version: int | None = None,
+    ) -> list[SessionEvent]: ...

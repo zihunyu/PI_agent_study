@@ -116,6 +116,8 @@ class ModelAttemptAdmissionScope:
                 raise ModelAttemptBudgetExceeded(
                     "Model Attempt Admission Scope is not active"
                 )
+            if self._unknown_attempts:
+                raise ModelAttemptBudgetExceeded("previous model usage is unknown")
             if self._attempt_count >= self.max_model_calls:
                 raise ModelAttemptBudgetExceeded(
                     "physical model-call budget is exhausted"
@@ -217,6 +219,21 @@ async def activate_model_attempt_admission(
     finally:
         _MODEL_ATTEMPT_SCOPE.reset(context_token)
         await scope._close()
+
+
+def model_attempt_usage_known(message: Mapping[str, Any]) -> bool:
+    """Explicitly missing usage must never settle an admission as free."""
+    if message.get("usageObserved") is False:
+        return False
+    usage = message.get("usage")
+    if not isinstance(usage, Mapping):
+        return False
+    values = (
+        [usage.get("totalTokens")]
+        if "totalTokens" in usage
+        else [usage.get("input"), usage.get("output")]
+    )
+    return all(type(value) is int and value >= 0 for value in values)
 
 
 def model_attempt_usage(message: Mapping[str, Any]) -> tuple[int, float]:

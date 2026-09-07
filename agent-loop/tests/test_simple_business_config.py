@@ -16,9 +16,9 @@ from pi_agent_loop import (  # noqa: E402
 
 
 class SimpleBusinessConfigTests(unittest.TestCase):
-    def test_示例配置不包含正则且可直接读取(self) -> None:
+    def test_固定测试配置保持路由验收合同(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        path = root / "config" / "business.toml.example"
+        path = root / "tests" / "fixtures" / "business_routing.toml"
         source = path.read_text(encoding="utf-8")
 
         config = load_simple_business_config(path)
@@ -31,6 +31,16 @@ class SimpleBusinessConfigTests(unittest.TestCase):
         assert query is not None
         self.assertTrue(query.must_use_tool)
         self.assertEqual(query.capability, "orders.read_current")
+
+    def test_工作区示例配置不包含正则且可直接读取(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        path = root / "config" / "business.toml.example"
+        source = path.read_text(encoding="utf-8")
+        config = load_simple_business_config(path)
+        self.assertNotIn("field_patterns", source)
+        self.assertNotIn("patterns =", source)
+        self.assertTrue(config.product.name)
+        self.assertTrue(config.intents)
 
     def test_must_use_tool_缺少_capability_会被拒绝(self) -> None:
         content = """

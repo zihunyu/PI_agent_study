@@ -91,6 +91,9 @@ from .store import (
     RuntimeStoreConflictError,
 )
 
+from .journal import SessionEventJournal, SessionJournalCapabilities, SynchronousSessionEventJournal, validate_session_event_journal
+from .journal_adapters import JournalOperationStore
+
 __all__ = [
     "DurableOperationRecorder",
     "DurableSessionRecovery",
@@ -162,3 +165,5 @@ __all__ = [
     "replay_operation",
     "replay_runtime_events",
 ]
+
+__all__ += ['SessionEventJournal', 'SessionJournalCapabilities', 'SynchronousSessionEventJournal', 'validate_session_event_journal', 'JournalOperationStore']

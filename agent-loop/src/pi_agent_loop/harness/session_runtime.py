@@ -38,6 +38,7 @@ def agent_configuration_hash(
     approval_policy_version: str = "1",
     plan_policy_version: str = "1",
     security_policy_version: str = "1",
+    execution_policy_version: str | None = None,
 ) -> str:
     """Return a stable digest for inputs that change transcript semantics."""
 
@@ -98,6 +99,7 @@ def agent_configuration_hash(
             "budget": _json_value(plan_budget),
         },
         "securityPolicyVersion": security_policy_version,
+        **({"executionPolicyVersion": execution_policy_version} if execution_policy_version is not None else {}),
     }
     encoded = json.dumps(
         value,

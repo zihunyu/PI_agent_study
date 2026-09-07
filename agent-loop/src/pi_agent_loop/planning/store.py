@@ -8,6 +8,8 @@ changing the core Journal schema or confusing the Operation reducer.
 
 from __future__ import annotations
 
+from ..session.journal import SessionEventJournal, validate_session_event_journal
+
 import hashlib
 import json
 from collections.abc import Mapping
@@ -18,7 +20,6 @@ from ..session.journal import (
     JournalConflictError,
     JournalFencedClaimLostError,
     JournalPrincipal,
-    SQLiteSessionEventJournal,
     SessionEvent,
     SessionEventSpec,
 )
@@ -138,25 +139,28 @@ class SessionJournalPlanStore:
     network filesystem happens to make the path visible elsewhere.
     """
 
-    capabilities = DurablePlanStoreCapabilities(
-        backend_name="sqlite-session-journal",
-        atomic_fenced_append=True,
-        supports_cross_process=True,
-        supports_multi_host=False,
-    )
-
     def __init__(
         self,
-        journal: SQLiteSessionEventJournal,
+        journal: SessionEventJournal,
         principal: JournalPrincipal,
         *,
         session_id: str,
     ) -> None:
         if not session_id:
             raise ValueError("Plan Store session_id 不能为空")
-        self.journal = journal
+        self.journal = validate_session_event_journal(journal)
         self.principal = principal
         self.session_id = session_id
+
+    @property
+    def capabilities(self) -> DurablePlanStoreCapabilities:
+        capabilities = self.journal.capabilities
+        return DurablePlanStoreCapabilities(
+            backend_name=capabilities.backend_name,
+            atomic_fenced_append=capabilities.atomic_fenced_append,
+            supports_cross_process=capabilities.supports_cross_process,
+            supports_multi_host=capabilities.supports_multi_host,
+        )
 
     @property
     def tenant_id(self) -> str:

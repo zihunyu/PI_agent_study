@@ -46,6 +46,8 @@ from .types import (
     ToolGuardViolation,
 )
 
+from .routed_agent import RuntimeBoundRouter
+
 __all__ = [
     "BusinessConfigError",
     "CapabilityMatch",
@@ -89,3 +91,5 @@ __all__ = [
     "guard_stream_fn",
     "load_simple_business_config",
 ]
+
+__all__ += ['RuntimeBoundRouter']

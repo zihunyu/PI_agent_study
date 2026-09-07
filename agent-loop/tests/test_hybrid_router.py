@@ -29,7 +29,7 @@ class HybridRouterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[1]
         self.config = load_simple_business_config(
-            root / "config" / "business.toml.example"
+            root / "tests" / "fixtures" / "business_routing.toml"
         )
         self.model = Model(id="hybrid-model", provider="fake", api="fake")
 
@@ -180,9 +180,7 @@ class HybridRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.total_cost, 0.42)
 
     async def test_no_tool_intent_由模型识别但不要求业务工具(self) -> None:
-        provider = ScriptedProvider(
-            [self.classifier_response("order.explain_status")]
-        )
+        provider = ScriptedProvider([self.classifier_response("order.explain_status")])
         router = HybridModelRouter(
             self.config,
             self.capabilities(),
@@ -240,9 +238,7 @@ class HybridRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("置信度", decision.reason)
 
     async def test_缺少必要字段使用配置中的追问(self) -> None:
-        provider = ScriptedProvider(
-            [self.classifier_response("order.get_status")]
-        )
+        provider = ScriptedProvider([self.classifier_response("order.get_status")])
         router = HybridModelRouter(
             self.config,
             self.capabilities(),
@@ -314,9 +310,7 @@ class HybridRouterTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 assistant_message(
                     model=self.model,
-                    content=[
-                        {"type": "text", "text": "订单 1001 已发货"}
-                    ],
+                    content=[{"type": "text", "text": "订单 1001 已发货"}],
                 ),
             ]
         )

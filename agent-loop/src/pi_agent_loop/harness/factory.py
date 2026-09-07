@@ -6,6 +6,14 @@ Recovery 与业务协调器都在这里完成一次性装配，避免不同执�
 
 from __future__ import annotations
 
+from ..routing.routed_agent import RuntimeBoundRouter
+from types import MethodType
+
+from ..planning.store_protocol import JournalPlanStore
+from ..session.journal import validate_session_event_journal
+
+from ..execution_policy import ExecutionPolicy, guard_tool_output
+
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +35,6 @@ from ..retry.circuit_breaker import CircuitBreaker
 from ..retry.compaction import CompactionRetryPolicy, ContextReplacement
 from ..retry.types import ModelRetryPolicy
 from ..routing.capabilities import CapabilityRegistry
-from ..routing.hybrid_router import HybridModelRouter
 from ..routing.routed_agent import RoutedAgent
 from ..runtime import RuntimeStateTracker, Telemetry
 from ..session import (
@@ -93,6 +100,7 @@ class DurableHostSettings:
     approval_policy_version: str = "1"
     plan_policy_version: str = "1"
     security_policy_version: str = "1"
+    execution_policy: ExecutionPolicy | None = None
     before_tool_call: Callable[..., Any] | None = None
     after_tool_call: Callable[..., Any] | None = None
     reconcile_tool: Callable[..., Any] | None = None
@@ -302,6 +310,10 @@ class DurableHostFactory:
     async def create(self, host_type: type[Any], settings: DurableHostSettings) -> Any:
         if not settings.session_id:
             raise ValueError("session_id 不能为空")
+        if settings.execution_policy is not None:
+            if not isinstance(settings.execution_policy, ExecutionPolicy):
+                raise TypeError("execution_policy must be ExecutionPolicy")
+            settings.after_tool_call = guard_tool_output(settings.execution_policy.content_safety, settings.after_tool_call, tenant_id=settings.tenant_id, session_id=settings.session_id)
         # Resolve this before opening stores.  It also rejects conflicting
         # catalogues before either one can influence a security decision.
         _effective_plan_policies(settings)
@@ -362,6 +374,13 @@ class DurableHostFactory:
         host.tool_identity = settings.tool_identity
         host.telemetry = settings.telemetry or Telemetry()
         host.resources = await _create_resources(settings)
+        if host.resources.journal is not None:
+            validate_session_event_journal(host.resources.journal, require_multi_host=settings.distributed_execution and settings.auto_plan_complex_requests and settings.planner is not None)
+            for store in (host.resources.operation_store, host.resources.runtime_store, host.resources.retry_store):
+                if getattr(store, "journal", None) is not host.resources.journal or getattr(store, "principal", None) != host.resources.journal_principal:
+                    raise ValueError("Host logical stores must share the same Journal and Principal")
+                if getattr(store, "session_id", settings.session_id) != settings.session_id:
+                    raise ValueError("Host logical store session scope mismatch")
         for resource in _managed_resources(settings):
             host.resources.own(resource)
         # ``plan_store=`` is an explicit caller-owned injection boundary.  Do
@@ -518,7 +537,7 @@ class DurableHostFactory:
             and host.plan_store is not None
         )
         if autonomous_requested and (
-            not isinstance(host.plan_store, SessionJournalPlanStore)
+            not isinstance(host.plan_store, JournalPlanStore)
             or host.autonomous_run_store is None
             or host.plan_store.journal is not host.autonomous_run_store.journal
             or host.plan_store.principal != host.autonomous_run_store.principal
@@ -557,7 +576,7 @@ class DurableHostFactory:
                     "Router 硬 model/token/cost 预算需要完整 Autonomous "
                     "Plan Runner 和 Durable Run Store"
                 )
-            if not isinstance(settings.router, HybridModelRouter):
+            if not isinstance(settings.router, RuntimeBoundRouter):
                 raise ValueError(
                     "自定义 Router 尚未接入 pre-route durable usage admission；"
                     "启用硬 model/token/cost 预算时拒绝装配"
@@ -616,10 +635,29 @@ class DurableHostFactory:
             pricing=settings.pricing,
             max_buffer_size=settings.model_event_buffer_size,
             max_buffer_bytes=settings.model_event_buffer_bytes,
+            execution_policy=settings.execution_policy,
+            tenant_id=settings.tenant_id,
+            session_id=settings.session_id,
         )
         # Close/drain the Runtime before the bound HTTP Provider (resources are
         # released in reverse ownership order).
         host.resources.own(host.model_runtime)
+        def stage_stream(stage: str) -> StreamFn:
+            def stream(runtime: Any, model: Model, context: dict[str, Any], options: dict[str, Any]) -> Any:
+                return runtime.stream(model, context, {**options, "model_request_source": stage})
+            return MethodType(stream, host.model_runtime)
+
+        if settings.planner is not None and callable(getattr(settings.planner, "bind_runtime", None)):
+            host.plan_workflow.planner = getattr(settings.planner, "bind_runtime")(stream_fn=stage_stream("planner"))
+        if host.autonomous_plan_runner is not None:
+            for name in ("result_validator", "replanner", "result_synthesizer"):
+                component = getattr(host.autonomous_plan_runner, name)
+                binder = getattr(component, "bind_runtime", None)
+                if callable(binder):
+                    bound = binder(stream_fn=stage_stream(name))
+                    if bound is component or not callable(bound):
+                        raise ValueError("Model component bind_runtime must return an independent callable")
+                    setattr(host.autonomous_plan_runner, name, bound)
         host.tool_dispatch_runtime = ToolDispatchRuntime(
             settings.tools,
             before_tool_call=settings.before_tool_call,
@@ -631,6 +669,7 @@ class DurableHostFactory:
             tenant_limits=settings.tenant_tool_limits,
             distributed_lock_backend=settings.resource_lock_backend,
             max_update_tasks=settings.max_tool_update_tasks,
+            suppress_unreviewed_updates=settings.execution_policy is not None and settings.execution_policy.content_safety is not None,
             telemetry=host.telemetry,
             default_tenant_id=settings.tenant_id,
             authorization=settings.tool_authorization,
@@ -665,12 +704,14 @@ class DurableHostFactory:
             if settings.capabilities is None:
                 raise ValueError("使用 Router 时必须提供 CapabilityRegistry")
             host_router = settings.router
-            if isinstance(settings.router, HybridModelRouter):
+            if isinstance(settings.router, RuntimeBoundRouter):
                 host_router = settings.router.bind_runtime(
-                    stream_fn=host.model_runtime.stream,
+                    stream_fn=stage_stream("router"),
                     retry_event_sink=retry_store.append,
                     durable_metadata_provider=durable_metadata_provider,
                 )
+                if host_router is settings.router or not isinstance(host_router, RuntimeBoundRouter):
+                    raise ValueError("Router bind_runtime must return an independent RuntimeBoundRouter instance")
             host.routed_agent = RoutedAgent(
                 host.agent,
                 host_router,
@@ -823,6 +864,7 @@ class DurableHostFactory:
             approval_policy_version=settings.approval_policy_version,
             plan_policy_version=settings.plan_policy_version,
             security_policy_version=settings.security_policy_version,
+            execution_policy_version=None if settings.execution_policy is None else settings.execution_policy.version,
         )
         try:
             session = await host.session_catalog.get_session(settings.session_id)

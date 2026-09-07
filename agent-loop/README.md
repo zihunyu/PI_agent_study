@@ -67,9 +67,14 @@ Calculator 是按需加载的教学样例。即使删除 Calculator 或任意业
   沙箱。浏览器、MCP 和真实业务 API 仍需独立适配包；
 - 路径边界按 realpath 拒绝静态 symlink/junction/ADS 逃逸，但假定工作区目录树由
   受信主体稳定维护；它不抵抗外部恶意进程在校验与 I/O 之间替换 reparse point；
-- 内置文件写工具只提供单进程 CAS、mutation lock 和原子发布，不等同于
+- 内置文件写工具按规范绝对路径共享进程内 mutation lock；独立 ToolServices 和
+  不同事件循环会共同串行化同一文件的版本检查与原子发布。该机制只提供单进程 CAS，不等同于
   `WriteOperationService` 的跨进程 Durable/Plan 写网关。生产恢复场景必须另接
   DurableActionEnvelope、持久 Intent/Result、幂等键、Fencing 和 Reconciliation。
+
+`grep` 在文件大小和安全正则限制内搜索完整行，命中后才截断展示片段。
+命中的 `column` / `textStartColumn` 是从 1 开始的字符列号，`textTruncated`
+只表示片段裁剪；顶层 `truncated` 表示搜索或命中集合不完整。
 
 完整接入边界和代码模板见 `SCAFFOLD_INTEGRATION_GUIDE.md`。
 
@@ -277,6 +282,11 @@ result = await orchestrator.run(
 跨 tenant 上下文泄漏，需要并发时应注入返回全新 Agent 的 factory。自定义
 `WorkerRunner` 属于可信宿主代码，必须合作传播 `CancellationToken` 和
 `asyncio.CancelledError`，编排器无法强制终止阻塞的同步代码或恶意吞取消的协程。
+
+同步 `ResultArbitrator` 与同步 Worker 一样在线程中执行；总 deadline 可以结束等待，
+不能强杀线程。适配器应自行限定 I/O 和计算耗时。任务结果只有在 State Store 确认保存后
+才向依赖任务发布成功。结果保存失败时，运行抛出 `OrchestrationStateError`，其
+`task_result` 保留已经观察到的执行结果；调用方须核对存储和执行事实，不得盲目重跑。
 
 ---
 
@@ -5176,3 +5186,8 @@ python -m pytest -q tests/test_router_security_contracts.py
 python -m pytest -q tests/test_p2_durable_planning.py
 python -m pytest -q tests/test_recovery_fencing_and_gate.py
 ```
+
+
+### 通用业务扩展
+
+新增业务推荐使用 `load_business_bundle(..., tool_factories=...)` + `DurableAgentHost.create(business_bundle=...)`。完整示例与 ExecutionPolicy、Journal/Router 协议、Provider 参数说明见 [GENERIC_EXTENSIONS.md](GENERIC_EXTENSIONS.md)。离线示例：`python examples/business_package/run_demo.py`。

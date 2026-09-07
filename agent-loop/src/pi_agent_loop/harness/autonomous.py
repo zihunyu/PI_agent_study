@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..planning.store_protocol import JournalPlanStore
+
 import asyncio
 import copy
 import inspect
@@ -31,7 +33,6 @@ from ..planning import (
     PlanValidator,
     ResultValidation,
     ResultValidator,
-    SessionJournalPlanStore,
 )
 from ..model_attempts import (
     ModelAttemptAdmissionScope,
@@ -45,7 +46,7 @@ from .autonomous_durability import (
     AutonomousRunControllerLeaseLostError,
     AutonomousRunRecord,
     AutonomousRunStoreError,
-    SessionJournalAutonomousRunStore,
+    JournalRunStore,
 )
 from .plans import DurablePlanWorkflow, PlanWorkflowUnavailableError
 
@@ -150,7 +151,7 @@ class AutonomousPlanRunner:
         result_synthesizer: PlanResultSynthesizer | None = None,
         budget: ClosedLoopBudget | None = None,
         event_sink: Callable[[ClosedLoopEvent], Any] | None = None,
-        run_store: SessionJournalAutonomousRunStore | None = None,
+        run_store: JournalRunStore | None = None,
         usage_meter: PlanUsageMeter | None = None,
     ) -> None:
         self.workflow = workflow
@@ -165,6 +166,7 @@ class AutonomousPlanRunner:
         )
         self.event_sink = event_sink
         self.run_store = run_store
+        self._route_not_dispatched: set[str] = set()
         self._model_attempt_snapshots: dict[
             str, ModelAttemptAdmissionSnapshot
         ] = {}
@@ -270,6 +272,8 @@ class AutonomousPlanRunner:
                     reason="router_admission_rejected",
                 )
                 raise
+        if ticket is not None:
+            self._route_not_dispatched.add(ticket.reservation_id)
         return run_id, ticket
 
     async def settle_pre_route_admission(
@@ -277,9 +281,17 @@ class AutonomousPlanRunner:
         run_id: str,
         ticket: PlanUsageReservation,
         *,
-        reported_usage: PlanResourceUsage,
+        reported_usage: PlanResourceUsage | None = None,
     ) -> PlanResourceUsage:
-        """Settle Router usage and cross-check the Router's provider report."""
+        """Settle from physical Runtime admission, never Router diagnostics."""
+        snapshot = self._model_attempt_snapshots.get(ticket.reservation_id)
+        if snapshot is not None:
+            _assert_physical_attempt_usage_covered(snapshot, ticket.reserved)
+        if (snapshot is not None and snapshot.model_calls == 0) or ticket.reservation_id in self._route_not_dispatched:
+            await self.release_pre_route_admission(run_id, ticket)
+            return PlanResourceUsage()
+        if snapshot is None:
+            raise PlanBudgetExceeded("Router dispatch cannot be proven; retain reservation")
 
         return await self._settle_model_stage(
             run_id,
@@ -304,6 +316,7 @@ class AutonomousPlanRunner:
         async def invoke() -> Any:
             if ticket is None:
                 return await callback()
+            self._route_not_dispatched.discard(ticket.reservation_id)
             return await self._dispatch_reserved_model_callback(
                 run_id,
                 ticket,
@@ -332,6 +345,10 @@ class AutonomousPlanRunner:
 
         if self.usage_meter is None or self.run_store is None:
             raise PlanBudgetExceeded("Router Admission 缺少 Usage Meter 或 Run Store")
+        snapshot = self._model_attempt_snapshots.get(ticket.reservation_id)
+        if ticket.reservation_id not in self._route_not_dispatched and (snapshot is None or snapshot.model_calls or snapshot.unknown_attempts or snapshot.in_flight_attempts):
+            raise PlanBudgetExceeded("Cannot release a dispatched or uncertain Router reservation")
+        self._route_not_dispatched.discard(ticket.reservation_id)
         value = self.usage_meter.cancel(ticket)
         if inspect.isawaitable(value):
             await cast(Awaitable[Any], value)
@@ -1034,7 +1051,7 @@ class AutonomousPlanRunner:
                 )
             if (
                 self.run_store is not None
-                and isinstance(store, SessionJournalPlanStore)
+                and isinstance(store, JournalPlanStore)
             ):
                 await self.run_store.register_plan_atomic(
                     run_id,
@@ -1044,17 +1061,9 @@ class AutonomousPlanRunner:
                     controller_lease_seconds=controller_lease_seconds,
                 )
             else:
-                # Non-Journal adapters must make the plan durable before its ID
-                # can be published.  It may remain as a harmless orphan after a
-                # crash, but resume can never point at a missing Plan.
-                await store.initialize(corrected)
                 if self.run_store is not None:
-                    await self.run_store.register_plan(
-                        run_id,
-                        corrected.plan_id,
-                        controller_lease=controller_lease,
-                        controller_lease_seconds=controller_lease_seconds,
-                    )
+                    raise PlanWorkflowUnavailableError("Corrections with a durable Run require a JournalPlanStore atomic participant")
+                await store.initialize(corrected)
             return CorrectionPlan(
                 (_action_from_plan(corrected),),
                 "; ".join(validation.issues),
@@ -1373,6 +1382,9 @@ class AutonomousPlanRunner:
     ) -> PlanResourceUsage:
         if self.usage_meter is None:
             raise PlanBudgetExceeded("模型阶段缺少 Usage Settlement Meter")
+        observed = self._model_attempt_snapshots.get(ticket.reservation_id)
+        if observed is not None:
+            _assert_physical_attempt_usage_covered(observed, ticket.reserved)
         value = self.usage_meter.settle(ticket)
         actual = (
             await cast(Awaitable[PlanResourceUsage], value)
@@ -1382,7 +1394,7 @@ class AutonomousPlanRunner:
         if not isinstance(actual, PlanResourceUsage):
             raise TypeError("Usage Meter settle 必须返回 PlanResourceUsage")
         _assert_model_settlement(actual, ticket.reserved)
-        attempt_snapshot = self._model_attempt_snapshots.pop(
+        attempt_snapshot = self._model_attempt_snapshots.get(
             ticket.reservation_id,
             None,
         )
@@ -1398,6 +1410,7 @@ class AutonomousPlanRunner:
                 controller_lease=controller_lease,
                 controller_lease_seconds=controller_lease_seconds,
             )
+        self._model_attempt_snapshots.pop(ticket.reservation_id, None)
         return actual
 
     async def _dispatch_reserved_model_callback(

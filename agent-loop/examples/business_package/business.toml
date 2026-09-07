@@ -1,0 +1,28 @@
+[product]
+name = "Fictional catalogue"
+description = "Offline demonstration; no real business integration."
+allow_general_questions = false
+
+[[tools]]
+name = "fictional_lookup"
+capabilities = ["catalogue.read"]
+domain = "fictional"
+operation = "read"
+side_effect = false
+
+[[intents]]
+id = "catalogue.lookup"
+name = "Lookup a fictional entry"
+description = "Read a fictional catalogue entry by key."
+examples = ["Read BLUE"]
+required_fields = ["key"]
+capability = "catalogue.read"
+must_use_tool = true
+requires_approval = false
+ask_when_missing = "Which key should I read?"
+
+# Optional. Other fields use IntentPlanPolicy.to_dict() names and semantics.
+# Omitted policy/parameter fields are derived from the intent and tool contract.
+[[plans]]
+intent = "catalogue.lookup"
+tool = "fictional_lookup"

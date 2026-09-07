@@ -12,7 +12,8 @@ import asyncio
 import copy
 import inspect
 import json
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
@@ -169,6 +170,7 @@ class ContentSafetyPipeline:
         self.audit_timeout_seconds = float(audit_timeout_seconds)
         self.audit_errors = 0
         self._active_policy_tasks: dict[int, asyncio.Task[SafetyDecision]] = {}
+        self._policy_locks = tuple(asyncio.Lock() for _policy in materialized)
         self._audit_task: asyncio.Task[None] | None = None
 
     @property
@@ -192,94 +194,149 @@ class ContentSafetyPipeline:
         normalized_metadata = _normalize_metadata(metadata)
         current = copy.deepcopy(value)
         for index, policy in enumerate(self._policies):
-            cancellation.throw_if_cancelled()
-            active = self._active_policy_tasks.get(index)
-            if active is not None and not active.done():
-                await self._audit(
+            async with self._policy_slot(
+                index, stage, tool_name, cancellation
+            ) as remaining:
+                cancellation.throw_if_cancelled()
+                active = self._active_policy_tasks.get(index)
+                if active is not None and not active.done():
+                    await self._audit(
+                        stage=stage,
+                        action="error",
+                        code="policy_still_running",
+                        policy_index=index,
+                        tool_name=tool_name,
+                    )
+                    raise ContentSafetyUnavailable()
+                inspection = SafetyInspection(
                     stage=stage,
-                    action="error",
-                    code="policy_still_running",
-                    policy_index=index,
+                    value=copy.deepcopy(current),
+                    tenant_id=tenant_id,
                     tool_name=tool_name,
+                    metadata=normalized_metadata,
                 )
-                raise ContentSafetyUnavailable()
-            inspection = SafetyInspection(
-                stage=stage,
-                value=copy.deepcopy(current),
-                tenant_id=tenant_id,
-                tool_name=tool_name,
-                metadata=normalized_metadata,
-            )
-            task = asyncio.create_task(
-                self._invoke_policy(policy, inspection, cancellation),
-                name=f"content-safety-policy:{index}:{stage}",
-            )
-            self._active_policy_tasks[index] = task
-
-            def policy_done(
-                completed: asyncio.Future[SafetyDecision],
-                policy_index: int = index,
-            ) -> None:
-                self._policy_task_done(policy_index, completed)
-
-            task.add_done_callback(policy_done)
-            try:
-                done, _pending = await asyncio.wait(
-                    {task},
-                    timeout=self.policy_timeout_seconds,
+                task = asyncio.create_task(
+                    self._invoke_policy(policy, inspection, cancellation),
+                    name=f"content-safety-policy:{index}:{stage}",
                 )
-                if task not in done:
-                    task.cancel()
+                self._active_policy_tasks[index] = task
+
+                def policy_done(
+                    completed: asyncio.Future[SafetyDecision],
+                    policy_index: int = index,
+                ) -> None:
+                    self._policy_task_done(policy_index, completed)
+
+                task.add_done_callback(policy_done)
+                try:
+                    done, _pending = await asyncio.wait(
+                        {task},
+                        timeout=remaining,
+                    )
+                    if task not in done:
+                        task.cancel()
+                        await self._audit(
+                            stage=stage,
+                            action="error",
+                            code="policy_unavailable",
+                            policy_index=index,
+                            tool_name=tool_name,
+                            error_type="TimeoutError",
+                        )
+                        raise ContentSafetyUnavailable()
+                    decision = task.result()
+                except asyncio.CancelledError:
+                    if not task.done():
+                        task.cancel()
+                    raise
+                except ContentSafetyUnavailable:
+                    raise
+                except Exception as error:
                     await self._audit(
                         stage=stage,
                         action="error",
                         code="policy_unavailable",
                         policy_index=index,
                         tool_name=tool_name,
-                        error_type="TimeoutError",
+                        error_type=type(error).__name__,
+                    )
+                    raise ContentSafetyUnavailable() from None
+                if not isinstance(decision, SafetyDecision):
+                    await self._audit(
+                        stage=stage,
+                        action="error",
+                        code="invalid_policy_decision",
+                        policy_index=index,
+                        tool_name=tool_name,
                     )
                     raise ContentSafetyUnavailable()
-                decision = task.result()
-            except asyncio.CancelledError:
-                if not task.done():
-                    task.cancel()
-                raise
-            except ContentSafetyUnavailable:
-                raise
-            except Exception as error:
+                await self._audit(
+                    stage=stage,
+                    action=decision.action,
+                    code=decision.code,
+                    policy_index=index,
+                    tool_name=tool_name,
+                )
+                if decision.action == "block":
+                    raise ContentSafetyBlocked(
+                        code=decision.code,
+                        reason=decision.reason,
+                    )
+                if decision.action == "replace":
+                    current = copy.deepcopy(decision.replacement)
+        return current
+
+    @asynccontextmanager
+    async def _policy_slot(
+        self,
+        index: int,
+        stage: SafetyStage,
+        tool_name: str | None,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[float]:
+        """Serialize normal inspections; reserve active-task checks for stragglers.
+
+        Queueing consumes the same deadline as execution. Cancelling a queued
+        caller must neither cancel the active policy nor leave an acquired lock.
+        """
+
+        cancellation.throw_if_cancelled()
+        deadline = asyncio.get_running_loop().time() + self.policy_timeout_seconds
+        lock = self._policy_locks[index]
+        acquire = asyncio.create_task(lock.acquire())
+        cancelled = asyncio.create_task(cancellation.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {acquire, cancelled},
+                timeout=self.policy_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            cancellation.throw_if_cancelled()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if acquire not in done or remaining <= 0:
                 await self._audit(
                     stage=stage,
                     action="error",
                     code="policy_unavailable",
                     policy_index=index,
                     tool_name=tool_name,
-                    error_type=type(error).__name__,
-                )
-                raise ContentSafetyUnavailable() from None
-            if not isinstance(decision, SafetyDecision):
-                await self._audit(
-                    stage=stage,
-                    action="error",
-                    code="invalid_policy_decision",
-                    policy_index=index,
-                    tool_name=tool_name,
+                    error_type="TimeoutError",
                 )
                 raise ContentSafetyUnavailable()
-            await self._audit(
-                stage=stage,
-                action=decision.action,
-                code=decision.code,
-                policy_index=index,
-                tool_name=tool_name,
-            )
-            if decision.action == "block":
-                raise ContentSafetyBlocked(
-                    code=decision.code,
-                    reason=decision.reason,
-                )
-            if decision.action == "replace":
-                current = copy.deepcopy(decision.replacement)
-        return current
+            yield remaining
+        finally:
+            for waiter in (acquire, cancelled):
+                if not waiter.done():
+                    waiter.cancel()
+            try:
+                await asyncio.gather(acquire, cancelled, return_exceptions=True)
+            finally:
+                if (
+                    acquire.done()
+                    and not acquire.cancelled()
+                    and acquire.exception() is None
+                ):
+                    lock.release()
 
     def _policy_task_done(
         self,

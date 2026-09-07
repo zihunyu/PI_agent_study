@@ -10,6 +10,7 @@ from .errors import (
     ProviderRateLimitError,
     ProviderTimeoutError,
 )
+from .generation import GenerationOptions
 from .factory import create_provider
 from .openai_compatible import OpenAICompatibleProvider
 from .serialize import serialize_chat_request
@@ -18,6 +19,7 @@ from .sse import SSEDecoder, iter_sse_data
 from .translate import OpenAIStreamTranslator
 
 __all__ = [
+    "GenerationOptions",
     "OpenAICompatibleProvider",
     "OpenAIStreamTranslator",
     "ProviderAuthenticationError",

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from .cancellation import CancellationToken, OperationCancelledError
@@ -37,7 +37,6 @@ from .tool_runtime import ToolDispatchRuntime
 from .transcript import repair_unresolved_tool_calls
 from .types import (
     AfterToolCallContext,
-    AfterToolCallResult,
     AgentContext,
     AgentEvent,
     AgentLoopConfig,
@@ -45,7 +44,6 @@ from .types import (
     AgentMessage,
     AgentState,
     AgentTool,
-    AgentToolResult,
     BeforeToolCallContext,
     Model,
     QueueMode,
@@ -55,8 +53,9 @@ from .types import (
     ToolDispatchContext,
     ToolExecutionMode,
     TurnCompletedContext,
-    UNSET,
 )
+
+from .execution_policy import ExecutionPolicy, ExecutionContext, guard_tool_output
 
 Listener = Callable[[AgentEvent, CancellationToken], Any]
 
@@ -75,68 +74,6 @@ def _default_convert_to_llm(messages: list[AgentMessage]) -> list[AgentMessage]:
         for message in messages
         if message.get("role") in {"user", "assistant", "toolResult"}
     ]
-
-
-def _apply_after_tool_override(
-    result: AgentToolResult,
-    is_error: bool,
-    override: Any,
-) -> tuple[AgentToolResult, bool]:
-    """Apply the public after-hook contract before content-safety inspection."""
-
-    if not isinstance(override, AfterToolCallResult):
-        return result, is_error
-    updated = AgentToolResult(
-        content=(
-            result.content
-            if override.content is UNSET
-            else list(override.content)
-        ),
-        details=(
-            result.details if override.details is UNSET else override.details
-        ),
-        usage=result.usage if override.usage is UNSET else override.usage,
-        added_tool_names=result.added_tool_names,
-        terminate=(
-            result.terminate
-            if override.terminate is UNSET
-            else override.terminate
-        ),
-    )
-    if override.is_error is not UNSET:
-        is_error = bool(override.is_error)
-    return updated, is_error
-
-
-def _validate_guarded_tool_output(value: Any) -> dict[str, Any]:
-    """Reject malformed policy rewrites before they re-enter the transcript."""
-
-    if not isinstance(value, Mapping):
-        raise TypeError("内容安全策略返回了无效的工具输出")
-    required = {"content", "details", "usage", "terminate", "isError"}
-    if set(value) != required:
-        raise ValueError("内容安全工具输出字段不完整或包含未知字段")
-    content = value.get("content")
-    usage = value.get("usage")
-    terminate = value.get("terminate")
-    is_error = value.get("isError")
-    if not isinstance(content, list) or any(
-        not isinstance(block, dict) for block in content
-    ):
-        raise TypeError("内容安全工具输出 content 必须是对象列表")
-    if usage is not None and not isinstance(usage, dict):
-        raise TypeError("内容安全工具输出 usage 必须是对象或 None")
-    if terminate is not None and not isinstance(terminate, bool):
-        raise TypeError("内容安全工具输出 terminate 必须是布尔值或 None")
-    if not isinstance(is_error, bool):
-        raise TypeError("内容安全工具输出 isError 必须是布尔值")
-    return {
-        "content": copy.deepcopy(content),
-        "details": copy.deepcopy(value.get("details")),
-        "usage": copy.deepcopy(usage),
-        "terminate": terminate,
-        "isError": is_error,
-    }
 
 
 def _materialize_staged_tool_results(
@@ -254,6 +191,8 @@ class Agent:
         durable_metadata_provider: Callable[[], Any] | None = None,
         message_input_limits: MessageInputLimits | None = None,
         content_safety: ContentSafetyPipeline | None = None,
+        execution_policy: ExecutionPolicy | None = None,
+        session_id: str | None = None,
     ) -> None:
         if (
             default_tool_timeout_seconds is not None
@@ -279,7 +218,16 @@ class Agent:
         )
         self.stream_fn = stream_fn
         self.convert_to_llm = convert_to_llm or _default_convert_to_llm
-        self.transform_context = transform_context
+        if execution_policy is not None and (transform_context is not None or content_safety is not None):
+            raise ValueError("execution_policy cannot be mixed with legacy content_safety/transform_context")
+        if execution_policy is not None and not isinstance(execution_policy, ExecutionPolicy):
+            raise TypeError("execution_policy must be ExecutionPolicy")
+        self.execution_policy = execution_policy or ExecutionPolicy(content_safety, transform_context)
+        self.execution_context = ExecutionContext("agent", tenant_id, session_id)
+        content_safety = self.execution_policy.content_safety
+        async def transform(messages: list[AgentMessage], cancellation: CancellationToken) -> list[AgentMessage]:
+            return await self.execution_policy.transform(messages, cancellation, self.execution_context)
+        self.transform_context = transform if self.execution_policy.transform_context is not None else None
         self.get_api_key = get_api_key
         self.before_tool_call = before_tool_call
         self.after_tool_call = after_tool_call
@@ -335,6 +283,9 @@ class Agent:
                 self.tool_runtime.authorization = tool_authorization
             if require_tool_identity:
                 self.tool_runtime.require_identity = True
+
+        if self.content_safety is not None:
+            self.tool_runtime.suppress_unreviewed_updates = True
 
         self._steering_queue = _PendingMessageQueue(steering_mode)
         self._follow_up_queue = _PendingMessageQueue(follow_up_mode)
@@ -602,19 +553,7 @@ class Agent:
         ) -> list[AgentMessage]:
             if self.content_safety is None:
                 return messages
-            inspected = await self.content_safety.inspect(
-                "model_input",
-                messages,
-                cancellation,
-                tenant_id=self.tenant_id,
-            )
-            if not isinstance(inspected, list) or any(
-                not isinstance(message, dict) for message in inspected
-            ):
-                raise TypeError(
-                    "内容安全策略返回了无效的模型输入消息"
-                )
-            return copy.deepcopy(inspected)
+            return await self.execution_policy.inspect_input(messages, cancellation, self.execution_context)
 
         async def inspect_model_output(
             message: AgentMessage,
@@ -622,17 +561,7 @@ class Agent:
         ) -> AgentMessage:
             if self.content_safety is None:
                 return message
-            inspected = await self.content_safety.inspect(
-                "model_output",
-                message,
-                cancellation,
-                tenant_id=self.tenant_id,
-            )
-            if not isinstance(inspected, dict):
-                raise TypeError(
-                    "内容安全策略返回了无效的模型输出消息"
-                )
-            return copy.deepcopy(inspected)
+            return await self.execution_policy.inspect_output(message, cancellation, self.execution_context)
 
         guarded_after_tool_call = self._guarded_after_tool_call()
 
@@ -675,103 +604,8 @@ class Agent:
             ),
         )
 
-    def _guarded_after_tool_call(
-        self,
-    ) -> Callable[[AfterToolCallContext, CancellationToken], Any] | None:
-        """Expose only inspected Tool output to hooks and the transcript."""
-
-        pipeline = self.content_safety
-        if pipeline is None:
-            return self.after_tool_call
-
-        async def inspect_output(
-            result: AgentToolResult,
-            is_error: bool,
-            cancellation: CancellationToken,
-            *,
-            tool_name: str | None,
-            tool_call_id: str,
-        ) -> dict[str, Any]:
-            inspected = await pipeline.inspect(
-                "tool_output",
-                {
-                    "content": copy.deepcopy(result.content),
-                    "details": copy.deepcopy(result.details),
-                    "usage": copy.deepcopy(result.usage),
-                    "terminate": result.terminate,
-                    "isError": is_error,
-                },
-                cancellation,
-                tenant_id=self.tenant_id,
-                tool_name=tool_name,
-                metadata=(
-                    {"toolCallId": tool_call_id} if tool_call_id else None
-                ),
-            )
-            return _validate_guarded_tool_output(inspected)
-
-        async def guarded(
-            context: AfterToolCallContext,
-            cancellation: CancellationToken,
-        ) -> AfterToolCallResult:
-            original_result = copy.deepcopy(context.result)
-            original_is_error = context.is_error
-            tool_name = str(context.tool_call.get("name", "")) or None
-            tool_call_id = str(context.tool_call.get("id", ""))
-            safe = await inspect_output(
-                original_result,
-                original_is_error,
-                cancellation,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-            )
-            if self.after_tool_call is not None:
-                # The caller hook is an observer/rewriter, not a trusted bypass:
-                # it receives the inspected snapshot and any override is applied
-                # to the original result, then inspected again before release.
-                safe_context = AfterToolCallContext(
-                    assistant_message=context.assistant_message,
-                    tool_call=context.tool_call,
-                    args=context.args,
-                    result=AgentToolResult(
-                        content=safe["content"],
-                        details=safe["details"],
-                        usage=safe["usage"],
-                        added_tool_names=copy.deepcopy(
-                            original_result.added_tool_names
-                        ),
-                        terminate=safe["terminate"],
-                    ),
-                    is_error=safe["isError"],
-                    context=context.context,
-                )
-                override = await _maybe_await(
-                    self.after_tool_call(safe_context, cancellation)
-                )
-                if isinstance(override, AfterToolCallResult):
-                    overridden_result, overridden_is_error = (
-                        _apply_after_tool_override(
-                            original_result,
-                            original_is_error,
-                            override,
-                        )
-                    )
-                    safe = await inspect_output(
-                        overridden_result,
-                        overridden_is_error,
-                        cancellation,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                    )
-            return AfterToolCallResult(
-                content=safe["content"],
-                details=safe["details"],
-                usage=safe["usage"],
-                terminate=safe["terminate"],
-                is_error=safe["isError"],
-            )
-
-        return guarded
+    def _guarded_after_tool_call(self) -> Callable[..., Any] | None:
+        return guard_tool_output(self.content_safety, self.after_tool_call, tenant_id=self.tenant_id, session_id=self.execution_context.session_id)
 
     async def _run_with_lifecycle(
         self,

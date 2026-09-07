@@ -41,3 +41,11 @@ retryable_statuses = [408, 409, 429, 500, 502, 503, 504]
 enabled = true
 failure_threshold = 3
 recovery_timeout_seconds = 30
+
+# 可选生成参数；不设置时不发送。两种 Token 参数只能选一个。
+# [profiles.third_party.generation]
+# max_completion_tokens = 1024
+# temperature = 0.2
+# top_p = 0.9
+# [profiles.third_party.generation.stream_options]
+# include_usage = true

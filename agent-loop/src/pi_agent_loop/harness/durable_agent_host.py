@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from ..routing.routed_agent import RuntimeBoundRouter
+
+from ..planning.store_protocol import JournalPlanStore
+
+from ..execution_policy import ExecutionPolicy
+
+from ..business import BusinessBundle
+
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from ..agent import Agent
 from ..approval import ApprovalService
@@ -20,14 +28,11 @@ from ..planning import (
     IntentPlanPolicy,
     MultiIntentPlan,
     PlanExecutionResult,
-    PlanResourceUsage,
-    SessionJournalPlanStore,
 )
 from ..retry.circuit_breaker import CircuitBreaker
 from ..retry.compaction import CompactionRetryPolicy
 from ..retry.types import ModelRetryPolicy
 from ..routing.capabilities import CapabilityRegistry
-from ..routing.hybrid_router import HybridModelRouter
 from ..routing.routed_agent import RoutedAgent
 from ..routing.types import RequestDecision
 from ..runtime import RuntimeStateTracker, Telemetry
@@ -68,7 +73,7 @@ from .autonomous import (
 )
 from .autonomous_durability import (
     AutonomousConversationProjector,
-    SessionJournalAutonomousRunStore,
+    JournalRunStore,
 )
 from .factory import DurableHostFactory, DurableHostSettings
 from .lifecycle import DurableHostLifecycle
@@ -124,7 +129,7 @@ class DurableAgentHost:
         self.distributed_execution: bool
         self.plan_workflow: DurablePlanWorkflow
         self.autonomous_plan_runner: AutonomousPlanRunner | None
-        self.autonomous_run_store: SessionJournalAutonomousRunStore | None
+        self.autonomous_run_store: JournalRunStore | None
         self.autonomous_conversation_projector: AutonomousConversationProjector
         self.project_id: str | None
         self.session_metadata: ConversationSession | None
@@ -142,7 +147,9 @@ class DurableAgentHost:
         model: Model,
         stream_fn: StreamFn,
         system_prompt: str,
-        tools: list[AgentTool],
+        tools: list[AgentTool] | None = None,
+        business_bundle: BusinessBundle | None = None,
+        execution_policy: ExecutionPolicy | None = None,
         router: Any | None = None,
         capabilities: CapabilityRegistry | None = None,
         router_policy_version: str = "1",
@@ -209,13 +216,27 @@ class DurableAgentHost:
         session_writer_lease_seconds: float = 30,
         allow_configuration_migration: bool = False,
     ) -> "DurableAgentHost":
+        if business_bundle is not None:
+            if not isinstance(business_bundle, BusinessBundle):
+                raise TypeError("business_bundle must be BusinessBundle")
+            if any(value is not None for value in (tools, router, capabilities, planner, plan_policies, plan_tool_bindings, plan_step_executor)):
+                raise ValueError("business_bundle cannot be mixed with tools, router, capabilities or plan configuration")
+            business_bundle.validate()
+            tools = list(business_bundle.tools)
+            capabilities = business_bundle.capabilities
+            router = business_bundle.create_router(model=model, stream_fn=stream_fn)
+            if business_bundle.plan_policies:
+                plan_policies = business_bundle.plan_policies
+                plan_tool_bindings = business_bundle.plan_tool_bindings
+                planner = business_bundle.create_planner(model=model, stream_fn=stream_fn)
         settings = DurableHostSettings(
             session_id=session_id,
             state_dir=state_dir,
             model=model,
             stream_fn=stream_fn,
             system_prompt=system_prompt,
-            tools=tools,
+            tools=[] if tools is None else tools,
+            execution_policy=execution_policy,
             router=router,
             capabilities=capabilities,
             router_policy_version=router_policy_version,
@@ -533,7 +554,6 @@ class DurableAgentHost:
             )
 
         route_admission: tuple[str, Any] | None = None
-        route_call_count = 0
         route_accounted = False
         route_admission_retained = False
         route_router = self.routed_agent.router
@@ -545,7 +565,7 @@ class DurableAgentHost:
         ):
             if (
                 plan_runner.hard_model_budget_enabled
-                and not isinstance(route_router, HybridModelRouter)
+                and not isinstance(route_router, RuntimeBoundRouter)
             ):
                 raise RuntimeError(
                     "硬 model/token/cost 预算禁止使用未纳入 Durable Admission "
@@ -554,7 +574,6 @@ class DurableAgentHost:
             route_admission = (
                 await plan_runner.open_pre_route_admission(text)
             )
-            route_call_count = int(getattr(route_router, "call_count", 0))
 
         async def close_route_admission(reason: str) -> None:
             if route_admission is None:
@@ -593,18 +612,8 @@ class DurableAgentHost:
             try:
                 if route_ticket is None:
                     pass
-                elif int(getattr(route_router, "call_count", 0)) > route_call_count:
-                    await plan_runner.settle_pre_route_admission(
-                        route_run_id,
-                        route_ticket,
-                        reported_usage=_router_resource_usage(route_router),
-                    )
                 else:
-                    await plan_runner.release_pre_route_admission(
-                        route_run_id,
-                        route_ticket,
-                    )
-                route_accounted = True
+                    await plan_runner.settle_pre_route_admission(route_run_id, route_ticket)
             except BaseException:
                 await plan_runner.close_pre_route_admission(
                     route_run_id,
@@ -775,7 +784,7 @@ class DurableAgentHost:
                 raise
             if autonomous_run_store is None or not isinstance(
                 self.plan_store,
-                SessionJournalPlanStore,
+                JournalPlanStore,
             ):
                 raise RuntimeError(
                     "Autonomous Plan 需要支持 Plan/Run/Conversation 原子绑定的 "
@@ -1140,32 +1149,3 @@ class DurableAgentHost:
 
     async def close(self) -> None:
         await self.lifecycle.close()
-
-
-def _router_resource_usage(router: object) -> PlanResourceUsage:
-    metrics_callback = getattr(router, "evaluation_metrics", None)
-    if not callable(metrics_callback):
-        raise RuntimeError("Router 未提供可信 Usage Meter")
-    metrics = cast(Callable[[], object], metrics_callback)()
-    if not isinstance(metrics, Mapping):
-        raise RuntimeError("Router 返回了无效 Usage 数据")
-    input_tokens = metrics.get("input_tokens", 0)
-    output_tokens = metrics.get("output_tokens", 0)
-    cost = metrics.get("cost", 0.0)
-    if (
-        isinstance(input_tokens, bool)
-        or not isinstance(input_tokens, int)
-        or input_tokens < 0
-        or isinstance(output_tokens, bool)
-        or not isinstance(output_tokens, int)
-        or output_tokens < 0
-        or isinstance(cost, bool)
-        or not isinstance(cost, (int, float))
-        or cost < 0
-    ):
-        raise RuntimeError("Hybrid Router 返回了无效 Usage 数据")
-    return PlanResourceUsage(
-        model_calls=1,
-        tokens=input_tokens + output_tokens,
-        cost=float(cost),
-    )

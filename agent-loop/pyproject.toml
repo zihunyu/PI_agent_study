@@ -32,6 +32,8 @@ where = ["src"]
 pi_agent_loop = ["py.typed"]
 
 [tool.setuptools.data-files]
+"share/pi-agent-loop/docs" = ["GENERIC_EXTENSIONS.md"]
+"share/pi-agent-loop/examples/business_package" = ["examples/business_package/*.py", "examples/business_package/*.toml", "examples/business_package/README.md"]
 "share/pi-agent-loop/evals" = ["evals/*.json"]
 "share/pi-agent-loop/config" = ["config/*.toml.example", "config/README.md"]
 

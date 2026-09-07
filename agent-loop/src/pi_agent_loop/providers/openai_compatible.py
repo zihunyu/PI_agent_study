@@ -187,8 +187,10 @@ class OpenAICompatibleProvider:
 
         if self._closed:
             raise RuntimeError("provider is closed")
+        effective_options = dict(options)
+        effective_options.update(self.profile.generation.resolve(options))
         self.call_count += 1
-        return self._retrying_stream(model, context, options)
+        return self._retrying_stream(model, context, effective_options)
 
     def _stream_attempt(
         self,
@@ -282,6 +284,15 @@ class OpenAICompatibleProvider:
         api_key: str,
     ) -> None:
         payload = serialize_chat_request(self.profile, context, options)
+        from ..model_attempts import current_model_attempt_admission_scope
+
+        scope = current_model_attempt_admission_scope()
+        if scope is not None and scope.max_tokens is not None:
+            observed = await scope.snapshot()
+            remaining = scope.max_tokens - observed.tokens
+            for name in ("max_tokens", "max_completion_tokens"):
+                if name in payload:
+                    payload[name] = min(payload[name], remaining)
         timeout = httpx.Timeout(
             self.profile.request_timeout_seconds,
             connect=self.profile.connect_timeout_seconds,
@@ -394,6 +405,7 @@ class OpenAICompatibleProvider:
             stop_reason="error",
             error_message=str(error),
         )
+        final["usageObserved"] = False
         final["providerError"] = {
             "code": error.code,
             "statusCode": error.status_code,
@@ -415,6 +427,7 @@ class OpenAICompatibleProvider:
             stop_reason="aborted" if reason == "aborted" else "error",
             error_message=message,
         )
+        final["usageObserved"] = False
         stream.push({"type": "error", "reason": reason, "error": final})
 
 

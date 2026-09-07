@@ -479,8 +479,10 @@ class AutonomousHostIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     result.plan_id
                 )
                 assert durable is not None
-                self.assertEqual(durable.resource_usage.model_calls, 2)
-                self.assertEqual(durable.resource_usage.tokens, 20)
+                # This rule-only fixture increments a diagnostic counter but
+                # never calls the model Runtime: only the validator is charged.
+                self.assertEqual(durable.resource_usage.model_calls, 1)
+                self.assertEqual(durable.resource_usage.tokens, 10)
             finally:
                 await host.close()
 

@@ -248,6 +248,7 @@ def serialize_chat_request(
         "messages": messages,
         "stream": True,
     }
+    payload.update(profile.generation.resolve(options))
 
     raw_tools = context.get("tools", [])
     if not isinstance(raw_tools, list):

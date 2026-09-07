@@ -8,6 +8,8 @@ remain encrypted, checksummed and auditable in the unified Session Journal.
 
 from __future__ import annotations
 
+from .journal import SessionEventJournal
+
 import asyncio
 import copy
 import os
@@ -23,7 +25,6 @@ from .journal import (
     JournalPrincipal,
     SessionEvent,
     SessionEventSpec,
-    SQLiteSessionEventJournal,
 )
 from .operation_store import ClaimLease
 
@@ -190,7 +191,7 @@ class WorkspaceSessionCatalog:
 
     def __init__(
         self,
-        journal: SQLiteSessionEventJournal,
+        journal: SessionEventJournal,
         principal: JournalPrincipal,
     ) -> None:
         self.journal = journal

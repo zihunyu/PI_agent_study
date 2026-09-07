@@ -13,6 +13,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 from ..cancellation import CancellationToken
+from ..execution_policy import ExecutionPolicy, ExecutionContext
 from ..event_stream import AssistantMessageEventStream
 from ..messages import assistant_message, empty_usage, public_error_message
 from ..model_attempts import (
@@ -21,6 +22,7 @@ from ..model_attempts import (
     ModelAttemptIdentity,
     current_model_attempt_admission_scope,
     model_attempt_usage,
+    model_attempt_usage_known,
 )
 from ..model_policy import (
     ModelRequestPolicy,
@@ -102,7 +104,15 @@ class ModelCallRuntime:
         pricing: TokenPricing | Mapping[str, TokenPricing] | None = None,
         max_buffer_size: int = 256,
         max_buffer_bytes: int = 4 * 1024 * 1024,
+        execution_policy: ExecutionPolicy | None = None,
+        tenant_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
+        if execution_policy is not None and not isinstance(execution_policy, ExecutionPolicy):
+            raise TypeError("execution_policy must be ExecutionPolicy")
+        self.execution_policy = execution_policy
+        self.tenant_id = tenant_id
+        self.session_id = session_id
         self.upstream_stream_fn = stream_fn
         # Admission wraps the raw Provider before Retry and Compaction. Thus
         # every physical attempt crosses the same reserved retry-tree scope.
@@ -304,7 +314,7 @@ class ModelCallRuntime:
             )
             tokens, cost = model_attempt_usage(final)
             try:
-                await scope.finish_attempt(identity, tokens=tokens, cost=cost)
+                await scope.finish_attempt(identity, tokens=tokens, cost=cost, usage_unknown=not model_attempt_usage_known(final))
                 settled = True
             except ModelAttemptBudgetExceeded as error:
                 settled = True
@@ -348,6 +358,7 @@ class ModelCallRuntime:
         started = time.monotonic()
         request_id = _request_id(options)
         source = str(options.pop("model_request_source", "agent"))
+        options["_execution_phase"] = source
         trace_id = _optional_string(options.pop("trace_id", None))
         parent_span_id = _optional_string(options.pop("parent_span_id", None))
         durable_metadata = _durable_metadata(options.pop("durable_metadata", {}))
@@ -641,6 +652,16 @@ class ModelCallRuntime:
         context: dict[str, Any],
         options: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        token = options.get("cancellation_token") or CancellationToken()
+        phase = str(options.pop("_execution_phase", "agent"))
+        scope = current_model_attempt_admission_scope()
+        if scope is not None:
+            phase = scope.stage
+        execution_context = ExecutionContext(phase, self.tenant_id, self.session_id)
+        if self.execution_policy is not None:
+            messages = await self.execution_policy.transform(context.get("messages", []), token, execution_context)
+            context = {**context, "messages": await self.execution_policy.inspect_input(messages, token, execution_context)}
+        buffer_output = self.execution_policy is not None and self.execution_policy.content_safety is not None
         value = self.effective_stream_fn(model, context, options)
         upstream = (
             await cast(Awaitable[Any], value)
@@ -667,7 +688,7 @@ class ModelCallRuntime:
                         terminal["error"] = final
                     terminal_event = terminal
                     terminal_seen = True
-                else:
+                elif not buffer_output:
                     output.push(event)
             if not terminal_seen:
                 final = _apply_pricing(
@@ -686,6 +707,9 @@ class ModelCallRuntime:
                 }
             if terminal_event is None or final is None:
                 raise RuntimeError("model stream did not produce a terminal result")
+            if self.execution_policy is not None:
+                final = await self.execution_policy.inspect_output(final, token, execution_context)
+                terminal_event["error" if terminal_event.get("type") == "error" else "message"] = final
             completed = True
             return terminal_event, final
         finally:
@@ -887,6 +911,9 @@ class RecoverableModelRuntime(ModelCallRuntime):
         pricing: TokenPricing | Mapping[str, TokenPricing] | None = None,
         max_buffer_size: int = 256,
         max_buffer_bytes: int = 4 * 1024 * 1024,
+        execution_policy: ExecutionPolicy | None = None,
+        tenant_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         super().__init__(
             stream_fn,
@@ -901,6 +928,9 @@ class RecoverableModelRuntime(ModelCallRuntime):
             pricing=pricing,
             max_buffer_size=max_buffer_size,
             max_buffer_bytes=max_buffer_bytes,
+            execution_policy=execution_policy,
+            tenant_id=tenant_id,
+            session_id=session_id,
         )
         self.model = model
         self.system_prompt = system_prompt

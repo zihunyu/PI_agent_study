@@ -398,7 +398,7 @@ def create_grep_tool(services: ToolServices) -> AgentTool:
         validate_args=validate,
         execution_mode="parallel",
         replay_policy="safe",
-        security_policy_version=services.security_version("workspace-grep-v2"),
+        security_policy_version=services.security_version("workspace-grep-v3"),
     )
 
 
@@ -537,18 +537,28 @@ def _grep_paths(
             lines = decoded.text.splitlines()
             for index, line in enumerate(lines):
                 cancellation.throw_if_cancelled()
-                searchable = line[:_MAX_GREP_LINE_CHARS]
-                if matcher.search(searchable) is None:
+                # File size and the restricted regex grammar bound the search;
+                # the display limit must never shorten the searchable input.
+                match = matcher.search(line)
+                if match is None:
                     continue
+                preview_start = max(0, match.start() - _MAX_GREP_LINE_CHARS // 2)
+                searchable = line[preview_start : preview_start + _MAX_GREP_LINE_CHARS]
                 start = max(0, index - context_lines)
                 end = min(len(lines), index + context_lines + 1)
                 display = f"{relative}:{index + 1}:{searchable}"
                 candidate = {
                     "path": relative,
                     "line": index + 1,
+                    "column": match.start() + 1,
                     "text": searchable,
+                    "textStartColumn": preview_start + 1,
+                    "textTruncated": len(searchable) < len(line),
                     "context": [
-                        context[:_MAX_GREP_LINE_CHARS] for context in lines[start:end]
+                        searchable
+                        if context_index == index
+                        else lines[context_index][:_MAX_GREP_LINE_CHARS]
+                        for context_index in range(start, end)
                     ],
                     "display": display,
                 }

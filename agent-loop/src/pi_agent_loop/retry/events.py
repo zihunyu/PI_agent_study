@@ -113,7 +113,7 @@ class JsonlRetryEventStore:
 class RetryRecoveryManager:
     """启动时发现未完成 Retry Chain，并由 Host 提供安全恢复处理器。"""
 
-    def __init__(self, store: JsonlRetryEventStore) -> None:
+    def __init__(self, store: RetryEventStore) -> None:
         self.store = store
 
     async def recover(
@@ -121,7 +121,15 @@ class RetryRecoveryManager:
         handler: Callable[[RetryChain], Awaitable[bool]],
     ) -> list[RetryChain]:
         recovered: list[RetryChain] = []
-        for chain in self.store.incomplete_chains():
+        discover = getattr(self.store, "incomplete_chains_async", None)
+        if callable(discover):
+            chains = await discover()
+        else:
+            legacy = getattr(self.store, "incomplete_chains", None)
+            if not callable(legacy):
+                raise TypeError("Retry recovery requires incomplete_chains_async or the legacy synchronous discovery method")
+            chains = await durable_to_thread(legacy)
+        for chain in chains:
             await self.store.append(
                 {
                     "type": "retry_recovery_started",

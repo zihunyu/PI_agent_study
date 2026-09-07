@@ -142,7 +142,7 @@ def create_write_tool(services: ToolServices) -> AgentTool:
         resource_access="write",
         replay_policy="never",
         requires_approval=True,
-        implementation_version="2",
+        implementation_version="3",
         security_policy_version=services.security_version("workspace-write-cas-v2"),
     )
 
@@ -301,7 +301,7 @@ def create_edit_tool(services: ToolServices) -> AgentTool:
         resource_access="write",
         replay_policy="never",
         requires_approval=True,
-        implementation_version="2",
+        implementation_version="3",
         security_policy_version=services.security_version("workspace-edit-cas-v2"),
     )
 

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from .journal import SessionEventJournal, validate_session_event_journal, SynchronousSessionEventJournal
+
 import hashlib
 import json
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from ..retry.events import RetryChain
 from ..runtime.events import RuntimeEvent
@@ -13,12 +15,12 @@ from .journal import (
     JournalDeadlineExceeded,
     JournalFencedClaimLostError,
     JournalPrincipal,
-    SQLiteSessionEventJournal,
     SessionEventSpec,
 )
 from .operation_events import OperationEvent
 from .operation_store import (
     ClaimLease,
+    OperationEventStore,
     OperationEventSpec,
     OperationStoreConflictError,
     OperationStoreDeadlineExceeded,
@@ -49,11 +51,15 @@ class SessionJournalOperationEventStore:
 
     def __init__(
         self,
-        journal: SQLiteSessionEventJournal,
+        journal: SessionEventJournal,
         principal: JournalPrincipal,
     ) -> None:
-        self.journal = journal
+        self.journal = validate_session_event_journal(journal)
         self.principal = principal
+
+    def event_spec(self, event_type: str, session_id: str, operation_id: str, data: dict[str, Any], *, event_id: str | None = None) -> SessionEventSpec:
+        """Build a conversation fact for the shared atomic Journal transaction."""
+        return SessionEventSpec("operation", event_type, session_id, dict(data), operation_id=operation_id, event_id=event_id)
 
     async def append(
         self,
@@ -260,14 +266,14 @@ class SessionJournalRuntimeEventStore:
 
     def __init__(
         self,
-        journal: SQLiteSessionEventJournal,
+        journal: SessionEventJournal,
         principal: JournalPrincipal,
         *,
         session_id: str,
     ) -> None:
         if not session_id:
             raise ValueError("Runtime Adapter session_id 不能为空")
-        self.journal = journal
+        self.journal = validate_session_event_journal(journal)
         self.principal = principal
         self.session_id = session_id
 
@@ -369,14 +375,14 @@ class SessionJournalRetryEventStore:
 
     def __init__(
         self,
-        journal: SQLiteSessionEventJournal,
+        journal: SessionEventJournal,
         principal: JournalPrincipal,
         *,
         session_id: str,
     ) -> None:
         if not session_id:
             raise ValueError("Retry Adapter session_id 不能为空")
-        self.journal = journal
+        self.journal = validate_session_event_journal(journal)
         self.principal = principal
         self.session_id = session_id
 
@@ -430,18 +436,9 @@ class SessionJournalRetryEventStore:
     def incomplete_chains(self) -> list[RetryChain]:
         # 兼容现有 RetryRecoveryManager 的同步发现接口。旧 JSONL Store 的
         # incomplete_chains() 同样执行同步磁盘读取；新代码优先使用异步版本。
-        self.journal.access_policy.authorize(self.principal, "read")
-        events = self.journal._load_events_sync(
-            self.principal,
-            self.session_id,
-            None,
-            None,
-            "retry",
-            None,
-            False,
-            None,
-            None,
-        )
+        if not isinstance(self.journal, SynchronousSessionEventJournal):
+            raise TypeError("Async-only Journal: use incomplete_chains_async()")
+        events = self.journal.load_events_sync(self.principal, session_id=self.session_id, journal_kind="retry")
         records: list[dict[str, Any]] = []
         for event in events:
             record = dict(event.payload)
@@ -522,3 +519,23 @@ def _retry_logical_id(event: dict[str, Any]) -> str | None:
 
 def _optional_text(value: Any) -> str | None:
     return str(value) if value is not None and str(value) else None
+
+
+@runtime_checkable
+class JournalOperationStore(OperationEventStore, Protocol):
+    """Conversation/operation participant; session scope is explicit per call."""
+
+    @property
+    def journal(self) -> SessionEventJournal: ...
+    @property
+    def principal(self) -> JournalPrincipal: ...
+
+    def event_spec(
+        self,
+        event_type: str,
+        session_id: str,
+        operation_id: str,
+        data: dict[str, Any],
+        *,
+        event_id: str | None = None,
+    ) -> SessionEventSpec: ...

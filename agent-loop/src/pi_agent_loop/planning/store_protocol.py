@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from ..session.journal import SessionEventJournal, JournalPrincipal, SessionEventSpec
     from ..session.operation_store import ClaimLease
     from .store import DurablePlanRecord, PlanCompletionEnvelope
     from .types import MultiIntentPlan, PlanEvent
@@ -219,3 +220,16 @@ __all__ = [
     "DurablePlanStoreConfigurationError",
     "validate_durable_plan_store",
 ]
+
+
+@runtime_checkable
+class JournalPlanStore(DurablePlanStore, Protocol):
+    """Plan participant in a caller-owned multi-stream Journal transaction."""
+
+    @property
+    def journal(self) -> SessionEventJournal: ...
+    @property
+    def principal(self) -> JournalPrincipal: ...
+    def initialization_spec(
+        self, plan: MultiIntentPlan, *, dispatchable: bool
+    ) -> SessionEventSpec: ...

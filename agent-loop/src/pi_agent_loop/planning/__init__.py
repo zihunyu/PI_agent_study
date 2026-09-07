@@ -92,6 +92,8 @@ from .types import (
     SynthesizedPlanResult,
 )
 
+from .store_protocol import JournalPlanStore
+
 __all__ = [
     "ApprovalBarrier",
     "ClosedLoopAction",
@@ -173,3 +175,5 @@ __all__ = [
     "validate_step_result",
     "validate_durable_plan_store",
 ]
+
+__all__ += ['JournalPlanStore']

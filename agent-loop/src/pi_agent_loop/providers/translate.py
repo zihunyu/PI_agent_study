@@ -70,6 +70,7 @@ class OpenAIStreamTranslator:
         self._started = False
         self._saw_payload = False
         self._total_tool_argument_bytes = 0
+        self.partial["usageObserved"] = False
 
     @property
     def finished(self) -> bool:
@@ -97,6 +98,7 @@ class OpenAIStreamTranslator:
         usage = payload.get("usage")
         if usage is not None:
             self.partial["usage"] = _translate_usage(usage)
+            self.partial["usageObserved"] = "prompt_tokens" in usage and "completion_tokens" in usage
 
         choices = payload.get("choices", [])
         if not isinstance(choices, list):
@@ -359,5 +361,5 @@ def _translate_usage(value: Any) -> dict[str, Any]:
     usage = empty_usage()
     usage["input"] = token("prompt_tokens")
     usage["output"] = token("completion_tokens")
-    usage["totalTokens"] = token("total_tokens")
+    usage["totalTokens"] = token("total_tokens") if "total_tokens" in value else usage["input"] + usage["output"]
     return usage

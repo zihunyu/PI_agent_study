@@ -328,6 +328,11 @@ def load_simple_business_config(path: str | Path) -> SimpleBusinessConfig:
             f"简化业务配置 TOML 格式错误：{error}"
         ) from error
 
+    return parse_simple_business_config(root)
+
+
+def parse_simple_business_config(root: dict[str, Any]) -> SimpleBusinessConfig:
+    """Parse the same schema from a trusted configuration document."""
     unknown_root = sorted(root.keys() - {"product", "intents", "denied"})
     if unknown_root:
         raise _ConfigError(

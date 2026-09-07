@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..session.journal import SessionEventJournal
+
 import inspect
 import hashlib
 import os
@@ -33,7 +35,7 @@ class DurableHostResources:
     operation_store: OperationEventStore
     runtime_store: Any
     retry_store: Any
-    journal: SQLiteSessionEventJournal | None = None
+    journal: SessionEventJournal | None = None
     journal_principal: JournalPrincipal | None = None
     owned_resources: list[Any] = field(default_factory=list)
 
@@ -52,7 +54,7 @@ class DurableHostResources:
             raise ValueError("session_id 不能为空")
         root = Path(state_dir)
         root.mkdir(parents=True, exist_ok=True)
-        journal: SQLiteSessionEventJournal | None = None
+        journal: SessionEventJournal | None = None
         principal: JournalPrincipal | None = None
         runtime_store: Any
         operation_store: OperationEventStore

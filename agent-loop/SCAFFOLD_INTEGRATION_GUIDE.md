@@ -73,8 +73,10 @@ Approval 仍是独立检查。
 启用安全管线时，模型 partial `message_update` 会缓冲到 terminal Message 完成并通过
 `model_output` 检查；失败或阻止时不会向 listener 暴露缓冲内容，也不会派发 Tool。
 这是明确的安全/体验取舍：安全模式没有实时逐 token 展示；不配置管线时保持普通流式
-行为。同步 policy 的 timeout 仍不能强杀底层 Python 线程，网络 Adapter 应使用可取消
-异步 I/O 或自行设置硬 deadline。
+行为。Policy 必须使用可取消的 `async def inspect`，网络 Adapter 应使用可取消
+异步 I/O 或自行设置硬 deadline。共享管线对同一策略的正常检查排队执行，排队和执行
+共同消耗 `policy_timeout_seconds`；超时后仍拒绝退出的旧策略任务会使后续检查失败关闭。
+取消排队检查不会取消其他请求的在途审核，也不会留下占用的策略锁。
 
 工具结果在交给 `after_tool_call` 前先过一次 `tool_output` 检查，因此 hook 只接收安全
 快照；hook 的 override 必须再次通过同一边界才能进入模型。业务 hook 不能借改写绕过

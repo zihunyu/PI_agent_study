@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 from ..agent import Agent
 from ..cancellation import CancellationToken
 from ..model_policy import ModelRequestPolicy
-from ..types import AgentLoopTurnUpdate, TurnCompletedContext
+from ..types import AgentLoopTurnUpdate, TurnCompletedContext, StreamFn
 from .capabilities import CapabilityRegistry
 from .guard import RequiredToolCallGuard, guard_stream_fn
 from .types import RequestDecision, RoutedPromptResult
@@ -28,6 +28,24 @@ class RouterLike(Protocol):
         session_id: str | None = None,
         tenant_id: str | None = None,
     ) -> Any: ...
+
+
+@runtime_checkable
+class RuntimeBoundRouter(RouterLike, Protocol):
+    """Bind a fresh per-Host instance. All model calls must use stream_fn.
+
+    The returned instance must satisfy this same protocol, and must not retain
+    an unbound Provider callable. Admission observes physical Runtime attempts;
+    Router diagnostic counters are never billing evidence.
+    """
+
+    def bind_runtime(
+        self,
+        *,
+        stream_fn: StreamFn,
+        retry_event_sink: Any | None,
+        durable_metadata_provider: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> RuntimeBoundRouter: ...
 
 
 class RoutedAgent:

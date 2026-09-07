@@ -20,6 +20,7 @@ from ..model_attempts import (
     ModelAttemptBudgetExceeded,
     current_model_attempt_admission_scope,
     model_attempt_usage,
+    model_attempt_usage_known,
 )
 from ..types import Model, StreamFn
 from .backoff import cancellable_sleep, retry_delay_seconds
@@ -303,7 +304,7 @@ class RetryingStreamFn:
                     metered_final = transformed
                 tokens, cost = model_attempt_usage(metered_final)
                 try:
-                    await scope.finish_attempt(identity, tokens=tokens, cost=cost)
+                    await scope.finish_attempt(identity, tokens=tokens, cost=cost, usage_unknown=not model_attempt_usage_known(metered_final))
                     settled = True
                 except ModelAttemptBudgetExceeded as error:
                     settled = True

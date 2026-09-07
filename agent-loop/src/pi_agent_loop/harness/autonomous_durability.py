@@ -7,12 +7,16 @@ streams without teaching the model transcript reducer about planner internals.
 
 from __future__ import annotations
 
+from ..planning.store_protocol import JournalPlanStore
+
+from ..session.journal import SessionEventJournal, validate_session_event_journal
+
 import copy
 import hashlib
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Protocol, runtime_checkable, Any, Literal
 from uuid import uuid4
 
 from ..messages import assistant_message, user_message
@@ -22,13 +26,11 @@ from ..planning import (
     MultiIntentPlan,
     PlanBudgetExceeded,
     PlanResourceUsage,
-    SessionJournalPlanStore,
 )
 from ..session.journal import (
     JournalConflictError,
     JournalFencedClaimLostError,
     JournalPrincipal,
-    SQLiteSessionEventJournal,
     SessionEvent,
     SessionEventSpec,
     SessionStreamKey,
@@ -44,7 +46,7 @@ from ..session.operation_store import (
     OperationStoreConflictError,
     operation_last_sequence,
 )
-from ..session.journal_adapters import SessionJournalOperationEventStore
+from ..session.journal_adapters import JournalOperationStore
 from ..types import Model
 
 
@@ -157,6 +159,169 @@ class AutonomousRunRecord:
         return usage
 
 
+@runtime_checkable
+class JournalRunStore(Protocol):
+    """Run participant in the same atomic Journal transaction as Plan/Conversation."""
+
+    @property
+    def journal(self) -> SessionEventJournal: ...
+    @property
+    def principal(self) -> JournalPrincipal: ...
+    @property
+    def session_id(self) -> str: ...
+
+    async def acquire_controller(
+        self, run_id: str, owner_token: str, *, lease_seconds: float
+    ) -> ClaimLease | None: ...
+
+    async def renew_controller(
+        self, run_id: str, lease: ClaimLease, *, lease_seconds: float
+    ) -> bool: ...
+
+    async def release_controller(self, run_id: str, lease: ClaimLease) -> None: ...
+
+    async def initialize(
+        self,
+        request: str,
+        initial_plan_id: str,
+        budget: ClosedLoopBudget,
+        *,
+        run_id: str | None = None,
+        started_at: float | None = None,
+        initial_usage: PlanResourceUsage | None = None,
+    ) -> AutonomousRunRecord: ...
+
+    async def open_admission(
+        self,
+        request: str,
+        budget: ClosedLoopBudget,
+        *,
+        run_id: str,
+        started_at: float | None = None,
+    ) -> AutonomousRunRecord: ...
+
+    async def bind_initial_plan(
+        self, run_id: str, plan_id: str
+    ) -> AutonomousRunRecord: ...
+
+    async def bind_initial_plan_atomic(
+        self, run_id: str, plan: MultiIntentPlan, plan_store: JournalPlanStore
+    ) -> AutonomousRunRecord: ...
+
+    def initialization_spec(
+        self,
+        request: str,
+        initial_plan_id: str,
+        budget: ClosedLoopBudget,
+        *,
+        run_id: str,
+        started_at: float | None = None,
+        initial_usage: PlanResourceUsage | None = None,
+        provisional: bool = False,
+    ) -> SessionEventSpec: ...
+
+    async def load(self, run_id: str) -> AutonomousRunRecord: ...
+
+    async def find_by_plan_id(self, plan_id: str) -> AutonomousRunRecord | None: ...
+
+    async def register_plan(
+        self,
+        run_id: str,
+        plan_id: str,
+        *,
+        controller_lease: ClaimLease | None = None,
+        controller_lease_seconds: float | None = None,
+    ) -> AutonomousRunRecord: ...
+
+    async def register_plan_atomic(
+        self,
+        run_id: str,
+        plan: MultiIntentPlan,
+        plan_store: JournalPlanStore,
+        *,
+        controller_lease: ClaimLease | None = None,
+        controller_lease_seconds: float | None = None,
+    ) -> AutonomousRunRecord: ...
+
+    async def link_conversation(
+        self, run_id: str, operation_id: str
+    ) -> AutonomousRunRecord: ...
+
+    async def mark_dispatchable(self, run_id: str) -> AutonomousRunRecord: ...
+
+    async def reserve_resources(
+        self,
+        run_id: str,
+        *,
+        reservation_id: str,
+        stage: str,
+        reserved: PlanResourceUsage,
+        controller_lease: ClaimLease | None = None,
+        controller_lease_seconds: float | None = None,
+    ) -> AutonomousRunRecord: ...
+
+    async def release_resources(
+        self,
+        run_id: str,
+        *,
+        reservation_id: str,
+        reason: str,
+        controller_lease: ClaimLease | None = None,
+        controller_lease_seconds: float | None = None,
+    ) -> AutonomousRunRecord: ...
+
+    async def settle_resources(
+        self,
+        run_id: str,
+        *,
+        reservation_id: str,
+        actual: PlanResourceUsage,
+        controller_lease: ClaimLease | None = None,
+        controller_lease_seconds: float | None = None,
+    ) -> AutonomousRunRecord: ...
+
+    async def close_admission(
+        self, run_id: str, *, reason: str
+    ) -> AutonomousRunRecord: ...
+
+    def require_same_journal(self, plan_store: JournalPlanStore) -> None: ...
+
+    async def append_closed_loop_event(
+        self,
+        run_id: str,
+        segment_id: str,
+        event: ClosedLoopEvent,
+        *,
+        controller_lease: ClaimLease | None = None,
+        controller_lease_seconds: float | None = None,
+    ) -> None: ...
+
+    async def finish_segment(
+        self,
+        run_id: str,
+        segment_id: str,
+        status: AutonomousDurableStatus,
+        *,
+        controller_lease: ClaimLease | None = None,
+        controller_lease_seconds: float | None = None,
+    ) -> None: ...
+
+    async def finalize(
+        self,
+        run_id: str,
+        *,
+        status: AutonomousDurableStatus,
+        response_text: str,
+        pending_approval_ids: tuple[str, ...] = (),
+        controller_lease: ClaimLease | None = None,
+        controller_lease_seconds: float | None = None,
+    ) -> AutonomousRunRecord: ...
+
+    def event_spec(
+        self, run_id: str, event_type: str, payload: dict[str, Any], *, stable_key: str
+    ) -> SessionEventSpec: ...
+
+
 class SessionJournalAutonomousRunStore:
     """Encrypted, append-only autonomous-run metadata on the Session journal.
 
@@ -167,14 +332,14 @@ class SessionJournalAutonomousRunStore:
 
     def __init__(
         self,
-        journal: SQLiteSessionEventJournal,
+        journal: SessionEventJournal,
         principal: JournalPrincipal,
         *,
         session_id: str,
     ) -> None:
         if not session_id:
             raise ValueError("Autonomous Run Store session_id 不能为空")
-        self.journal = journal
+        self.journal = validate_session_event_journal(journal)
         self.principal = principal
         self.session_id = session_id
 
@@ -327,7 +492,7 @@ class SessionJournalAutonomousRunStore:
             return current
         await self._append(
             run_id,
-            self._spec(
+            self.event_spec(
                 run_id,
                 _INITIAL_PLAN_BOUND,
                 {"runId": run_id, "planId": plan_id},
@@ -340,11 +505,11 @@ class SessionJournalAutonomousRunStore:
         self,
         run_id: str,
         plan: MultiIntentPlan,
-        plan_store: SessionJournalPlanStore,
+        plan_store: JournalPlanStore,
     ) -> AutonomousRunRecord:
         """Atomically persist the first Plan and bind a provisional Run."""
 
-        self._require_same_journal(plan_store)
+        self.require_same_journal(plan_store)
         current = await self.load(run_id)
         if current.admission_closed:
             raise AutonomousRunStoreError(
@@ -372,7 +537,7 @@ class SessionJournalAutonomousRunStore:
             # DurablePlanWorker; only AutonomousConversationProjector.bootstrap
             # may atomically publish all three streams as dispatchable.
             plan_store.initialization_spec(plan, dispatchable=False),
-            self._spec(
+            self.event_spec(
                 run_id,
                 _INITIAL_PLAN_BOUND,
                 {"runId": run_id, "planId": plan.plan_id},
@@ -464,7 +629,7 @@ class SessionJournalAutonomousRunStore:
             "initialUsage": usage.to_dict(),
             "provisional": provisional,
         }
-        return self._spec(
+        return self.event_spec(
             run_id,
             _RUN_INITIALIZED,
             payload,
@@ -521,7 +686,7 @@ class SessionJournalAutonomousRunStore:
         payload = {"runId": run_id, "planId": plan_id}
         await self._append(
             run_id,
-            self._spec(
+            self.event_spec(
                 run_id,
                 _PLAN_REGISTERED,
                 payload,
@@ -536,14 +701,14 @@ class SessionJournalAutonomousRunStore:
         self,
         run_id: str,
         plan: MultiIntentPlan,
-        plan_store: SessionJournalPlanStore,
+        plan_store: JournalPlanStore,
         *,
         controller_lease: ClaimLease | None = None,
         controller_lease_seconds: float | None = None,
     ) -> AutonomousRunRecord:
         """Persist a correction plan and publish its run linkage atomically."""
 
-        self._require_same_journal(plan_store)
+        self.require_same_journal(plan_store)
         current = await self.load(run_id)
         if not current.linked or not current.dispatchable:
             raise AutonomousRunStoreError(
@@ -551,7 +716,7 @@ class SessionJournalAutonomousRunStore:
             )
         plan_spec = plan_store.initialization_spec(plan, dispatchable=True)
         payload = {"runId": run_id, "planId": plan.plan_id}
-        run_spec = self._spec(
+        run_spec = self.event_spec(
             run_id,
             _PLAN_REGISTERED,
             payload,
@@ -609,7 +774,7 @@ class SessionJournalAutonomousRunStore:
         }
         await self._append(
             run_id,
-            self._spec(
+            self.event_spec(
                 run_id,
                 _CONVERSATION_LINKED,
                 payload,
@@ -621,7 +786,7 @@ class SessionJournalAutonomousRunStore:
     async def mark_dispatchable(self, run_id: str) -> AutonomousRunRecord:
         await self._append(
             run_id,
-            self._spec(
+            self.event_spec(
                 run_id,
                 _RUN_DISPATCHABLE,
                 {"runId": run_id},
@@ -666,7 +831,7 @@ class SessionJournalAutonomousRunStore:
             "stage": stage,
             "reserved": reserved.to_dict(),
         }
-        spec = self._spec(
+        spec = self.event_spec(
             run_id,
             _RESOURCE_RESERVED,
             payload,
@@ -753,7 +918,7 @@ class SessionJournalAutonomousRunStore:
                 "reservationId": reservation_id,
                 "reason": reason.strip(),
             }
-            spec = self._spec(
+            spec = self.event_spec(
                 run_id,
                 _RESOURCE_RELEASED,
                 payload,
@@ -823,7 +988,7 @@ class SessionJournalAutonomousRunStore:
                 "reservationId": reservation_id,
                 "actual": actual.to_dict(),
             }
-            spec = self._spec(
+            spec = self.event_spec(
                 run_id,
                 _RESOURCE_SETTLED,
                 payload,
@@ -863,7 +1028,7 @@ class SessionJournalAutonomousRunStore:
             return current
         await self._append(
             run_id,
-            self._spec(
+            self.event_spec(
                 run_id,
                 _ADMISSION_CLOSED,
                 {"runId": run_id, "reason": reason.strip()},
@@ -872,9 +1037,9 @@ class SessionJournalAutonomousRunStore:
         )
         return await self.load(run_id)
 
-    def _require_same_journal(self, plan_store: SessionJournalPlanStore) -> None:
+    def require_same_journal(self, plan_store: JournalPlanStore) -> None:
         if (
-            not isinstance(plan_store, SessionJournalPlanStore)
+            not isinstance(plan_store, JournalPlanStore)
             or plan_store.journal is not self.journal
             or plan_store.principal != self.principal
             or plan_store.session_id != self.session_id
@@ -899,7 +1064,7 @@ class SessionJournalAutonomousRunStore:
         }
         await self._append(
             run_id,
-            self._spec(
+            self.event_spec(
                 run_id,
                 _LOOP_EVENT,
                 payload,
@@ -921,7 +1086,7 @@ class SessionJournalAutonomousRunStore:
         payload = {"runId": run_id, "segmentId": segment_id, "status": status}
         await self._append(
             run_id,
-            self._spec(
+            self.event_spec(
                 run_id,
                 _SEGMENT_FINISHED,
                 payload,
@@ -965,7 +1130,7 @@ class SessionJournalAutonomousRunStore:
             return current
         await self._append(
             run_id,
-            self._spec(run_id, _RUN_FINALIZED, payload, stable_key="finalized"),
+            self.event_spec(run_id, _RUN_FINALIZED, payload, stable_key="finalized"),
             controller_lease=controller_lease,
             controller_lease_seconds=controller_lease_seconds,
         )
@@ -1094,7 +1259,7 @@ class SessionJournalAutonomousRunStore:
             return
         raise AutonomousRunStoreError("Autonomous Run 事件并发冲突")
 
-    def _spec(
+    def event_spec(
         self,
         run_id: str,
         event_type: str,
@@ -1494,8 +1659,8 @@ class AutonomousConversationProjector:
         plan: MultiIntentPlan,
         budget: ClosedLoopBudget,
         initial_messages: list[dict[str, Any]],
-        run_store: SessionJournalAutonomousRunStore,
-        plan_store: SessionJournalPlanStore,
+        run_store: JournalRunStore,
+        plan_store: JournalPlanStore,
     ) -> AutonomousConversationLink:
         """Atomically create Plan, Run and Conversation Link as dispatchable.
 
@@ -1504,11 +1669,11 @@ class AutonomousConversationProjector:
         without the exact durable user turn and run identity that authorized it.
         """
 
-        if not isinstance(self.store, SessionJournalOperationEventStore):
+        if not isinstance(self.store, JournalOperationStore):
             raise AutonomousRunStoreError(
                 "Atomic Autonomous Bootstrap 需要 Session Journal Operation Store"
             )
-        run_store._require_same_journal(plan_store)
+        run_store.require_same_journal(plan_store)
         if (
             self.store.journal is not run_store.journal
             or self.store.principal != run_store.principal
@@ -1558,7 +1723,7 @@ class AutonomousConversationProjector:
                     "Initial Plan 尚未完成 Durable Step Budget Reservation"
                 )
             run_specs = [
-                run_store._spec(
+                run_store.event_spec(
                     run_id,
                     _INITIAL_PLAN_BOUND,
                     {"runId": run_id, "planId": plan.plan_id},
@@ -1575,25 +1740,24 @@ class AutonomousConversationProjector:
         specs: list[SessionEventSpec] = [
             plan_spec,
             *run_specs,
-            run_store._spec(
+            run_store.event_spec(
                 run_id,
                 _CONVERSATION_LINKED,
                 {"runId": run_id, "operationId": operation_id},
                 stable_key="conversation-linked",
             ),
-            run_store._spec(
+            run_store.event_spec(
                 run_id,
                 _RUN_DISPATCHABLE,
                 {"runId": run_id},
                 stable_key="dispatchable",
             ),
             *[
-                SessionEventSpec(
-                    "operation",
+                self.store.event_spec(
                     event_type,
                     self.session_id,
+                    operation_id,
                     copy.deepcopy(payload),
-                    operation_id=operation_id,
                     event_id=_conversation_event_id(
                         run_store.principal.tenant_id,
                         self.session_id,

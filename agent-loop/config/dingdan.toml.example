@@ -1,0 +1,11 @@
+# test_demo 本地 HTTP 服务配置示例。
+# 教学测试默认兼容 HTTP/HTTPS。生产环境必须改成 false 并使用 HTTPS。
+[dingdan]
+base_url = "http://127.0.0.1:8000"
+allow_insecure_http = true
+connect_timeout_seconds = 3.0
+read_timeout_seconds = 5.0
+write_timeout_seconds = 10.0
+# 临时登录 Agent 的总墙钟超时；不会被 SSE 心跳无限延长。
+login_model_timeout_seconds = 30.0
+max_read_retries = 2

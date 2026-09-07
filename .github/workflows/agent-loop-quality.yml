@@ -131,6 +131,8 @@ jobs:
             --output-file=reports/licenses.json
       - name: Build distributions without an isolated dependency resolver
         run: python -m build --no-isolation
+      - name: Check generic public APIs and packaged offline business example
+        run: python scripts/check_generic_distribution.py dist
       - name: Check distribution metadata
         run: python -m twine check dist/*.whl dist/*.tar.gz
       - name: Verify the wheel and packaged assets outside the checkout
