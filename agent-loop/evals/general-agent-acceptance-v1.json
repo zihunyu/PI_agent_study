@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "general-agent-acceptance-v1",
+  "execution": "pytest contract suite; deterministic, no paid model or business API",
+  "cases": [
+    {"id": "open-task-evidence-correction-artifact", "test": "tests/test_general_tasks.py::test_open_task_reads_then_replans_and_verifies_report", "acceptance": "Actual file observation is used in a correction and the stored report passes its contract"},
+    {"id": "false-completion-rejected", "test": "tests/test_general_tasks.py::test_artifact_claim_does_not_prove_completion", "acceptance": "A claim of success without required report content cannot complete the task"},
+    {"id": "dispatch-history", "test": "tests/test_general_acceptance.py::test_actual_http_body_is_audited_after_output_budget_and_each_retry", "acceptance": "Encrypted snapshots equal actual HTTP bodies for every dispatched attempt"},
+    {"id": "revoked-source", "test": "tests/test_general_knowledge.py::test_retrieval_updates_revocation_and_restart", "acceptance": "Updated or revoked sources invalidate old citations, including after restart"},
+    {"id": "child-crash-delivery", "test": "tests/test_general_children.py::test_crash_after_child_completion_recovers_without_redispatch", "acceptance": "A completed child survives loss of parent publication without repeating model or tool work"},
+    {"id": "child-abrupt-process-exit", "test": "tests/test_general_children.py::test_abrupt_parent_process_exit_recovers_child_without_redispatch", "acceptance": "A real parent exits without running cleanup; another process takes over expired leases and delivers the child result without redispatch"},
+    {"id": "extension-cancelled-rollback", "test": "tests/test_general_extensions.py::test_activation_rollback_drains_resources_after_repeated_cancellation", "acceptance": "Repeated cancellation during failed extension activation cannot abandon owned resource cleanup"},
+    {"id": "shared-admission", "test": "tests/test_general_children.py::test_budget_reservations_are_atomic_and_survive_restart", "acceptance": "Concurrent controllers cannot overallocate the parent budget"},
+    {"id": "mcp-reconnect", "test": "tests/test_general_acceptance.py::test_mcp_disconnect_reconnect_does_not_replay_failed_call", "acceptance": "Actual transport reconnect restores new calls without resubmitting the failed call"},
+    {"id": "preflight-window", "test": "tests/test_general_context.py", "acceptance": "Preflight preserves task facts and tool pairs or rejects before model dispatch"},
+    {"id": "semantic-synonyms", "test": "tests/test_general_knowledge.py::test_neural_multilingual_embeddings_from_provisioned_local_weights", "requires": "PI_AGENT_EMBEDDING_MODEL", "acceptance": "A Chinese equivalent ranks above unrelated text for an English query using real neural weights"},
+    {"id": "isolated-process", "test": "tests/test_general_acceptance.py::test_real_docker_environment_isolation_and_cleanup", "requires": "PI_AGENT_DOCKER_IMAGE", "acceptance": "Actual container is non-root, lacks external network, cannot mutate input and is removed after timeout"}
+  ],
+  "limits": "These contracts verify runtime controls. They do not measure real-model planning quality or production business correctness."
+}

@@ -69,6 +69,7 @@ from .resources import (
 )
 from .session_runtime import (
     SessionAlreadyOpenError,
+    SessionWriterBusyError,
     SessionWriterLeaseLostError,
     agent_configuration_hash,
 )
@@ -136,6 +137,7 @@ __all__ = [
     "RecoverableModelRuntime",
     "RecoverableToolRuntime",
     "SessionAlreadyOpenError",
+    "SessionWriterBusyError",
     "SessionWriterLeaseLostError",
     "SessionJournalAutonomousRunStore",
     "StartupRecoveryCoordinator",

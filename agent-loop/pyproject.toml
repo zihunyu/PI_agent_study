@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pi-agent-loop-python"
 version = "0.1.0"
-description = "参考 Pi Agent Loop 语义编写的纯 Python 教学实现"
+description = "通用 Python Agent Runtime：受控工具执行、可恢复任务、扩展与证据验收"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -13,12 +13,23 @@ authors = [{ name = "Python adaptation" }]
 dependencies = ["cryptography>=42", "httpx>=0.27,<1"]
 
 [project.optional-dependencies]
+extensions = ["PyYAML>=6,<7"]
+mcp = ["mcp>=1.28.1,<2", "jsonschema>=4.23,<5"]
+knowledge = ["sentence-transformers>=3,<6", "pypdf>=5,<7", "python-docx>=1,<2"]
 test = [
     "coverage[toml]>=7,<8",
     "mypy>=1.15,<2",
     "pytest>=9,<10",
     "pytest-asyncio>=1,<2",
     "ruff>=0.15,<0.16",
+    "PyYAML>=6,<7",
+    "mcp>=1.28.1,<2",
+    "jsonschema>=4.23,<5",
+    "types-jsonschema",
+    "types-PyYAML",
+    "pypdf>=5,<7",
+    "python-docx>=1,<2",
+    "reportlab>=4,<5",
 ]
 build = ["build>=1,<2"]
 
@@ -32,7 +43,8 @@ where = ["src"]
 pi_agent_loop = ["py.typed"]
 
 [tool.setuptools.data-files]
-"share/pi-agent-loop/docs" = ["GENERIC_EXTENSIONS.md"]
+"share/pi-agent-loop/docs" = ["GENERIC_EXTENSIONS.md", "GENERAL_AGENT.md"]
+"share/pi-agent-loop/examples/general_agent" = ["examples/general_agent/*.py", "examples/general_agent/*.toml", "examples/general_agent/README.md"]
 "share/pi-agent-loop/examples/business_package" = ["examples/business_package/*.py", "examples/business_package/*.toml", "examples/business_package/README.md"]
 "share/pi-agent-loop/evals" = ["evals/*.json"]
 "share/pi-agent-loop/config" = ["config/*.toml.example", "config/README.md"]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import ParamSpec, TypeVar
 
 P = ParamSpec("P")
@@ -54,4 +54,19 @@ async def durable_to_thread(
     return result
 
 
-__all__ = ["durable_to_thread"]
+async def await_owned_cleanup(work: Awaitable[T]) -> T:
+    """Drain one owned cleanup operation despite repeated caller cancellation."""
+    task = asyncio.ensure_future(work)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+__all__ = ["durable_to_thread", "await_owned_cleanup"]

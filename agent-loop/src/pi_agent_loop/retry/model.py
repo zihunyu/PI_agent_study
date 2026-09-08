@@ -281,6 +281,11 @@ class RetryingStreamFn:
         completed = False
         settled = False
         try:
+            audit = options.get("_model_request_audit") if self.physical_attempt_admission and not options.get("_audit_at_http_boundary", False) else None
+            if callable(audit):
+                audited = audit(model, context, options)
+                if inspect.isawaitable(audited):
+                    await audited
             value = self.stream_fn(model, context, options)
             stream = (
                 await cast(Awaitable[Any], value)

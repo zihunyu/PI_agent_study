@@ -412,7 +412,10 @@ class BuiltinWorkspaceToolTests(unittest.IsolatedAsyncioTestCase):
                                 )
                             },
                         ),
-                        timeout=2,
+                        # Windows task-tree cleanup itself has a five-second
+                        # deadline. The test guard must allow that cleanup to
+                        # finish before asserting the injected pipe failure.
+                        timeout=10,
                     )
             spill_directory = services.spill_directory
             services.close()

@@ -12,6 +12,7 @@ from .cancellation import CancellationToken
 from ._context_transform import ContextTransformState, run_context_transform
 from .safety import ContentSafetyPipeline
 from .types import AfterToolCallContext, AfterToolCallResult, AgentToolResult, UNSET
+from .context import ContextBudget
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -31,6 +32,7 @@ class ExecutionPolicy:
     transform_context: Callable[..., Any] | None = None
     version: str = "1"
     transform_timeout_seconds: float = 30.0
+    context_budget: ContextBudget | None = None
     _transform_state: ContextTransformState = field(
         default_factory=ContextTransformState, init=False, repr=False, compare=False
     )
@@ -38,6 +40,8 @@ class ExecutionPolicy:
     def __post_init__(self) -> None:
         import math
 
+        if self.context_budget is not None and not isinstance(self.context_budget, ContextBudget):
+            raise TypeError("context_budget must be ContextBudget")
         if not isinstance(self.version, str) or not self.version.strip():
             raise ValueError("ExecutionPolicy.version must be non-empty text")
         if self.content_safety is not None and not isinstance(
@@ -54,6 +58,10 @@ class ExecutionPolicy:
             or value <= 0
         ):
             raise ValueError("transform_timeout_seconds must be finite and positive")
+
+    @property
+    def configuration_version(self) -> str:
+        return self.version if self.context_budget is None else f"{self.version}+context.{self.context_budget.fingerprint}"
 
     async def transform(
         self,

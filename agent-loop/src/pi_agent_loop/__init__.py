@@ -6,6 +6,16 @@ from typing import Any
 from .agent import Agent
 from .approval import ApprovalError, ApprovalRecord, ApprovalService
 from .cancellation import CancellationToken, OperationCancelledError
+from .children import ChildSessionRequest, DurableChildSessionManager, DurableHostWorker
+from .context import ContextBudget, ContextBudgetExceeded, JournalModelRequestAudit
+from .artifacts import Artifact, ArtifactStore
+from .execution import ExecutionEnvironment, EnvironmentCapabilities, ProcessResult, LocalExecutionEnvironment, DockerExecutionEnvironment, create_environment_tools
+from .extensions import ExtensionPackage, ExtensionBundle, load_extension_bundle, SkillRegistry, MCPClient, MCPServerConfig, MCPToolPolicy, MCPContractChangedError
+from .general import GeneralAgentBundle, GeneralTaskRouter, create_general_agent_bundle, load_general_agent_bundle
+from .knowledge import DocumentLibrary
+from .memory.semantic_provider import SentenceTransformerEmbeddingProvider
+from .validation import ArtifactRequirement, TaskContract, TaskResultValidator
+from .usage_meter import RuntimeUsageMeter
 from .config import AgentLimits, load_agent_limits
 from .domains import (
     ApprovalReceipt,
@@ -99,6 +109,7 @@ from .harness import (
     RecoverableModelRuntime,
     RecoverableToolRuntime,
     SessionAlreadyOpenError,
+    SessionWriterBusyError,
     SessionJournalAutonomousRunStore,
     SessionWriterLeaseLostError,
     StartupRecoveryBlockedError,
@@ -766,6 +777,7 @@ __all__ = [
     "SessionJournalPlanStore",
     "SessionJournalAutonomousRunStore",
     "SessionAlreadyOpenError",
+    "SessionWriterBusyError",
     "SessionConfigurationMismatchError",
     "SessionContext",
     "SessionContextProjection",
@@ -1030,5 +1042,18 @@ def __getattr__(name: str) -> Any:
 __all__ += ["BusinessBundle", "load_business_bundle", "GenerationOptions"]
 
 __all__ += ["ExecutionPolicy", "ExecutionContext"]
+
+__all__ += [
+    "ContextBudget", "ContextBudgetExceeded", "JournalModelRequestAudit",
+    "Artifact", "ArtifactStore", "ExecutionEnvironment", "EnvironmentCapabilities",
+    "ProcessResult", "LocalExecutionEnvironment", "DockerExecutionEnvironment",
+    "create_environment_tools", "ExtensionPackage", "ExtensionBundle",
+    "load_extension_bundle", "SkillRegistry", "MCPClient", "MCPServerConfig",
+    "MCPToolPolicy", "MCPContractChangedError", "GeneralAgentBundle", "GeneralTaskRouter",
+    "create_general_agent_bundle", "load_general_agent_bundle", "DocumentLibrary",
+    "SentenceTransformerEmbeddingProvider", "ArtifactRequirement", "TaskContract",
+    "TaskResultValidator", "RuntimeUsageMeter", "ChildSessionRequest",
+    "DurableChildSessionManager", "DurableHostWorker",
+]
 
 __all__ += ['SessionEventJournal', 'SessionJournalCapabilities', 'SynchronousSessionEventJournal', 'validate_session_event_journal', 'JournalOperationStore', 'JournalPlanStore', 'JournalRunStore', 'RuntimeBoundRouter']

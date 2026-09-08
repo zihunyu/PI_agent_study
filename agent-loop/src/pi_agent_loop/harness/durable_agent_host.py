@@ -9,8 +9,12 @@ from ..planning.store_protocol import JournalPlanStore
 from ..execution_policy import ExecutionPolicy
 
 from ..business import BusinessBundle
+from ..general import GeneralAgentBundle
+from ..context import ContextBudget
 
 import inspect
+import asyncio
+import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -137,6 +141,8 @@ class DurableAgentHost:
         self.context_projection: SessionContextProjection
         self.session_writer_lease: SessionWriterLease | None
         self.tool_identity: VerifiedIdentity | None
+        self.general_task_mode: bool
+        self._submission_lock = asyncio.Lock()
 
     @classmethod
     async def create(
@@ -149,6 +155,7 @@ class DurableAgentHost:
         system_prompt: str,
         tools: list[AgentTool] | None = None,
         business_bundle: BusinessBundle | None = None,
+        general_bundle: GeneralAgentBundle | None = None,
         execution_policy: ExecutionPolicy | None = None,
         router: Any | None = None,
         capabilities: CapabilityRegistry | None = None,
@@ -216,6 +223,30 @@ class DurableAgentHost:
         session_writer_lease_seconds: float = 30,
         allow_configuration_migration: bool = False,
     ) -> "DurableAgentHost":
+        if general_bundle is not None:
+            if exclusive_session is False:
+                raise ValueError("general tasks require an exclusive managed session")
+            managed_session = True
+            if not isinstance(general_bundle, GeneralAgentBundle):
+                raise TypeError("general_bundle must be GeneralAgentBundle")
+            artifact_scope = general_bundle.validator.artifacts.records
+            if artifact_scope.session_id != session_id or artifact_scope.principal.tenant_id != tenant_id:
+                raise ValueError("general artifact store must match the Host tenant and session")
+            if any(value is not None for value in (business_bundle, tools, router, capabilities, planner, plan_policies, plan_tool_bindings, plan_step_executor, plan_result_validator, plan_replanner, plan_result_synthesizer)):
+                raise ValueError("general_bundle cannot be mixed with business or legacy execution configuration")
+            tools = list(general_bundle.tools)
+            capabilities = general_bundle.capabilities
+            router, planner, plan_replanner, plan_result_synthesizer = general_bundle.assemble(model, stream_fn)
+            plan_policies = general_bundle.policies
+            plan_tool_bindings = general_bundle.tool_bindings
+            plan_result_validator = general_bundle.validator
+            owned_resources = (*owned_resources, *general_bundle.resources)
+            if execution_policy is None:
+                window = model.context_window if model.context_window > 0 else 32_000
+                reserve = min(model.max_tokens or 4096, max(1, window // 4))
+                execution_policy = ExecutionPolicy(context_budget=ContextBudget(window, output_reserve=reserve, safety_margin=min(512, max(0, window // 16))))
+            if not auto_plan_complex_requests:
+                raise ValueError("general tasks require the durable autonomous runner")
         if business_bundle is not None:
             if not isinstance(business_bundle, BusinessBundle):
                 raise TypeError("business_bundle must be BusinessBundle")
@@ -237,6 +268,7 @@ class DurableAgentHost:
             system_prompt=system_prompt,
             tools=[] if tools is None else tools,
             execution_policy=execution_policy,
+            general_task_mode=general_bundle is not None,
             router=router,
             capabilities=capabilities,
             router_policy_version=router_policy_version,
@@ -423,6 +455,61 @@ class DurableAgentHost:
             )
 
         return await self.lifecycle.run(resume)
+
+    async def submit_task(
+        self,
+        request_id: str,
+        text: str,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> DurableHostPromptResult:
+        """Idempotent general-task submission, including crash recovery.
+
+        A stable request ID is bound to exactly one request in this session.
+        Re-delivery resumes the existing run and its durable budgets/approvals.
+        """
+        if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 160:
+            raise ValueError("request_id must be a bounded non-empty string")
+        if not isinstance(text, str) or not text.strip() or len(text) > 128_000:
+            raise ValueError("task text must be bounded and non-empty")
+        run_id = "submission-" + hashlib.sha256(request_id.encode()).hexdigest()
+
+        async def submit() -> DurableHostPromptResult:
+            async with self._submission_lock:
+                token = cancellation or CancellationToken()
+                token.throw_if_cancelled()
+                await self._verify_writer_lease()
+                self._ensure_startup_recovery_unblocked()
+                runner = self.autonomous_plan_runner
+                run_store = self.autonomous_run_store
+                if not self.general_task_mode or runner is None or run_store is None or not isinstance(self.plan_store, JournalPlanStore):
+                    raise RuntimeError("submit_task requires a durable general-task Host")
+                link = await self.autonomous_conversation_projector.find(run_id)
+                if link is not None:
+                    record = await run_store.load(run_id)
+                    if record.request != text:
+                        raise ValueError("request_id is already bound to different task text")
+                    return await self.resume_autonomous_plan(record.latest_plan_id, cancellation=token)
+                unfinished = await self.autonomous_conversation_projector.find_unfinished()
+                if unfinished is not None:
+                    raise RuntimeError("another task in this session must be resumed first")
+                self.agent.tool_dispatch_context = ToolDispatchContext(
+                    identity=self.tool_identity,
+                    tenant_id=self.agent.tenant_id,
+                    fencing_token=self.session_writer_lease.fencing_token if self.session_writer_lease else None,
+                    fencing_scope=f"conversation_session_writer:{self.session_id}" if self.session_writer_lease else None,
+                )
+                prepared = await runner.prepare(text, run_id=run_id, defer_persistence_for_conversation=True, cancellation=token)
+                link = await self.autonomous_conversation_projector.bootstrap(
+                    text, run_id=prepared.run_id, plan=prepared.plan, budget=runner.budget,
+                    initial_messages=list(self.agent.state.messages), run_store=run_store, plan_store=self.plan_store,
+                )
+                self._append_autonomous_message_once(await self.autonomous_conversation_projector.load_user_message(link))
+                # resume uses the same Plan/Run/Conversation execution and
+                # projection path as an ordinary recovered autonomous request.
+                return await self.resume_autonomous_plan(prepared.plan.plan_id, cancellation=token)
+
+        return await self.lifecycle.run(submit)
 
     async def prompt(
         self,
@@ -685,7 +772,7 @@ class DurableAgentHost:
             route_admission_retained = False
         if result.decision.status == "in_scope_plan_required":
             task_decision = result.decision.task_decision
-            if task_decision is None:
+            if task_decision is None and not self.general_task_mode:
                 message = "Router 没有提供可校验的结构化任务决策，已拒绝自动执行。"
                 blocked_decision = replace(
                     result.decision,
@@ -709,7 +796,7 @@ class DurableAgentHost:
                     result=invalid,
                     operation_id=operation_id,
                 )
-            if not task_decision.ready_for_planner:
+            if task_decision is not None and not task_decision.ready_for_planner:
                 blocked_decision = replace(
                     result.decision,
                     status="in_scope_need_clarification",

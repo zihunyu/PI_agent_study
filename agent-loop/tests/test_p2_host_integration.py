@@ -348,7 +348,7 @@ class P2HostIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "SELECT DISTINCT journal_kind FROM session_events"
                     )
                 }
-            self.assertEqual(kinds, {"runtime", "operation", "retry"})
+            self.assertEqual(kinds, {"runtime", "operation", "retry", "audit"})
             with closing(sqlite3.connect(database)) as connection:
                 model_boundary_types = {
                     row[0]

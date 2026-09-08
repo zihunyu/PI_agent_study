@@ -100,6 +100,7 @@ class ModelCallRuntime:
         | None = None,
         retry_event_sink: ModelEventSink | None = None,
         durable_event_sink: ModelEventSink | None = None,
+        request_audit: Callable[..., Any] | None = None,
         telemetry: Telemetry | None = None,
         pricing: TokenPricing | Mapping[str, TokenPricing] | None = None,
         max_buffer_size: int = 256,
@@ -111,6 +112,7 @@ class ModelCallRuntime:
         if execution_policy is not None and not isinstance(execution_policy, ExecutionPolicy):
             raise TypeError("execution_policy must be ExecutionPolicy")
         self.execution_policy = execution_policy
+        self.request_audit = request_audit
         self.tenant_id = tenant_id
         self.session_id = session_id
         self.upstream_stream_fn = stream_fn
@@ -129,6 +131,20 @@ class ModelCallRuntime:
             if self.upstream_provides_physical_attempt_admission
             else self._admitted_upstream_stream
         )
+        if request_audit is not None and not self.upstream_provides_physical_attempt_admission:
+            audit_dispatch = effective
+
+            async def audited_stream(model: Model, context: dict[str, Any], options: dict[str, Any]) -> Any:
+                token = options.get("cancellation_token") or CancellationToken()
+                token.throw_if_cancelled()
+                value = request_audit(model, context, options)
+                if inspect.isawaitable(value):
+                    await value
+                token.throw_if_cancelled()
+                value = audit_dispatch(model, context, options)
+                return await value if inspect.isawaitable(value) else value
+
+            effective = audited_stream
         # Inspect the actual context at the Provider boundary, inside Runtime
         # retry/compaction wrappers. Context transformation remains once per
         # logical request; compaction must not reuse a verdict on older input.
@@ -146,6 +162,8 @@ class ModelCallRuntime:
                     ExecutionContext(phase, self.tenant_id, self.session_id),
                 )
                 token.throw_if_cancelled()
+                if execution_policy.context_budget is not None:
+                    execution_policy.context_budget.validate_prepared({**context, "messages": messages})
                 value = dispatch(model, {**context, "messages": messages}, options)
                 return await value if inspect.isawaitable(value) else value
 
@@ -378,6 +396,12 @@ class ModelCallRuntime:
     ) -> None:
         started = time.monotonic()
         request_id = _request_id(options)
+        options["_audit_request_id"] = request_id
+        options["_audit_policy_version"] = None if self.execution_policy is None else self.execution_policy.configuration_version
+        # Provider-owned retry wrappers invoke this for each physical attempt.
+        # Never accept an application/model supplied callback at this boundary.
+        options["_model_request_audit"] = self.request_audit
+        options["_audit_at_http_boundary"] = bool(getattr(getattr(self.upstream_stream_fn, "__self__", None), "provides_model_request_audit", False))
         source = str(options.pop("model_request_source", "agent"))
         options["_execution_phase"] = source
         trace_id = _optional_string(options.pop("trace_id", None))
@@ -682,6 +706,9 @@ class ModelCallRuntime:
         if self.execution_policy is not None:
             messages = await self.execution_policy.transform(context.get("messages", []), token, execution_context)
             context = {**context, "messages": messages}
+            if self.execution_policy.context_budget is not None:
+                context = await self.execution_policy.context_budget.prepare(context, token)
+                options = {**options, "_context_output_limit": self.execution_policy.context_budget.output_reserve}
         buffer_output = self.execution_policy is not None and self.execution_policy.content_safety is not None
         value = self.effective_stream_fn(model, context, options)
         upstream = (
@@ -928,6 +955,7 @@ class RecoverableModelRuntime(ModelCallRuntime):
         | None = None,
         retry_event_sink: Any | None = None,
         durable_event_sink: ModelEventSink | None = None,
+        request_audit: Callable[..., Any] | None = None,
         telemetry: Telemetry | None = None,
         pricing: TokenPricing | Mapping[str, TokenPricing] | None = None,
         max_buffer_size: int = 256,
@@ -945,6 +973,7 @@ class RecoverableModelRuntime(ModelCallRuntime):
             compactor=compactor,
             retry_event_sink=retry_event_sink,
             durable_event_sink=durable_event_sink,
+            request_audit=request_audit,
             telemetry=telemetry,
             pricing=pricing,
             max_buffer_size=max_buffer_size,

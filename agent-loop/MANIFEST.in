@@ -1,4 +1,8 @@
 include GENERIC_EXTENSIONS.md
+include GENERAL_AGENT.md
 include scripts/check_generic_distribution.py
 include scripts/check_minimum_build.py
+include scripts/update_ci_lock.py
 recursive-include examples/business_package *.py *.toml *.md
+recursive-include examples/general_agent *.py *.toml *.md
+recursive-include tests/fixtures *.py

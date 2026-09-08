@@ -2,6 +2,17 @@
 cryptography==50.0.1
 httpx==0.28.1
 
+# Optional integration boundaries exercised without real services.
+mcp==1.28.1
+PyYAML==6.0.3
+jsonschema==4.26.0
+types-jsonschema==4.26.0.20260518
+types-PyYAML==6.0.12.20260518
+pypdf==6.18.0
+python-docx==1.2.0
+reportlab==4.4.10
+pywin32==311; sys_platform == "win32"
+
 # Test and quality gates. pytest 9.0.3 is the first release carrying the fix
 # for PYSEC-2026-1845, so CI intentionally requires that security baseline.
 coverage[toml]==7.16.0
@@ -24,6 +35,7 @@ wheel==0.48.0
 # Cross-platform closure for conditional keyring dependencies. pip-compile
 # resolves markers for its host, so these are explicit to keep one lock valid
 # for Python 3.11-3.13 on Linux and Python 3.12 on Windows.
+backports.tarfile==1.2.0
 importlib-metadata==9.0.1
 jeepney==0.9.0
 secretstorage==3.5.0

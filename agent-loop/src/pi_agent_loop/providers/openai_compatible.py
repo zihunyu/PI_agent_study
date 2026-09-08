@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 from datetime import datetime, timezone
@@ -58,6 +59,7 @@ class OpenAICompatibleProvider:
     # unified ModelCallRuntime must not charge provider.stream as another
     # physical call on top of these attempts.
     provides_physical_attempt_admission = True
+    provides_model_request_audit = True
 
     def __init__(
         self,
@@ -284,6 +286,12 @@ class OpenAICompatibleProvider:
         api_key: str,
     ) -> None:
         payload = serialize_chat_request(self.profile, context, options)
+        output_limit = options.get("_context_output_limit")
+        if output_limit is not None:
+            if type(output_limit) is not int or output_limit < 1:
+                raise ProviderProtocolError("context output limit must be a positive integer")
+            token_field = "max_completion_tokens" if "max_completion_tokens" in payload else "max_tokens"
+            payload[token_field] = min(payload.get(token_field, output_limit), output_limit)
         from ..model_attempts import current_model_attempt_admission_scope
 
         scope = current_model_attempt_admission_scope()
@@ -297,6 +305,11 @@ class OpenAICompatibleProvider:
             self.profile.request_timeout_seconds,
             connect=self.profile.connect_timeout_seconds,
         )
+        audit = options.get("_model_request_audit")
+        if callable(audit):
+            audited = audit(model, context, {**options, "_audit_wire_body": payload})
+            if inspect.isawaitable(audited):
+                await audited
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",

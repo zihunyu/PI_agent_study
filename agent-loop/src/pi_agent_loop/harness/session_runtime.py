@@ -20,6 +20,10 @@ class SessionAlreadyOpenError(RuntimeError):
     """Another Host currently owns the product-session writer lease."""
 
 
+class SessionWriterBusyError(SessionAlreadyOpenError):
+    """A capable store has an unexpired writer; admission can be retried later."""
+
+
 class SessionWriterLeaseLostError(RuntimeError):
     """The Host lost its session lease and must stop accepting prompts."""
 
@@ -227,7 +231,7 @@ class SessionWriterLease:
             lease_seconds=lease_seconds,
         )
         if not acquired:
-            raise SessionAlreadyOpenError(
+            raise SessionWriterBusyError(
                 f"Session {session_id} 已被另一个 DurableAgentHost 打开"
             )
         lease.claim_lease = acquired
@@ -359,6 +363,7 @@ def _json_value(value: Any) -> Any:
 
 __all__ = [
     "SessionAlreadyOpenError",
+    "SessionWriterBusyError",
     "SessionWriterLease",
     "SessionWriterLeaseLostError",
     "agent_configuration_hash",

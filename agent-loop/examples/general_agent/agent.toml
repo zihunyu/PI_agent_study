@@ -1,0 +1,14 @@
+[task]
+version = "1"
+required_tools = ["environment_read"]
+max_repeated_observations = 3
+
+[[tools]]
+name = "environment_read"
+factory = "workspace_read"
+
+[[artifacts]]
+name = "comparison.md"
+media_type = "text/markdown"
+minimum_bytes = 30
+required_sections = ["Comparison", "Evidence"]

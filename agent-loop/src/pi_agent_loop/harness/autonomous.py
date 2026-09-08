@@ -985,8 +985,9 @@ class AutonomousPlanRunner:
                     invoke_validator,
                     controller_lease=controller_lease,
                     controller_lease_seconds=controller_lease_seconds,
+                    model_free=getattr(self.result_validator, "model_free", False) is True,
                 )
-                if self.usage_meter is not None
+                if self.usage_meter is not None or getattr(self.result_validator, "model_free", False) is True
                 else await invoke_validator()
             )
             if not isinstance(result, ResultValidation):
@@ -1265,8 +1266,9 @@ class AutonomousPlanRunner:
                 invoke_synthesizer,
                 controller_lease=controller_lease,
                 controller_lease_seconds=controller_lease_seconds,
+                model_free=getattr(self.result_synthesizer, "model_free", False) is True,
             )
-            if self.usage_meter is not None
+            if self.usage_meter is not None or getattr(self.result_synthesizer, "model_free", False) is True
             else await invoke_synthesizer()
         )
         if not isinstance(text, str) or not text.strip():
@@ -1281,7 +1283,14 @@ class AutonomousPlanRunner:
         *,
         controller_lease: ClaimLease | None,
         controller_lease_seconds: float | None,
+        model_free: bool = False,
     ) -> Any:
+        if model_free:
+            # No reservation is needed when physical dispatch is prohibited.
+            # A callback cannot turn a "model-free" declaration into free calls.
+            scope = ModelAttemptAdmissionScope(run_id=run_id, stage=stage, reservation_id=f"model-free:{uuid4()}", max_model_calls=0)
+            async with activate_model_attempt_admission(scope):
+                return await callback()
         ticket = await self._reserve_model_stage(
             run_id,
             stage,
@@ -1393,7 +1402,7 @@ class AutonomousPlanRunner:
         )
         if not isinstance(actual, PlanResourceUsage):
             raise TypeError("Usage Meter settle 必须返回 PlanResourceUsage")
-        _assert_model_settlement(actual, ticket.reserved)
+        _assert_model_settlement(actual, ticket.reserved, allow_zero=(observed is not None and observed.model_calls == 0 and not observed.unknown_attempts and not observed.in_flight_attempts))
         attempt_snapshot = self._model_attempt_snapshots.get(
             ticket.reservation_id,
             None,
@@ -1696,9 +1705,13 @@ def _assert_model_reservation(
 def _assert_model_settlement(
     actual: PlanResourceUsage,
     reserved: PlanResourceUsage,
+    *,
+    allow_zero: bool = False,
 ) -> None:
-    if actual.model_calls < 1:
+    if actual.model_calls < 1 and not allow_zero:
         raise ValueError("Opaque callback 的 actual usage 必须包含 model_call")
+    if actual.model_calls == 0 and (actual.tokens or actual.cost):
+        raise ValueError("zero physical attempts cannot report token or cost usage")
     for name in (
         "plan_steps",
         "step_attempts",

@@ -68,9 +68,9 @@ class ModelAttemptAdmissionScope:
         if (
             isinstance(max_model_calls, bool)
             or not isinstance(max_model_calls, int)
-            or max_model_calls < 1
+            or max_model_calls < 0
         ):
-            raise ValueError("max_model_calls must be a positive integer")
+            raise ValueError("max_model_calls must be a non-negative integer")
         if max_tokens is not None and (
             isinstance(max_tokens, bool)
             or not isinstance(max_tokens, int)

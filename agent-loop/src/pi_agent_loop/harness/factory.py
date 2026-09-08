@@ -13,6 +13,7 @@ from ..planning.store_protocol import JournalPlanStore
 from ..session.journal import validate_session_event_journal
 
 from ..execution_policy import ExecutionPolicy, guard_tool_output
+from ..context import JournalModelRequestAudit
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -101,6 +102,7 @@ class DurableHostSettings:
     plan_policy_version: str = "1"
     security_policy_version: str = "1"
     execution_policy: ExecutionPolicy | None = None
+    general_task_mode: bool = False
     before_tool_call: Callable[..., Any] | None = None
     after_tool_call: Callable[..., Any] | None = None
     reconcile_tool: Callable[..., Any] | None = None
@@ -364,6 +366,7 @@ class DurableHostFactory:
         settings: DurableHostSettings,
     ) -> Any:
         host.session_id = settings.session_id
+        host.general_task_mode = settings.general_task_mode
         effective_plan_policies = _effective_plan_policies(settings)
         if not settings.exclusive_session:
             raise ValueError(
@@ -631,6 +634,7 @@ class DurableHostFactory:
             # projection ignores them while the unified timeline retains every
             # Agent/Router/Recovery request start and terminal outcome.
             durable_event_sink=retry_store.append,
+            request_audit=(JournalModelRequestAudit(host.resources.journal, host.resources.journal_principal, settings.session_id) if host.resources.journal is not None and host.resources.journal_principal is not None else None),
             telemetry=host.telemetry,
             pricing=settings.pricing,
             max_buffer_size=settings.model_event_buffer_size,
@@ -864,7 +868,7 @@ class DurableHostFactory:
             approval_policy_version=settings.approval_policy_version,
             plan_policy_version=settings.plan_policy_version,
             security_policy_version=settings.security_policy_version,
-            execution_policy_version=None if settings.execution_policy is None else settings.execution_policy.version,
+            execution_policy_version=None if settings.execution_policy is None else settings.execution_policy.configuration_version,
         )
         try:
             session = await host.session_catalog.get_session(settings.session_id)

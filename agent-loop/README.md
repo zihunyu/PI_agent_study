@@ -1,13 +1,17 @@
-# Pi Agent Loop 的 Python 改写
+# 通用 Python Agent Runtime
 
-本目录是对 Pi Agent Loop 核心语义的纯 Python 改写，适合用于：
+本项目从 Pi Agent Loop 的控制语义发展为可嵌入的通用 Agent 框架，支持：
 
-- 学习 Agent Loop 的工作原理；
-- 编写自己的命令行 Agent；
-- 测试模型调用和工具调用流程；
-- 学习并按需装配低层 Loop、持久 Session、重试、压缩、工具与上层 Host。
+- 从已授权工具规划开放任务，并按实际交付物核验和纠错；
+- 持久会话、审批、恢复执行，以及共享预算的持久子任务；
+- 统一执行环境、MCP/Skills 扩展、文档检索和派发输入审计；
+- 单入口 TOML 装配业务能力，保留低层 Agent/Loop 的独立调用方式。
 
-本实现不是 Pi 官方 Python 包，也没有复制 Pi 的全部 Coding Agent 产品功能。它重点保留 Pi 低层 Agent Loop 最有价值的控制语义，并使用中文注释解释关键代码。
+通用入口、配置、生命周期和部署验证见 [GENERAL_AGENT.md](GENERAL_AGENT.md)。
+可直接运行的离线示例见 [examples/general_agent](examples/general_agent/README.md)。
+
+本实现不是 Pi 官方 Python 包。真实业务 API、授权规则与业务验收由应用适配包提供，
+框架负责执行约束、持久化和恢复；参考样例仍使用虚构数据。
 
 参考源码：
 
@@ -18,9 +22,9 @@
 
 Pi 原项目采用 MIT License。本目录保留了原许可证文件；若继续分发或改造，请同时遵守许可证要求。
 
-## 脚手架与真实项目的边界
+## 通用框架与业务适配的边界
 
-这个目录是可复用脚手架，不是某个订单、退款或其他真实业务的交付仓库。
+这个目录提供可复用的执行框架。订单、退款或其他真实业务由独立适配包接入。
 接入项目时采用“框架注入业务”的方式：
 
 ```text
@@ -33,7 +37,7 @@ pi_agent_loop（本目录）
   ├─ 真实 Tool 与 Router
   ├─ 身份、权限和 API Client
   ├─ 业务配置与测试
-  └─ 通过公开扩展点注入脚手架
+  └─ 通过公开扩展点注入框架
 ```
 
 推荐的公开扩展点：
@@ -56,15 +60,18 @@ Calculator 是按需加载的教学样例。即使删除 Calculator 或任意业
   实现，跨重启需应用注入持久 Store。这不是语义记忆或长期知识库；
 - 框架提供独立的单进程 `MultiAgentOrchestrator`：可信 Worker 注册、DAG 调度、
   tenant/run 隔离、有界消息/结果、副本仲裁和取消预算均可直接运行；它不等同于跨进程
-  Durable Worker 集群，生产多机调度仍需共享状态、分布式资源锁和 Fencing；
+  Durable Worker 集群。新增 `DurableChildSessionManager` / `DurableHostWorker` 提供
+  持久子会话、消息去重和共享预算；生产多机调度仍需合格的共享 Journal、资源锁和 Fencing；
 - `AutonomousPlanRunner` 的 completed 只表示结构执行结束。未注入可信
-  `PlanResultValidator` 时语义结果为 `outcome_unknown`，不会自动宣称成功；
+  `PlanResultValidator` 时语义结果为 `outcome_unknown`，不会自动宣称成功。
+  新通用入口自动装配 `TaskResultValidator`，按任务合同检查实际工具结果和交付物；
 - `Agent.prompt(images=...)` 与内置 OpenAI-compatible Provider 支持受限的标准
   `image_url`（HTTPS 或图片 data URL）；音频、视频、文件等未实现类型会在边界拒绝；
 - 核心包已交付 workspace-only 的 `read`、`list_dir`、`find`、`grep`，以及需
   `workspace-write` + Runtime Approval 的本地 `write`/`edit`。`shell` 只有显式
   `full-access` + `allow_trusted_shell=True` 才创建；它是受信本机执行，不是安全
-  沙箱。浏览器、MCP 和真实业务 API 仍需独立适配包；
+  沙箱。新增 `DockerExecutionEnvironment` 提供隔离执行后端，`MCPClient` 提供
+  stdio/Streamable HTTP 接入；浏览器和真实业务 API 仍由独立适配包提供；
 - 路径边界按 realpath 拒绝静态 symlink/junction/ADS 逃逸，但假定工作区目录树由
   受信主体稳定维护；它不抵抗外部恶意进程在校验与 I/O 之间替换 reparse point；
 - 内置文件写工具按规范绝对路径共享进程内 mutation lock；独立 ToolServices 和
@@ -152,7 +159,8 @@ Approval 仍需独立检查角色、自审限制、TTL 和精确 Action Hash。�
 - TTL、每 scope 数量、文本/metadata/向量维度、查询 top-k 和 prompt context 均有硬上限，
   更新/删除可以使用 `expected_updated_at_ms` 做乐观并发控制；
 - `HashingEmbeddingProvider` 是确定性的离线 feature hashing，不是学习得到的语义模型；
-  生产检索质量需要注入真实 `EmbeddingProvider`；内置 SQLite 会在有界 scope 内解密并
+  可用 `SentenceTransformerEmbeddingProvider` 加载本地神经模型，并用 `DocumentLibrary`
+  管理解析、版本、权限与引用；内置 SQLite 会在有界 scope 内解密并
   排序，不是分布式向量数据库；
 - `MemoryContextProvider.retrieve()` 默认只返回结构化结果。注入 prompt 必须同时在构造
   时启用 `prompt_injection_enabled=True`，并在每次

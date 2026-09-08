@@ -551,9 +551,17 @@ class Agent:
             messages: list[AgentMessage],
             cancellation: CancellationToken,
         ) -> list[AgentMessage]:
+            if self.execution_policy.context_budget is not None:
+                prepared = await self.execution_policy.context_budget.prepare(
+                    {"messages": messages, "systemPrompt": self.state.system_prompt, "tools": self.state.tools}, cancellation,
+                )
+                messages = prepared["messages"]
             if self.content_safety is None:
                 return messages
-            return await self.execution_policy.inspect_input(messages, cancellation, self.execution_context)
+            messages = await self.execution_policy.inspect_input(messages, cancellation, self.execution_context)
+            if self.execution_policy.context_budget is not None:
+                self.execution_policy.context_budget.validate_prepared({"messages": messages, "systemPrompt": self.state.system_prompt, "tools": self.state.tools})
+            return messages
 
         async def inspect_model_output(
             message: AgentMessage,
@@ -590,14 +598,14 @@ class Agent:
             max_tool_calls=self.max_tool_calls,
             max_parallel_tools=self.max_parallel_tools,
             max_turns=self.max_turns,
-            stream_options=dict(self.stream_options),
+            stream_options={**self.stream_options, **({"_context_output_limit": self.execution_policy.context_budget.output_reserve} if self.execution_policy.context_budget is not None else {})},
             retry_event_sink=self.retry_event_sink,
             tool_runtime=self.tool_runtime,
             tenant_id=self.tenant_id,
             tool_dispatch_context=self.tool_dispatch_context,
             durable_metadata_provider=self.durable_metadata_provider,
             inspect_model_input=(
-                inspect_model_input if self.content_safety is not None else None
+                inspect_model_input if self.content_safety is not None or self.execution_policy.context_budget is not None else None
             ),
             inspect_model_output=(
                 inspect_model_output if self.content_safety is not None else None
